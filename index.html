@@ -29,6 +29,10 @@
   body { overflow-x:hidden; }
   /* iOS zooms in on focus when a control's text is < 16px; force 16px on small screens to prevent it */
   @media (max-width:640px){ input, select, textarea { font-size:16px !important; } }
+  /* consistent custom dropdown styling (removes native iOS grey look, adds our own chevron) */
+  select { -webkit-appearance:none; appearance:none; padding-right:2rem !important;
+    background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='16' height='16' fill='none' stroke='%236b7a82' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='m4 6 4 4 4-4'/></svg>");
+    background-repeat:no-repeat; background-position:right 0.65rem center; }
 </style>
 </head>
 <body>
@@ -105,6 +109,8 @@ const INITIAL_RATES = {
 };
 const PACKAGING = ['Hanging', 'Hanging in box', 'Box only'];
 const EXTRA_TYPES = ['Dry cleaning', 'Bedding / duvet', 'Repairs & alterations'];
+const TIME_WINDOWS = ['09:00–10:00','10:00–11:00','11:00–12:00','12:00–13:00','13:00–14:00',
+  '14:00–15:00','15:00–16:00','16:00–17:00','17:00–18:00','18:00–19:00 (evening)'];
 
 /* ------------------------------- dates -------------------------------- */
 const TODAY = '2026-07-10';
@@ -285,7 +291,7 @@ function LoginCard({ title, sub, go, children }) {
 function Field({ label, children, hint }) {
   return <div><label className="text-xs font-semibold text-slate2">{label}</label>{children}{hint&&<p className="text-[11px] text-slate2 mt-1">{hint}</p>}</div>;
 }
-const inputCls = "w-full border border-gray-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-teal/40 focus:border-teal";
+const inputCls = "w-full bg-white border border-gray-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-teal/40 focus:border-teal";
 
 /* =================================================================== */
 /*  LANDING                                                            */
@@ -843,7 +849,8 @@ function IntakeModal({ drivers, onClose, onCreate }) {
           <Field label="Assign driver"><select value={driverId} onChange={e=>setDriverId(e.target.value)} className={inputCls+' mt-1'}>
             {drivers.map(d=><option key={d.id} value={d.id}>{d.name}</option>)}</select></Field>
           {type==='collection' && <Field label="Return by"><input type="date" value={returnDate} onChange={e=>setReturnDate(e.target.value)} className={inputCls+' mt-1'}/></Field>}
-          <Field label="Time window"><input value={window_} onChange={e=>setWindow(e.target.value)} className={inputCls+' mt-1'}/></Field>
+          <Field label="Time window"><select value={window_} onChange={e=>setWindow(e.target.value)} className={inputCls+' mt-1'}>
+            {TIME_WINDOWS.map(t=><option key={t}>{t}</option>)}</select></Field>
           <div className="col-span-2"><Field label="Packaging"><select value={packaging} onChange={e=>setPackaging(e.target.value)} className={inputCls+' mt-1'}>
             {PACKAGING.map(p=><option key={p}>{p}</option>)}</select></Field></div>
         </div>
