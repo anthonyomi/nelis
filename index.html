@@ -1,0 +1,1090 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NELIS Operations App — POC</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+<script src="https://cdn.tailwindcss.com"></script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Plus+Jakarta+Sans:wght@600;700;800&display=swap" rel="stylesheet">
+<script>
+  tailwind.config = { theme: { extend: {
+    fontFamily: { sans:['Inter','sans-serif'], display:['"Plus Jakarta Sans"','Inter','sans-serif'] },
+    colors: { teal:{ DEFAULT:'#3AAFCB', dark:'#2b93ac', light:'#eaf7fb' }, ink:'#1f2a30', slate2:'#6b7a82' }
+  }}}
+</script>
+<style>
+  body { font-family:'Inter',-apple-system,BlinkMacSystemFont,sans-serif; background:#f4f6f8; color:#1f2a30; }
+  h1,h2,h3,h4,.font-display { font-family:'Plus Jakarta Sans','Inter',sans-serif; letter-spacing:-0.011em; }
+  .card { box-shadow:0 1px 2px rgba(16,40,50,.04), 0 4px 16px rgba(16,40,50,.05); }
+  ::-webkit-scrollbar { width:9px; height:9px; }
+  ::-webkit-scrollbar-thumb { background:#cdd6da; border-radius:6px; }
+  .drag-over { outline:2px dashed #3AAFCB; outline-offset:-2px; background:#eaf7fb; }
+  select, input, textarea, button { font-family:inherit; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel" data-presets="react">
+const { useState, useMemo, useCallback } = React;
+
+/* =================================================================== */
+/*  ICONS — inline SVG line set (no emoji anywhere)                    */
+/* =================================================================== */
+const ICONS = {
+  user:<g><circle cx="12" cy="8" r="4"/><path d="M5 20c1.5-4 5-5 7-5s5.5 1 7 5"/></g>,
+  truck:<g><rect x="1.5" y="6.5" width="12" height="10" rx="1.5"/><path d="M13.5 9.5H17l3.5 3.5V16.5h-7z"/><circle cx="6" cy="18.6" r="1.7"/><circle cx="17" cy="18.6" r="1.7"/></g>,
+  hanger:<g><path d="M12 5.4a2 2 0 1 1 1.9 2c-1 .4-1.9.9-1.9 2.1"/><path d="M12 11 4 16.6h16z"/></g>,
+  pin:<g><path d="M12 21c4.5-4.6 7-7.7 7-11a7 7 0 1 0-14 0c0 3.3 2.5 6.4 7 11z"/><circle cx="12" cy="10" r="2.4"/></g>,
+  mail:<g><rect x="3" y="5" width="18" height="14" rx="2"/><path d="m3.5 7 8.5 6 8.5-6"/></g>,
+  check:<path d="M5 12.5 10 17 19 7"/>,
+  checkCircle:<g><circle cx="12" cy="12" r="9"/><path d="m8 12 2.5 2.5L16 9"/></g>,
+  box:<g><path d="M12 3 4 7.2v9.6L12 21l8-4.2V7.2z"/><path d="M4 7.2 12 11.5l8-4.3"/><path d="M12 11.5V21"/></g>,
+  note:<g><rect x="5" y="3" width="14" height="18" rx="2"/><path d="M9 8h6M9 12h6M9 16h4"/></g>,
+  printer:<g><path d="M7 9V3h10v6"/><rect x="4" y="9" width="16" height="8" rx="2"/><path d="M7 15h10v6H7z"/></g>,
+  plus:<path d="M12 5v14M5 12h14"/>,
+  up:<path d="m6 14 6-6 6 6"/>, down:<path d="m6 10 6 6 6-6"/>,
+  left:<path d="m15 18-6-6 6-6"/>, right:<path d="M4 12h15M13 6l6 6-6 6"/>,
+  grip:<g stroke="none"><circle cx="9" cy="6" r="1.4"/><circle cx="9" cy="12" r="1.4"/><circle cx="9" cy="18" r="1.4"/><circle cx="15" cy="6" r="1.4"/><circle cx="15" cy="12" r="1.4"/><circle cx="15" cy="18" r="1.4"/></g>,
+  search:<g><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></g>,
+  clock:<g><circle cx="12" cy="12" r="9"/><path d="M12 7.5V12l3 2"/></g>,
+  edit:<g><path d="M4 20h4L18.5 9.5l-4-4L4 16z"/><path d="M13 6.5l4 4"/></g>,
+  close:<path d="M6 6l12 12M18 6 6 18"/>,
+  tag:<g><path d="M3 12.5V4h8.5l8.5 8.5-8.5 8.5z"/><circle cx="7.5" cy="7.5" r="1.3"/></g>,
+  chart:<g><path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/></g>,
+  users:<g><circle cx="9" cy="8" r="3.4"/><path d="M3 19c1-3.5 4-4.5 6-4.5s5 1 6 4.5"/><path d="M16 5a3.2 3.2 0 0 1 0 6.2M21 19c-.6-2.5-2-3.6-3.5-4.1"/></g>,
+  layers:<g><path d="M12 3 3 8l9 5 9-5z"/><path d="m3 13 9 5 9-5M3 8v5M21 8v5"/></g>,
+  logout:<g><path d="M15 4h3a1 1 0 0 1 1 1v14a1 1 0 0 1-1 1h-3"/><path d="M10 8l-4 4 4 4M6 12h9"/></g>,
+  alert:<g><path d="M12 4 2.5 20h19z"/><path d="M12 10v4M12 17.5v.2"/></g>,
+  info:<g><circle cx="12" cy="12" r="9"/><path d="M12 11v5M12 8v.2"/></g>,
+};
+function Ic({ name, size=18, className='', stroke=1.9 }) {
+  const grip = name==='grip';
+  return <svg width={size} height={size} viewBox="0 0 24 24" fill={grip?'currentColor':'none'}
+    stroke={grip?'none':'currentColor'} strokeWidth={stroke} strokeLinecap="round" strokeLinejoin="round"
+    className={className} style={{display:'inline-block',verticalAlign:'middle',flexShrink:0}}>{ICONS[name]}</svg>;
+}
+
+/* =================================================================== */
+/*  RATE CARD — from nelironingservice.com/price-list (editable in app) */
+/* =================================================================== */
+const INITIAL_RATES = {
+  weight: [
+    { key:'iron', label:'Ironing (iron only)',        unit:'kg', price:6.00 },
+    { key:'wdi',  label:'Laundry — wash, dry & iron',  unit:'kg', price:8.00 },
+    { key:'wd',   label:'Laundry — wash & dry only',   unit:'kg', price:4.00 },
+  ],
+  items: [
+    { key:'dc_shirt',    label:'Dry clean — shirt',       price:3.00,  group:'Dry Cleaning' },
+    { key:'dc_trousers', label:'Dry clean — trousers',    price:4.00,  group:'Dry Cleaning' },
+    { key:'dc_blazer',   label:'Dry clean — blazer',      price:6.00,  group:'Dry Cleaning' },
+    { key:'dc_2piece',   label:'Dry clean — 2-piece suit',price:10.00, group:'Dry Cleaning' },
+    { key:'dc_dress',    label:'Dry clean — dress',       price:10.00, group:'Dry Cleaning' },
+    { key:'dc_coat',     label:'Dry clean — coat',        price:10.00, group:'Dry Cleaning' },
+    { key:'hh_duvet_s',  label:'Duvet — single',          price:15.00, group:'Bedding' },
+    { key:'hh_duvet_d',  label:'Duvet — double',          price:20.00, group:'Bedding' },
+    { key:'hh_duvet_k',  label:'Duvet — king',            price:22.00, group:'Bedding' },
+    { key:'hh_pillow',   label:'Pillow',                  price:8.00,  group:'Bedding' },
+    { key:'ra_stitch',   label:'Stitching',               price:6.00,  group:'Repairs & Alterations' },
+    { key:'ra_buttons',  label:'Buttons',                 price:3.00,  group:'Repairs & Alterations' },
+    { key:'ra_short_tr', label:'Shorten trousers',        price:9.00,  group:'Repairs & Alterations' },
+    { key:'ra_taper_tr', label:'Taper trousers',          price:10.00, group:'Repairs & Alterations' },
+    { key:'ra_zip_tr',   label:'Zip — trousers',          price:8.00,  group:'Repairs & Alterations' },
+  ],
+  minOrder: 25.00,
+  firstOrderDiscount: 0.10,
+};
+const PACKAGING = ['Hanging', 'Hanging in box', 'Box only'];
+const EXTRA_TYPES = ['Dry cleaning', 'Bedding / duvet', 'Repairs & alterations'];
+
+/* ------------------------------- dates -------------------------------- */
+const TODAY = '2026-07-10';
+const fmtDate = iso => new Date(iso+'T00:00:00').toLocaleDateString('en-GB',{weekday:'short',day:'numeric',month:'short'});
+const addDays = (iso,n)=>{ const d=new Date(iso+'T00:00:00'); d.setDate(d.getDate()+n); return d.toISOString().slice(0,10); };
+const withinWeek = iso => iso>=TODAY && iso<=addDays(TODAY,6);
+
+/* ------------------------------- mock DB ------------------------------- */
+const CUSTOMERS = [
+  { id:'c1', title:'Mrs', first:'Laila',   last:'Hassan',  addr:'12 Orford Rd, Walthamstow, E17 9NL',  mob:'07700 900112', email:'laila@example.com' },
+  { id:'c2', title:'Mr',  first:'John',    last:'Adeyemi', addr:'4 Grove Rd, Chingford, E4 7DA',        mob:'07700 900233', email:'john@example.com' },
+  { id:'c3', title:'Ms',  first:'Adriana', last:'Costa',   addr:'88 Church Ln, Loughton, IG10 1PD',     mob:'07700 900344', email:'adriana@example.com' },
+  { id:'c4', title:'Mr',  first:'Tunde',   last:'Balogun', addr:'21 High Rd, Leyton, E10 5QH',          mob:'07700 900455', email:'tunde@example.com' },
+  { id:'c5', title:'Mrs', first:'Priya',   last:'Sharma',  addr:'9 Nightingale Ln, Wanstead, E11 2EW',  mob:'07700 900566', email:'priya@example.com' },
+  { id:'c6', title:'Ms',  first:'Grace',   last:'Bennett', addr:'5 Myrtle Rd, Walthamstow, E17 8BX',    mob:'07700 900677', email:'grace@example.com' },
+];
+const DRIVERS = [ { id:'d1', name:'Sam Okoro', pin:'1234' }, { id:'d2', name:'Maria Silva', pin:'1234' } ];
+
+const INITIAL_JOBS = [
+  { id:'j1', driverId:'d1', seq:1, type:'collection', customerId:'c1', window:'09:00–10:00', status:'pending', orderId:'o7',
+    packaging:'Hanging', instructions:'Doorstep collection is fine — bags left in porch.', returnDate:addDays(TODAY,3), paidInAdvance:false },
+  { id:'j2', driverId:'d1', seq:2, type:'delivery', customerId:'c4', window:'10:00–11:00', status:'pending',
+    bags:2, weight:4.0, amount:32.00, service:'Wash, dry & iron', packaging:'Box only', paymentMethod:'Online', paidInAdvance:true },
+  { id:'j3', driverId:'d1', seq:3, type:'collection', customerId:'c2', window:'11:00–12:00', status:'pending',
+    packaging:'Hanging in box', instructions:'Ring bell twice.', returnDate:addDays(TODAY,1), paidInAdvance:false },
+  { id:'j4', driverId:'d1', seq:4, type:'delivery', customerId:'c5', window:'13:00–14:00', status:'pending',
+    bags:1, weight:3.0, amount:25.00, service:'Ironing', packaging:'Hanging', paymentMethod:'Cash', paidInAdvance:false },
+  { id:'j5', driverId:'d1', seq:5, type:'collection', customerId:'c6', window:'14:00–15:00', status:'pending',
+    packaging:'Hanging', instructions:'Ironing plus a duvet in the bag — price the duvet at the shop.', returnDate:addDays(TODAY,1), paidInAdvance:false },
+  { id:'j6', driverId:'d2', seq:1, type:'collection', customerId:'c5', window:'09:30–10:30', status:'pending',
+    packaging:'Hanging', instructions:'', returnDate:addDays(TODAY,2), paidInAdvance:false },
+  { id:'j7', driverId:'d2', seq:2, type:'delivery', customerId:'c1', window:'11:00–12:00', status:'pending',
+    bags:3, weight:9.2, amount:41.50, service:'Dry cleaning', packaging:'Hanging in box', paymentMethod:'Bank transfer', paidInAdvance:false },
+];
+
+const mkOrder = o => ({ extras:[], needsPricing:false, addedItems:{}, firstOrder:false, initialAmount:o.amount, weightCharge:o.amount, ...o });
+const INITIAL_ORDERS = [
+  mkOrder({ id:'o1', customerId:'c2', services:['Ironing'], bagsCount:1, bagWeights:[5.0], weight:5.0, amount:30.00, weightCharge:30.00,
+    packaging:'Hanging in box', paymentMethod:'Online', paidInAdvance:true, collectedDate:addDays(TODAY,-1), collectedAt:'17:20', dueDate:TODAY, status:'Ready', notes:'Ring bell twice.' }),
+  mkOrder({ id:'o2', customerId:'c3', services:['Wash, dry & iron'], bagsCount:2, bagWeights:[6.0,4.0], weight:10.0, amount:80.00, weightCharge:80.00,
+    packaging:'Box only', paymentMethod:'Cash', paidInAdvance:false, collectedDate:addDays(TODAY,-1), collectedAt:'16:05', dueDate:TODAY, status:'In Shop', notes:'' }),
+  mkOrder({ id:'o3', customerId:'c5', services:['Ironing'], bagsCount:1, bagWeights:[3.5], weight:3.5, amount:25.00, weightCharge:21.00,
+    packaging:'Hanging', paymentMethod:'Cash', paidInAdvance:false, collectedDate:TODAY, collectedAt:'09:40', dueDate:addDays(TODAY,1), status:'Collected', notes:'' }),
+  mkOrder({ id:'o4', customerId:'c1', services:['Dry cleaning'], bagsCount:3, bagWeights:[3.0,3.2,3.0], weight:9.2, amount:41.50, weightCharge:41.50,
+    packaging:'Hanging in box', paymentMethod:'Bank transfer', paidInAdvance:false, collectedDate:addDays(TODAY,-2), collectedAt:'18:10', dueDate:addDays(TODAY,2), status:'In Shop', notes:'Delicate — silk blouse.' }),
+  mkOrder({ id:'o5', customerId:'c4', services:['Wash, dry & iron'], bagsCount:2, bagWeights:[7.0,5.0], weight:12.0, amount:96.00, weightCharge:96.00,
+    packaging:'Box only', paymentMethod:'Online', paidInAdvance:true, collectedDate:TODAY, collectedAt:'10:15', dueDate:addDays(TODAY,3), status:'Collected', notes:'Bulk order — bedding.' }),
+  // needs shop pricing (driver flagged a duvet)
+  mkOrder({ id:'o6', customerId:'c6', services:['Ironing'], extras:['Bedding / duvet'], needsPricing:true, bagsCount:2, bagWeights:[4.0,3.0], weight:7.0,
+    amount:42.00, weightCharge:42.00, initialAmount:42.00, packaging:'Hanging', paymentMethod:'Cash', paidInAdvance:false,
+    collectedDate:TODAY, collectedAt:'09:55', dueDate:addDays(TODAY,1), status:'Needs pricing', notes:'Customer said there is a double duvet in with the ironing.' }),
+  // booked by the boss, not yet collected (linked to driver job j1)
+  { id:'o7', customerId:'c1', services:[], extras:[], needsPricing:false, addedItems:{}, firstOrder:false,
+    bagsCount:0, bagWeights:[], weight:0, weightCharge:0, amount:0, initialAmount:0,
+    packaging:'Hanging', paymentMethod:'—', paidInAdvance:false, collectedDate:null, collectedAt:null,
+    dueDate:addDays(TODAY,3), status:'Pending Collection', notes:'Doorstep collection is fine — bags left in porch.' },
+];
+
+/* ------------------------------- helpers ------------------------------- */
+const gbp = n => '£' + Number(n).toFixed(2);
+const custById = id => CUSTOMERS.find(c => c.id === id);
+const fullName = c => c ? `${c.title} ${c.first} ${c.last}` : '—';
+const now = () => new Date().toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit'});
+const mapsUrl = addr => `https://www.google.com/maps/dir/?api=1&destination=${encodeURIComponent(addr)}`;
+const sum = a => a.reduce((s,x)=>s+(parseFloat(x)||0),0);
+
+// PURE pricing engine (unit-tested)
+function calcPrice(rates, weightInputs, itemInputs, firstOrder) {
+  let subtotal = 0; const lines = [];
+  rates.weight.forEach(r => { const kg = parseFloat(weightInputs[r.key]) || 0;
+    if (kg > 0) { const amt = kg*r.price; subtotal += amt; lines.push({label:`${r.label} — ${kg}kg × ${gbp(r.price)}`, amt}); } });
+  rates.items.forEach(r => { const q = parseInt(itemInputs[r.key]) || 0;
+    if (q > 0) { const amt = q*r.price; subtotal += amt; lines.push({label:`${r.label} × ${q}`, amt}); } });
+  const discount = firstOrder ? subtotal*rates.firstOrderDiscount : 0;
+  const afterDisc = subtotal - discount;
+  const belowMin = afterDisc > 0 && afterDisc < rates.minOrder;
+  const charged = belowMin ? rates.minOrder : afterDisc;
+  return { lines, subtotal, discount, afterDisc, charged, belowMin };
+}
+// PURE order total from a stored weight charge + shop-added items (unit-tested)
+function orderTotal(rates, weightCharge, addedItems, firstOrder) {
+  let subtotal = weightCharge; const lines = [];
+  rates.items.forEach(r => { const q = parseInt(addedItems[r.key]) || 0;
+    if (q > 0) { const amt = q*r.price; subtotal += amt; lines.push({label:`${r.label} × ${q}`, amt}); } });
+  const discount = firstOrder ? subtotal*rates.firstOrderDiscount : 0;
+  const afterDisc = subtotal - discount;
+  const belowMin = afterDisc > 0 && afterDisc < rates.minOrder;
+  const charged = belowMin ? rates.minOrder : afterDisc;
+  return { lines, subtotal, discount, charged, belowMin };
+}
+// PURE reorder helpers (unit-tested)
+function reorderJobs(jobs, driverId, jobId, targetJobId) {
+  const mine = jobs.filter(j=>j.driverId===driverId).sort((a,b)=>a.seq-b.seq);
+  const others = jobs.filter(j=>j.driverId!==driverId);
+  const from = mine.findIndex(j=>j.id===jobId);
+  const to = mine.findIndex(j=>j.id===targetJobId);
+  if (from<0 || to<0) return jobs;
+  const arr = mine.slice(); const [moved] = arr.splice(from,1); arr.splice(to,0,moved);
+  return [...others, ...arr.map((j,i)=>({...j, seq:i+1}))];
+}
+function moveJob(jobs, driverId, jobId, dir) {
+  const mine = jobs.filter(j=>j.driverId===driverId).sort((a,b)=>a.seq-b.seq);
+  const i = mine.findIndex(j=>j.id===jobId); const j = dir==='up'?i-1:i+1;
+  if (i<0 || j<0 || j>=mine.length) return jobs;
+  return reorderJobs(jobs, driverId, jobId, mine[j].id);
+}
+function moveJobTo(jobs, jobId, toDriverId, targetJobId) {
+  const job = jobs.find(j=>j.id===jobId); if (!job) return jobs;
+  if (job.driverId===toDriverId) return targetJobId ? reorderJobs(jobs, toDriverId, jobId, targetJobId) : jobs;
+  const fromDriverId = job.driverId;
+  const others = jobs.filter(j=>j.driverId!==fromDriverId && j.driverId!==toDriverId);
+  const source = jobs.filter(j=>j.driverId===fromDriverId && j.id!==jobId).sort((a,b)=>a.seq-b.seq).map((j,i)=>({...j, seq:i+1}));
+  const target = jobs.filter(j=>j.driverId===toDriverId).sort((a,b)=>a.seq-b.seq);
+  let idx = targetJobId ? target.findIndex(j=>j.id===targetJobId) : target.length; if (idx<0) idx = target.length;
+  const nt = target.slice(); nt.splice(idx,0,{...job, driverId:toDriverId});
+  return [...others, ...source, ...nt.map((j,i)=>({...j, seq:i+1}))];
+}
+
+/* =================================================================== */
+/*  SHARED UI                                                          */
+/* =================================================================== */
+function Logo({ h=34 }) {
+  return (
+    <div className="flex items-center gap-2 select-none">
+      <div className="rounded-full border-[3px] border-teal flex items-center justify-center" style={{width:h,height:h}}>
+        <div className="rounded-full bg-teal" style={{width:h*0.34,height:h*0.34}}></div>
+      </div>
+      <div className="leading-none">
+        <div className="font-display font-extrabold tracking-wide text-slate2" style={{fontSize:h*0.5}}>NEL</div>
+        <div className="text-teal-dark tracking-[0.18em]" style={{fontSize:h*0.23}}>IRONING SERVICE</div>
+      </div>
+    </div>
+  );
+}
+function Badge({ children, tone='teal' }) {
+  const tones = { teal:'bg-teal-light text-teal-dark', green:'bg-emerald-50 text-emerald-700',
+    amber:'bg-amber-50 text-amber-700', grey:'bg-gray-100 text-gray-500',
+    rose:'bg-rose-50 text-rose-600', slate:'bg-slate-100 text-slate-600' };
+  return <span className={`text-[11px] font-semibold px-2 py-0.5 rounded-full ${tones[tone]}`}>{children}</span>;
+}
+function Btn({ children, onClick, kind='primary', className='', icon, ...p }) {
+  const styles = { primary:'bg-teal text-white hover:bg-teal-dark',
+    ghost:'bg-white text-ink border border-gray-200 hover:bg-gray-50',
+    green:'bg-emerald-600 text-white hover:bg-emerald-700',
+    subtle:'bg-teal-light text-teal-dark hover:bg-teal/15',
+    rose:'bg-rose-500 text-white hover:bg-rose-600',
+    dark:'bg-ink text-white hover:bg-black' };
+  return <button onClick={onClick} {...p}
+    className={`inline-flex items-center justify-center gap-1.5 px-4 py-2 rounded-xl text-sm font-semibold transition ${styles[kind]} ${className}`}>
+    {icon && <Ic name={icon} size={16}/>}{children}</button>;
+}
+function TopBar({ left, right }) {
+  return <div className="bg-white/90 backdrop-blur border-b border-gray-100 sticky top-0 z-30">
+    <div className="max-w-5xl mx-auto px-4 py-3 flex items-center justify-between">{left}{right}</div></div>;
+}
+function TypeBadge({ type }) {
+  return type==='collection' ? <Badge tone="rose">Collection</Badge> : <Badge tone="slate">Delivery</Badge>;
+}
+const rowTint = (type, done) => done ? 'bg-gray-50 opacity-60 border-gray-100'
+  : type==='collection' ? 'bg-rose-50/60 border-rose-100' : 'bg-white border-gray-100';
+
+function LoginCard({ title, sub, go, children }) {
+  return (
+    <div className="min-h-screen flex items-center justify-center px-4">
+      <div className="bg-white card rounded-3xl p-8 w-full max-w-sm">
+        <button onClick={()=>go('landing')} className="text-slate2 text-sm mb-4 inline-flex items-center gap-1"><Ic name="left" size={15}/>Back</button>
+        <Logo h={30} />
+        <h2 className="text-lg font-bold text-ink mt-4">{title}</h2>
+        <p className="text-slate2 text-sm mb-4">{sub}</p>
+        {children}
+        <div className="mt-5 pt-4 border-t border-gray-100 text-[11px] text-slate2 flex items-start gap-1.5">
+          <Ic name="info" size={13}/><span>Prototype for review — uses sample data and resets when you refresh. Nothing is saved or sent.</span>
+        </div>
+      </div>
+    </div>
+  );
+}
+function Field({ label, children, hint }) {
+  return <div><label className="text-xs font-semibold text-slate2">{label}</label>{children}{hint&&<p className="text-[11px] text-slate2 mt-1">{hint}</p>}</div>;
+}
+const inputCls = "w-full border border-gray-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-teal/40 focus:border-teal";
+
+/* =================================================================== */
+/*  LANDING                                                            */
+/* =================================================================== */
+function Landing({ go }) {
+  const cards = [
+    ['driver-login','truck','Driver','Today’s collections & deliveries in order; take collections and confirm drop-offs.'],
+    ['store-login','hanger','Store team','What’s coming in and going out, sorted by what’s due first. Price extras and print the day’s list.'],
+    ['admin-login','user','Admin (Boss)','Overview, customers, orders, pricing, drivers, job intake and route planning.'],
+  ];
+  return (
+    <div className="min-h-screen flex flex-col items-center justify-center px-4 py-10">
+      <Logo h={62} />
+      <h1 className="mt-6 text-2xl font-extrabold text-ink">Operations App</h1>
+      <p className="text-slate2 mt-1 text-sm">Proof of concept · choose how you want to sign in</p>
+      <div className="mt-8 grid sm:grid-cols-3 gap-4 w-full max-w-3xl">
+        {cards.map(([v,ic,t,d])=>(
+          <button key={v} onClick={()=>go(v)}
+            className="group card bg-white rounded-2xl p-6 text-left hover:-translate-y-0.5 hover:ring-2 hover:ring-teal transition">
+            <div className="w-11 h-11 rounded-xl bg-teal-light text-teal-dark flex items-center justify-center"><Ic name={ic} size={22}/></div>
+            <div className="font-bold text-ink mt-3">{t}</div>
+            <div className="text-slate2 text-sm mt-1 leading-snug">{d}</div>
+          </button>))}
+      </div>
+      <p className="text-[11px] text-slate2 mt-8 inline-flex items-center gap-1.5"><Ic name="info" size={13}/>Prototype for review · sample data resets on refresh · nothing leaves this page.</p>
+    </div>
+  );
+}
+
+/* =================================================================== */
+/*  DRIVER                                                             */
+/* =================================================================== */
+function DriverLogin({ go, onLogin }) {
+  const [driverId,setDriverId]=useState('d1'); const [pin,setPin]=useState(''); const [err,setErr]=useState('');
+  const submit=()=>{ const d=DRIVERS.find(x=>x.id===driverId); if(pin!==d.pin){setErr('Incorrect PIN (hint: 1234)');return;} onLogin(d); };
+  return (
+    <LoginCard go={go} title="Driver sign in" sub="Each driver has their own login for the audit trail.">
+      <Field label="Driver"><select value={driverId} onChange={e=>setDriverId(e.target.value)} className={inputCls+' mt-1 mb-3'}>
+        {DRIVERS.map(d=><option key={d.id} value={d.id}>{d.name}</option>)}</select></Field>
+      <Field label="PIN"><input value={pin} onChange={e=>{setPin(e.target.value);setErr('')}} type="password" placeholder="1234"
+        className={inputCls+' mt-1'} onKeyDown={e=>e.key==='Enter'&&submit()} /></Field>
+      {err && <p className="text-rose-500 text-xs mt-2">{err}</p>}
+      <Btn onClick={submit} className="w-full mt-4">Log in</Btn>
+    </LoginCard>
+  );
+}
+
+function DriverApp({ driver, go, jobs, setJobs, rates, addAudit, addOrder, updateOrder }) {
+  const [openId,setOpenId]=useState(null);
+  const [tab,setTab]=useState('run');
+  const myJobs = jobs.filter(j=>j.driverId===driver.id).sort((a,b)=>a.seq-b.seq);
+  const nextPendingId = (myJobs.find(j=>j.status==='pending')||{}).id;
+  const done = myJobs.filter(j=>j.status==='done').length;
+  const openJob = openId ? myJobs.find(j=>j.id===openId) : null;
+
+  const completeCollection = (job, data) => {
+    setJobs(prev => prev.map(j => j.id===job.id ? {...j, status:'done', doneAt:now(), ...data} : j));
+    const c = custById(job.customerId);
+    const patch = { services:[data.service], extras:data.extras, needsPricing:data.extras.length>0,
+      bagsCount:data.bagWeights.length, bagWeights:data.bagWeights, weight:data.weight,
+      weightCharge:data.weightCharge, amount:data.amount, initialAmount:data.amount,
+      paymentMethod:data.paymentMethod, collectedDate:TODAY, collectedAt:now(),
+      status:data.extras.length>0?'Needs pricing':'Collected',
+      notes:[job.instructions,data.customerNotes].filter(Boolean).join(' · ') };
+    if (job.orderId) updateOrder(job.orderId, patch); // move the Pending Collection order to Collected
+    else addOrder({ id:'ord'+Date.now(), customerId:job.customerId, addedItems:{}, firstOrder:data.firstOrder,
+      packaging:job.packaging, paidInAdvance:job.paidInAdvance, dueDate:job.returnDate||addDays(TODAY,2), ...patch });
+    addAudit(`${driver.name} collected from ${fullName(c)} · ${gbp(data.amount)}${data.extras.length? ' (provisional)':''} · ${data.paymentMethod}`);
+    setOpenId(null);
+  };
+  const completeDelivery = (job) => {
+    setJobs(prev => prev.map(j => j.id===job.id ? {...j, status:'done', doneAt:now()} : j));
+    addAudit(`${driver.name} delivered to ${fullName(custById(job.customerId))}`);
+    setOpenId(null);
+  };
+
+  return (
+    <div className="min-h-screen pb-20">
+      <TopBar left={<Logo h={26}/>} right={<span className="text-sm text-ink font-semibold">{driver.name}</span>} />
+      <div className="max-w-2xl mx-auto p-4">
+        {tab==='run' && !openJob && <>
+          <div className="flex items-center justify-between mb-1">
+            <h2 className="text-xl font-extrabold text-ink">Today’s run</h2>
+            <Badge tone="grey">{done}/{myJobs.length} done</Badge>
+          </div>
+          <p className="text-slate2 text-sm mb-3">In driving order. <span className="text-rose-500 font-semibold">Pink = collection</span>, white = delivery. Next job highlighted; done jobs greyed out.</p>
+          <div className="space-y-3">
+            {myJobs.map(job => {
+              const c = custById(job.customerId);
+              const isNext = job.id===nextPendingId, isDone = job.status==='done';
+              return (
+                <div key={job.id} className={`rounded-2xl p-4 border transition card ${rowTint(job.type,isDone)} ${isNext?'ring-2 ring-teal':''}`}>
+                  <div className="flex items-start justify-between gap-3">
+                    <div className="flex gap-3">
+                      <div className={`w-8 h-8 rounded-full flex items-center justify-center font-bold text-sm shrink-0 ${isDone?'bg-gray-300 text-white':job.type==='collection'?'bg-rose-500 text-white':'bg-teal text-white'}`}>{job.seq}</div>
+                      <div>
+                        <div className="flex items-center gap-2 flex-wrap">
+                          <TypeBadge type={job.type}/>
+                          <span className="text-xs text-slate2 inline-flex items-center gap-1"><Ic name="clock" size={13}/>{job.window}</span>
+                          {job.paidInAdvance && <Badge tone="green">Paid</Badge>}
+                          {isDone && <span className="text-xs text-emerald-600 font-semibold inline-flex items-center gap-1"><Ic name="check" size={13}/>{job.doneAt}</span>}
+                        </div>
+                        <div className="font-semibold text-ink mt-1">{fullName(c)}</div>
+                        <div className="text-sm text-slate2">{c.addr}</div>
+                        <div className="text-xs text-slate2 mt-0.5 inline-flex items-center gap-1"><Ic name="box" size={13}/>{job.packaging}{job.type==='collection'&&job.returnDate?` · return ${fmtDate(job.returnDate)}`:''}</div>
+                        {job.instructions && <div className="text-xs text-rose-700 mt-1 bg-rose-50 rounded-lg px-2 py-1 inline-flex items-start gap-1"><Ic name="note" size={13}/><span>{job.instructions}</span></div>}
+                      </div>
+                    </div>
+                    {!isDone && <Btn kind={isNext?(job.type==='collection'?'rose':'primary'):'subtle'} onClick={()=>setOpenId(job.id)} className="!py-1.5 !px-3 shrink-0">Open</Btn>}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </>}
+
+        {tab==='run' && openJob && (openJob.type==='collection'
+          ? <CollectionForm job={openJob} rates={rates} onBack={()=>setOpenId(null)} onConfirm={completeCollection} />
+          : <DeliveryView job={openJob} onBack={()=>setOpenId(null)} onConfirm={completeDelivery} />)}
+
+        {tab==='profile' && <DriverProfile driver={driver} total={myJobs.length} done={done} go={go} />}
+      </div>
+
+      <nav className="fixed bottom-0 inset-x-0 bg-white border-t border-gray-100 z-30">
+        <div className="max-w-2xl mx-auto flex">
+          {[['run','truck','Today’s run'],['profile','user','Profile']].map(([k,ic,l])=>(
+            <button key={k} onClick={()=>{setTab(k);setOpenId(null);}}
+              className={`flex-1 py-2.5 flex flex-col items-center gap-0.5 text-[11px] font-semibold ${tab===k?'text-teal-dark':'text-slate2'}`}>
+              <Ic name={ic} size={20}/>{l}</button>))}
+        </div>
+      </nav>
+    </div>
+  );
+}
+function DriverProfile({ driver, total, done, go }) {
+  return (
+    <div className="bg-white card rounded-2xl p-6">
+      <div className="flex items-center gap-3">
+        <div className="w-12 h-12 rounded-full bg-teal-light text-teal-dark flex items-center justify-center"><Ic name="user" size={24}/></div>
+        <div><div className="font-bold text-ink">{driver.name}</div><div className="text-sm text-slate2">Driver</div></div>
+      </div>
+      <div className="grid grid-cols-2 gap-3 mt-5">
+        <div className="bg-gray-50 rounded-xl p-3"><div className="text-2xl font-extrabold text-ink">{total}</div><div className="text-xs text-slate2">Jobs today</div></div>
+        <div className="bg-gray-50 rounded-xl p-3"><div className="text-2xl font-extrabold text-ink">{done}</div><div className="text-xs text-slate2">Completed</div></div>
+      </div>
+      <Btn kind="ghost" icon="logout" className="w-full mt-5" onClick={()=>go('landing')}>Log out</Btn>
+    </div>
+  );
+}
+
+function DirectionsBtn({ addr }) {
+  return <a href={mapsUrl(addr)} target="_blank" rel="noopener"
+    className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl text-sm font-semibold bg-white border border-gray-200 text-ink hover:bg-gray-50">
+    <Ic name="pin" size={16}/>Directions</a>;
+}
+
+function CollectionForm({ job, rates, onBack, onConfirm }) {
+  const c = custById(job.customerId);
+  const [bags,setBags]=useState([{id:1,weight:''}]);
+  const [serviceKey,setServiceKey]=useState('iron');
+  const [extras,setExtras]=useState([]);
+  const [firstOrder,setFirstOrder]=useState(false);
+  const [payment,setPayment]=useState('Cash');
+  const [notes,setNotes]=useState('');
+  const [confirmed,setConfirmed]=useState(false);
+
+  const totalWeight = useMemo(()=>sum(bags.map(b=>b.weight)), [bags]);
+  const result = useMemo(()=>calcPrice(rates,{[serviceKey]:totalWeight},{},firstOrder), [rates,serviceKey,totalWeight,firstOrder]);
+  const svcLabel = rates.weight.find(r=>r.key===serviceKey).label.replace(/ \(.*\)/,'');
+  const needsPricing = extras.length>0;
+
+  const addBag=()=>setBags(b=>[...b,{id:(b[b.length-1]?.id||0)+1,weight:''}]);
+  const rmBag=id=>setBags(b=>b.length>1?b.filter(x=>x.id!==id):b);
+  const setBagW=(id,v)=>setBags(b=>b.map(x=>x.id===id?{...x,weight:v}:x));
+  const toggleExtra=x=>setExtras(e=>e.includes(x)?e.filter(y=>y!==x):[...e,x]);
+
+  if (confirmed) return (
+    <div className="bg-white card rounded-2xl p-8 text-center">
+      <div className="w-16 h-16 mx-auto rounded-full bg-emerald-50 text-emerald-600 flex items-center justify-center"><Ic name="check" size={34} stroke={2.4}/></div>
+      <h3 className="text-xl font-bold text-ink mt-3">Collection confirmed</h3>
+      <p className="text-slate2 mt-1">{fullName(c)} · {gbp(result.charged)}{needsPricing?' (provisional)':''} · {payment}</p>
+      {needsPricing && <div className="bg-amber-50 text-amber-700 rounded-xl p-3 mt-4 text-sm inline-flex items-center gap-2"><Ic name="alert" size={16}/>Extras noted — shop will price {extras.join(', ').toLowerCase()} and finalise the total.</div>}
+      <div className="bg-teal-light text-teal-dark rounded-xl p-3 mt-3 text-sm flex items-center justify-center gap-2"><Ic name="mail" size={16}/>{needsPricing?'Provisional':'Receipt'} email sent to {c.email}</div>
+      <div className="mt-6"><Btn icon="right" onClick={()=>onConfirm(job,{ bagWeights:bags.map(b=>parseFloat(b.weight)||0), weight:totalWeight,
+        service:svcLabel, weightCharge:result.subtotal, amount:result.charged, firstOrder, paymentMethod:payment, customerNotes:notes, extras })}>Back to run</Btn></div>
+    </div>
+  );
+
+  return (
+    <div>
+      <button onClick={onBack} className="text-slate2 text-sm mb-3 inline-flex items-center gap-1"><Ic name="left" size={15}/>Back to run</button>
+      <div className="bg-white card rounded-2xl p-5">
+        <div className="flex items-start justify-between gap-2">
+          <div><TypeBadge type="collection"/>
+            <h3 className="text-lg font-bold text-ink mt-1">{fullName(c)}</h3>
+            <p className="text-sm text-slate2">{c.addr}</p>
+            <p className="text-xs text-slate2 mt-0.5 inline-flex items-center gap-1"><Ic name="box" size={13}/>{job.packaging}{job.returnDate?` · return ${fmtDate(job.returnDate)}`:''}</p>
+          </div>
+          <DirectionsBtn addr={c.addr}/>
+        </div>
+        {job.instructions && <div className="text-xs text-rose-700 mt-3 bg-rose-50 rounded-lg px-2 py-1.5 inline-flex items-start gap-1"><Ic name="note" size={14}/><span>Boss note: {job.instructions}</span></div>}
+
+        <hr className="my-4 border-gray-100"/>
+        <div className="flex items-center justify-between">
+          <h4 className="font-bold text-ink text-sm">Bags &amp; weight</h4>
+          <Btn kind="subtle" icon="plus" onClick={addBag} className="!py-1 !px-2 text-xs">Add bag</Btn>
+        </div>
+        <div className="space-y-2 mt-2">
+          {bags.map((b,i)=>(
+            <div key={b.id} className="flex items-center gap-2">
+              <span className="text-sm text-slate2 w-14">Bag {i+1}</span>
+              <input type="number" min="0" step="0.1" value={b.weight} onChange={e=>setBagW(b.id,e.target.value)} className={inputCls+' !w-24 text-right'} placeholder="0.0"/>
+              <span className="text-xs text-slate2">kg</span>
+              {bags.length>1 && <button onClick={()=>rmBag(b.id)} className="text-rose-400 text-xs ml-1 hover:text-rose-600 inline-flex items-center gap-0.5"><Ic name="close" size={13}/>remove</button>}
+            </div>
+          ))}
+          <div className="text-sm text-ink font-semibold pt-1">Total weight: {totalWeight.toFixed(1)} kg <span className="text-slate2 font-normal">across {bags.length} bag{bags.length>1?'s':''}</span></div>
+        </div>
+
+        <h4 className="font-bold text-ink text-sm mt-4 mb-1">Service <span className="text-slate2 font-normal">(applied to total weight)</span></h4>
+        <div className="space-y-1">
+          {rates.weight.map(r=>(
+            <label key={r.key} className="flex items-center gap-2 text-sm text-ink">
+              <input type="radio" name="svc" checked={serviceKey===r.key} onChange={()=>setServiceKey(r.key)} className="accent-teal"/>
+              {r.label} <span className="text-slate2">({gbp(r.price)}/kg)</span></label>))}
+        </div>
+
+        <h4 className="font-bold text-ink text-sm mt-4 mb-1">Extras in the bag <span className="text-slate2 font-normal">— priced at the shop</span></h4>
+        <p className="text-xs text-slate2 mb-2">Just tick what the customer says is in there. No need to unpack or price it at the door.</p>
+        <div className="flex flex-wrap gap-2">
+          {EXTRA_TYPES.map(x=>(
+            <button key={x} onClick={()=>toggleExtra(x)}
+              className={`inline-flex items-center gap-1 px-3 py-1.5 rounded-full text-xs font-semibold border transition ${extras.includes(x)?'bg-amber-50 border-amber-300 text-amber-700':'bg-white border-gray-200 text-slate2 hover:border-gray-300'}`}>
+              {extras.includes(x)&&<Ic name="check" size={13}/>}{x}</button>))}
+        </div>
+        {needsPricing && <div className="text-xs text-amber-700 bg-amber-50 rounded-lg px-2 py-1.5 mt-2 inline-flex items-center gap-1"><Ic name="alert" size={14}/>Price below is provisional — shop finalises it.</div>}
+
+        <label className="flex items-center gap-2 mt-3 text-sm text-ink">
+          <input type="checkbox" checked={firstOrder} onChange={e=>setFirstOrder(e.target.checked)} className="accent-teal"/> Apply first-order discount (10%)</label>
+
+        <h4 className="font-bold text-ink text-sm mt-4 mb-1">Payment</h4>
+        <div className="flex gap-4">
+          {['Cash','Bank transfer'].map(m=>(
+            <label key={m} className="flex items-center gap-1.5 text-sm text-ink">
+              <input type="radio" name="pay" checked={payment===m} onChange={()=>setPayment(m)} className="accent-teal"/> {m}</label>))}
+        </div>
+
+        <h4 className="font-bold text-ink text-sm mt-4 mb-1">Customer notes <span className="text-slate2 font-normal">(seen by boss &amp; store team)</span></h4>
+        <textarea value={notes} onChange={e=>setNotes(e.target.value)} rows="2" placeholder="e.g. stain on white shirt collar, handle silk gently…" className={inputCls}></textarea>
+
+        <div className="bg-gray-50 rounded-xl p-4 mt-4">
+          {result.lines.length===0
+            ? <p className="text-slate2 text-sm">Enter bag weights to calculate the price…</p>
+            : <div className="space-y-1">
+                {result.lines.map((l,i)=>(<div key={i} className="flex justify-between text-sm text-slate2"><span>{l.label}</span><span>{gbp(l.amt)}</span></div>))}
+                {result.discount>0 && <div className="flex justify-between text-sm text-emerald-600"><span>First-order discount</span><span>−{gbp(result.discount)}</span></div>}
+                {result.belowMin && <div className="flex justify-between text-xs text-amber-600"><span>Below {gbp(rates.minOrder)} minimum — rounded up</span><span></span></div>}
+              </div>}
+          <div className="flex justify-between items-center mt-2 pt-2 border-t border-gray-200">
+            <span className="font-bold text-ink">{needsPricing?'Provisional total':'Total to charge'}</span>
+            <span className="text-2xl font-extrabold text-teal-dark">{gbp(result.charged)}</span></div>
+        </div>
+
+        <Btn kind="green" className="w-full mt-4" onClick={()=>setConfirmed(true)} {...(result.charged<=0?{disabled:true}:{})}>
+          Confirm collection {result.charged>0?`· ${gbp(result.charged)}`:''}</Btn>
+      </div>
+    </div>
+  );
+}
+
+function DeliveryView({ job, onBack, onConfirm }) {
+  const c = custById(job.customerId);
+  return (
+    <div>
+      <button onClick={onBack} className="text-slate2 text-sm mb-3 inline-flex items-center gap-1"><Ic name="left" size={15}/>Back to run</button>
+      <div className="bg-white card rounded-2xl p-5">
+        <div className="flex items-start justify-between">
+          <div><TypeBadge type="delivery"/>
+            <h3 className="text-lg font-bold text-ink mt-1">{fullName(c)}</h3>
+            <p className="text-sm text-slate2">{c.addr}</p></div>
+          <DirectionsBtn addr={c.addr}/>
+        </div>
+        <div className="bg-gray-50 rounded-xl p-4 mt-4 text-sm text-ink space-y-1">
+          <div className="flex justify-between"><span className="text-slate2">Service</span><span>{job.service}</span></div>
+          <div className="flex justify-between"><span className="text-slate2">Bags</span><span>{job.bags} · {job.weight}kg</span></div>
+          <div className="flex justify-between"><span className="text-slate2">Packaging</span><span>{job.packaging}</span></div>
+          <div className="flex justify-between"><span className="text-slate2">Amount</span><span>{gbp(job.amount)}</span></div>
+          <div className="flex justify-between"><span className="text-slate2">Payment</span><span>{job.paidInAdvance?'Paid in advance':job.paymentMethod}</span></div>
+        </div>
+        <Btn kind="green" icon="check" className="w-full mt-4" onClick={()=>onConfirm(job)}>Confirm bags delivered</Btn>
+      </div>
+    </div>
+  );
+}
+
+/* =================================================================== */
+/*  ORDER TIMELINE + DETAIL / PRICING MODAL                            */
+/* =================================================================== */
+const LIFECYCLE = ['Pending Collection','Collected','In Shop','Ready','Delivered'];
+const statusToStep = s => ({ 'Pending Collection':0,'Booked':0,'Needs pricing':1,'Collected':1,'In Shop':2,'In progress':2,'Ready':3,'Delivered':4 }[s] ?? 1);
+const NEXT_STATUS = { 'Collected':'In Shop', 'In Shop':'Ready', 'Ready':'Delivered' };
+function statusTone(s){ return s==='Ready'?'green':s==='In Shop'?'amber':s==='Collected'?'teal':s==='Needs pricing'?'rose':s==='Pending Collection'?'slate':'grey'; }
+
+function Timeline({ status }) {
+  const active = statusToStep(status);
+  return (
+    <div className="mt-1">
+      {LIFECYCLE.map((step,i)=>{
+        const doneStep = i<active, cur = i===active;
+        return (
+          <div key={step} className="flex gap-3">
+            <div className="flex flex-col items-center">
+              <div className={`w-3.5 h-3.5 rounded-full border-2 ${cur?'bg-teal border-teal':doneStep?'bg-teal-dark border-teal-dark':'bg-white border-gray-300'}`}></div>
+              {i<LIFECYCLE.length-1 && <div className={`w-0.5 flex-1 min-h-[18px] ${doneStep?'bg-teal-dark':'bg-gray-200'}`}></div>}
+            </div>
+            <div className={`text-sm pb-2 ${cur?'text-ink font-semibold':doneStep?'text-slate2':'text-gray-300'}`}>{step}
+              {cur && status==='Needs pricing' && <span className="ml-2"><Badge tone="rose">Needs pricing</Badge></span>}</div>
+          </div>);
+      })}
+    </div>
+  );
+}
+
+function OrderModal({ order, rates, onClose, onSave, addAudit }) {
+  const c = custById(order.customerId);
+  const [pricing,setPricing]=useState(order.needsPricing);
+  const [added,setAdded]=useState(order.addedItems||{});
+  const groups = useMemo(()=>{ const g={}; rates.items.forEach(r=>{(g[r.group]=g[r.group]||[]).push(r)}); return g; },[rates]);
+  const calc = useMemo(()=>orderTotal(rates, order.weightCharge, added, order.firstOrder), [rates,order,added]);
+
+  const save = () => {
+    onSave(order.id, { addedItems:added, amount:calc.charged, needsPricing:false,
+      status: order.status==='Needs pricing'?'In Shop':order.status });
+    addAudit(`Shop priced ${fullName(c)}: ${gbp(order.initialAmount)} → ${gbp(calc.charged)}`);
+    onClose();
+  };
+  const advance = () => { const ns=NEXT_STATUS[order.status]; if(!ns) return;
+    onSave(order.id, { status:ns }); addAudit(`${fullName(c)}'s order marked ${ns}`); };
+
+  return (
+    <div className="fixed inset-0 bg-black/40 flex items-center justify-center p-4 z-50" onClick={onClose}>
+      <div className="bg-white rounded-2xl w-full max-w-2xl max-h-[92vh] overflow-y-auto" onClick={e=>e.stopPropagation()}>
+        <div className="flex items-center justify-between px-5 py-4 border-b border-gray-100 sticky top-0 bg-white">
+          <div><h3 className="text-lg font-bold text-ink">{fullName(c)}</h3><p className="text-sm text-slate2">{c.addr}</p></div>
+          <button onClick={onClose} className="text-slate2 hover:text-ink"><Ic name="close" size={20}/></button>
+        </div>
+        <div className="p-5 grid md:grid-cols-2 gap-5">
+          <div>
+            <h4 className="font-bold text-ink text-sm mb-2">Order details</h4>
+            <div className="text-sm space-y-1.5">
+              <Row k="Services" v={order.services.join(', ')}/>
+              {order.extras.length>0 && <Row k="Extras" v={<span className="text-amber-700">{order.extras.join(', ')}</span>}/>}
+              <Row k="Bags" v={order.bagsCount>0?`${order.bagsCount} · ${order.bagWeights.join('+')}kg = ${order.weight}kg`:'—'}/>
+              <Row k="Packaging" v={order.packaging}/>
+              <Row k="Collected" v={order.collectedDate?`${fmtDate(order.collectedDate)} · ${order.collectedAt}`:'Not yet collected'}/>
+              <Row k="Deliver by" v={fmtDate(order.dueDate)}/>
+              <Row k="Payment" v={order.paidInAdvance?'Paid in advance':(order.paymentMethod==='—'?'—':order.paymentMethod)}/>
+              <Row k="Price" v={order.status==='Pending Collection'?'—':<span className="font-bold text-ink">{gbp(order.amount)}{order.needsPricing&&<span className="text-rose-500 font-normal"> (provisional)</span>}</span>}/>
+            </div>
+            {order.notes && <div className="text-xs text-ink mt-3 bg-amber-50 border border-amber-100 rounded-lg px-2 py-1.5 flex items-start gap-1"><Ic name="note" size={14}/><span>{order.notes}</span></div>}
+            <h4 className="font-bold text-ink text-sm mt-5 mb-1">Progress</h4>
+            <Timeline status={order.status}/>
+            {order.status==='Pending Collection' &&
+              <p className="text-xs text-slate2 mt-2 inline-flex items-center gap-1"><Ic name="clock" size={14}/>Awaiting driver collection.</p>}
+            {order.needsPricing &&
+              <p className="text-xs text-rose-600 mt-2 inline-flex items-center gap-1"><Ic name="alert" size={14}/>Price the extras before advancing.</p>}
+            {NEXT_STATUS[order.status] && !order.needsPricing &&
+              <Btn kind="dark" icon="right" className="mt-3 w-full" onClick={advance}>Mark {NEXT_STATUS[order.status]}</Btn>}
+          </div>
+
+          <div>
+            <div className="flex items-center justify-between mb-2">
+              <h4 className="font-bold text-ink text-sm">Pricing</h4>
+              {!pricing && <Btn kind="subtle" icon="edit" className="!py-1 !px-2 text-xs" onClick={()=>setPricing(true)}>Amend price</Btn>}
+            </div>
+            {order.needsPricing && <div className="text-xs text-rose-600 bg-rose-50 rounded-lg px-2 py-1.5 mb-2 inline-flex items-center gap-1"><Ic name="alert" size={14}/>Driver flagged extras — add them to finalise the price.</div>}
+            {!pricing
+              ? <div className="text-sm text-slate2">Current total <span className="font-bold text-ink">{gbp(order.amount)}</span>. Tap <b>Amend price</b> to add dry cleaning, bedding or repairs found in the bag.</div>
+              : <>
+                  <div className="bg-gray-50 rounded-xl p-3 text-sm mb-3">
+                    <div className="flex justify-between text-slate2"><span>Weight-based ({order.services[0]})</span><span>{gbp(order.weightCharge)}</span></div>
+                  </div>
+                  <div className="max-h-56 overflow-y-auto pr-1">
+                    {Object.entries(groups).map(([g,list])=>(
+                      <div key={g} className="mb-2">
+                        <div className="text-[11px] font-semibold text-teal-dark uppercase tracking-wide mb-1">{g}</div>
+                        {list.map(r=>(
+                          <div key={r.key} className="flex items-center justify-between gap-2 py-0.5">
+                            <span className="text-sm text-ink">{r.label.replace(/^Dry clean — /,'')} <span className="text-slate2">{gbp(r.price)}</span></span>
+                            <input type="number" min="0" step="1" value={added[r.key]||''} onChange={e=>setAdded({...added,[r.key]:e.target.value})} className={inputCls+' !w-16 text-right !py-1'} placeholder="0"/>
+                          </div>))}
+                      </div>))}
+                  </div>
+                  <div className="bg-teal-light rounded-xl p-3 mt-2">
+                    {calc.lines.map((l,i)=>(<div key={i} className="flex justify-between text-sm text-teal-dark"><span>{l.label}</span><span>{gbp(l.amt)}</span></div>))}
+                    <div className="flex justify-between items-center mt-1 pt-1 border-t border-teal/30">
+                      <span className="font-bold text-ink">New total</span><span className="text-xl font-extrabold text-teal-dark">{gbp(calc.charged)}</span></div>
+                  </div>
+                  <Btn kind="primary" icon="check" className="w-full mt-3" onClick={save}>Save &amp; notify customer</Btn>
+                  <p className="text-[11px] text-slate2 text-center mt-1.5">Logged to the audit trail; customer emailed the updated total.</p>
+                </>}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+function Row({ k, v }) { return <div className="flex justify-between gap-4"><span className="text-slate2">{k}</span><span className="text-ink text-right">{v}</span></div>; }
+
+/* =================================================================== */
+/*  STORE / PRODUCTION TEAM                                            */
+/* =================================================================== */
+function StoreLogin({ go, onLogin }) {
+  const [pin,setPin]=useState(''); const [err,setErr]=useState('');
+  const submit=()=>{ if(pin!=='2222'){setErr('Incorrect PIN (hint: 2222)');return;} onLogin(); };
+  return (
+    <LoginCard go={go} title="Store team sign in" sub="Shop-floor view of what's in and going out.">
+      <Field label="PIN"><input value={pin} onChange={e=>{setPin(e.target.value);setErr('')}} type="password" placeholder="2222"
+        className={inputCls+' mt-1'} onKeyDown={e=>e.key==='Enter'&&submit()} /></Field>
+      {err && <p className="text-rose-500 text-xs mt-2">{err}</p>}
+      <Btn onClick={submit} className="w-full mt-4">Log in</Btn>
+    </LoginCard>
+  );
+}
+function StoreApp({ go, orders, rates, updateOrder, addAudit }) {
+  const [scope,setScope]=useState('today');
+  const [sel,setSel]=useState(null);
+  const list = useMemo(()=>{
+    const inShop = o => o.status!=='Pending Collection' && o.status!=='Delivered'; // garments physically in the shop
+    const f = orders.filter(o => inShop(o) && (scope==='today' ? o.dueDate===TODAY : withinWeek(o.dueDate)));
+    return [...f].sort((a,b)=> a.dueDate.localeCompare(b.dueDate) || (a.collectedAt||'').localeCompare(b.collectedAt||''));
+  }, [orders,scope]);
+
+  const printList = () => {
+    const rows = list.map(o=>{ const c=custById(o.customerId);
+      return `<tr><td><b>${fmtDate(o.dueDate)}</b></td><td>${fullName(c)}<br><span class="a">${c.addr}</span></td>
+        <td>${o.services.join(', ')}${o.extras.length?` <b>+ ${o.extras.join(', ')}</b>`:''}</td>
+        <td>${o.bagsCount} (${o.bagWeights.join('+')}kg) · ${o.weight}kg</td>
+        <td>${gbp(o.amount)}${o.needsPricing?' <b>(prov.)</b>':''}<br><span class="a">${o.paidInAdvance?'PAID':o.paymentMethod}</span></td>
+        <td>${o.packaging}</td><td>${fmtDate(o.collectedDate)} ${o.collectedAt}</td><td>${o.status}</td><td>${o.notes||''}</td></tr>`; }).join('');
+    const html = `<html><head><title>NELIS — ${scope==='today'?'Today':'This week'}</title>
+      <style>body{font-family:Arial;padding:18px;color:#1f2a30}h1{font-size:16px;margin:0}.sub{color:#777;font-size:12px;margin:2px 0 12px}
+      table{width:100%;border-collapse:collapse;font-size:11px}th{background:#3AAFCB;color:#fff;text-align:left;padding:5px 6px}
+      td{border-bottom:1px solid #ddd;padding:5px 6px;vertical-align:top}.a{color:#888;font-size:10px}@media print{@page{size:landscape;margin:10mm}}</style></head>
+      <body><h1>NEL Ironing Service — Production list</h1><div class="sub">${scope==='today'?'Due today':'Due this week'} · printed ${fmtDate(TODAY)} · ${list.length} order(s)</div>
+      <table><thead><tr><th>Due</th><th>Customer</th><th>Services</th><th>Bags / weight</th><th>Price</th><th>Pack</th><th>Collected</th><th>Status</th><th>Notes</th></tr></thead>
+      <tbody>${rows}</tbody></table></body></html>`;
+    const w = window.open('','_blank'); if(!w){alert('Please allow pop-ups to print the list.');return;}
+    w.document.write(html); w.document.close(); w.focus(); setTimeout(()=>w.print(),300);
+  };
+
+  return (
+    <div className="min-h-screen">
+      <TopBar left={<Logo h={26}/>} right={
+        <div className="flex items-center gap-3"><span className="text-sm text-ink font-semibold hidden sm:inline">Store team</span>
+          <Btn kind="ghost" icon="logout" onClick={()=>go('landing')} className="!py-1.5 !px-3">Log out</Btn></div>} />
+      <div className="max-w-5xl mx-auto p-4">
+        <div className="flex items-center justify-between mb-1 flex-wrap gap-2">
+          <h2 className="text-xl font-extrabold text-ink">Production list</h2>
+          <div className="flex items-center gap-2">
+            <div className="bg-white rounded-xl p-1 card flex">
+              {[['today','Today'],['week','This week']].map(([k,l])=>(
+                <button key={k} onClick={()=>setScope(k)} className={`px-3 py-1.5 rounded-lg text-sm font-semibold ${scope===k?'bg-teal text-white':'text-slate2'}`}>{l}</button>))}
+            </div>
+            <Btn kind="ghost" icon="printer" onClick={printList}>Print / PDF</Btn>
+          </div>
+        </div>
+        <p className="text-slate2 text-sm mb-4">Sorted by soonest due first, so you know which bags to deal with first. Tap an order for full details and to price extras.</p>
+
+        {list.length===0 ? <div className="bg-white card rounded-2xl p-8 text-center text-slate2">Nothing due {scope==='today'?'today':'this week'}.</div>
+        : <div className="space-y-3">
+            {list.map(o=>{ const c=custById(o.customerId); const dueToday=o.dueDate===TODAY;
+              return (
+                <button key={o.id} onClick={()=>setSel(o)} className={`w-full text-left bg-white card rounded-2xl p-4 border-l-4 hover:ring-2 hover:ring-teal/40 transition ${o.needsPricing?'border-rose-400':dueToday?'border-teal':'border-gray-200'}`}>
+                  <div className="flex flex-wrap items-start justify-between gap-3">
+                    <div className="min-w-[180px]">
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <Badge tone={dueToday?'teal':'grey'}>Due {fmtDate(o.dueDate)}</Badge>
+                        <Badge tone={statusTone(o.status)}>{o.status}</Badge>
+                        {o.paidInAdvance && <Badge tone="green">Paid</Badge>}
+                      </div>
+                      <div className="font-semibold text-ink mt-1.5">{fullName(c)}</div>
+                      <div className="text-sm text-slate2">{c.addr}</div>
+                      {o.extras.length>0 && <div className="text-xs text-amber-700 mt-1 inline-flex items-center gap-1"><Ic name="alert" size={13}/>To price: {o.extras.join(', ')}</div>}
+                    </div>
+                    <div className="text-sm grid grid-cols-2 gap-x-6 gap-y-0.5">
+                      <span className="text-slate2">Services</span><span className="text-ink text-right">{o.services.join(', ')}</span>
+                      <span className="text-slate2">Bags</span><span className="text-ink text-right">{o.bagsCount} · {o.weight}kg</span>
+                      <span className="text-slate2">Price</span><span className="text-ink text-right">{gbp(o.amount)}{o.needsPricing?' (prov.)':''}</span>
+                      <span className="text-slate2">Collected</span><span className="text-ink text-right">{fmtDate(o.collectedDate)} · {o.collectedAt}</span>
+                    </div>
+                  </div>
+                  {o.notes && <div className="text-xs text-ink mt-2 bg-amber-50 border border-amber-100 rounded-lg px-2 py-1 inline-flex items-start gap-1"><Ic name="note" size={13}/><span>{o.notes}</span></div>}
+                </button>);
+            })}
+          </div>}
+      </div>
+      {sel && <OrderModal order={orders.find(o=>o.id===sel.id)||sel} rates={rates} onClose={()=>setSel(null)} onSave={updateOrder} addAudit={addAudit}/>}
+    </div>
+  );
+}
+
+/* =================================================================== */
+/*  ADMIN                                                              */
+/* =================================================================== */
+function AdminLogin({ go, onLogin }) {
+  const [pin,setPin]=useState(''); const [err,setErr]=useState('');
+  const submit=()=>{ if(pin!=='0000'){setErr('Incorrect PIN (hint: 0000)');return;} onLogin(); };
+  return (
+    <LoginCard go={go} title="Admin sign in" sub="Boss access to all operations.">
+      <Field label="PIN"><input value={pin} onChange={e=>{setPin(e.target.value);setErr('')}} type="password" placeholder="0000"
+        className={inputCls+' mt-1'} onKeyDown={e=>e.key==='Enter'&&submit()} /></Field>
+      {err && <p className="text-rose-500 text-xs mt-2">{err}</p>}
+      <Btn onClick={submit} className="w-full mt-4">Log in</Btn>
+    </LoginCard>
+  );
+}
+function AdminApp({ go, jobs, setJobs, rates, setRates, audit, drivers, setDrivers, orders, addJob, updateOrder, addAudit }) {
+  const [tab,setTab]=useState('overview');
+  const [intake,setIntake]=useState(false);
+  const tabs=[['overview','chart','Overview'],['customers','users','Customers'],['orders','layers','Orders'],
+    ['pricing','tag','Pricing'],['drivers','truck','Drivers'],['logistics','pin','Logistics']];
+  return (
+    <div className="min-h-screen">
+      <TopBar left={<Logo h={26}/>} right={
+        <div className="flex items-center gap-2">
+          <Btn kind="rose" icon="plus" onClick={()=>setIntake(true)} className="!py-1.5 !px-3">New job</Btn>
+          <Btn kind="ghost" icon="logout" onClick={()=>go('landing')} className="!py-1.5 !px-3">Log out</Btn></div>} />
+      <div className="max-w-5xl mx-auto p-4">
+        <div className="flex gap-1 overflow-x-auto mb-4 bg-white rounded-2xl p-1 card">
+          {tabs.map(([k,ic,l])=>(<button key={k} onClick={()=>setTab(k)}
+            className={`px-3.5 py-2 rounded-xl text-sm font-semibold whitespace-nowrap inline-flex items-center gap-1.5 ${tab===k?'bg-teal text-white':'text-slate2 hover:bg-gray-50'}`}><Ic name={ic} size={15}/>{l}</button>))}
+        </div>
+        {tab==='overview'  && <Overview jobs={jobs} orders={orders} audit={audit} onNew={()=>setIntake(true)}/>}
+        {tab==='customers' && <Customers/>}
+        {tab==='orders'    && <Orders orders={orders} rates={rates} updateOrder={updateOrder} addAudit={addAudit}/>}
+        {tab==='pricing'   && <Pricing rates={rates} setRates={setRates}/>}
+        {tab==='drivers'   && <DriversAdmin drivers={drivers} setDrivers={setDrivers}/>}
+        {tab==='logistics' && <Logistics jobs={jobs} setJobs={setJobs} drivers={drivers} onNew={()=>setIntake(true)}/>}
+      </div>
+      {intake && <IntakeModal drivers={drivers} onClose={()=>setIntake(false)} onCreate={addJob}/>}
+    </div>
+  );
+}
+
+function IntakeModal({ drivers, onClose, onCreate }) {
+  const [q,setQ]=useState(''); const [customerId,setCustomerId]=useState(null);
+  const [type,setType]=useState('collection'); const [driverId,setDriverId]=useState(drivers[0].id);
+  const [returnDate,setReturnDate]=useState(addDays(TODAY,2)); const [packaging,setPackaging]=useState('Hanging');
+  const [instructions,setInstructions]=useState(''); const [paid,setPaid]=useState(false); const [window_,setWindow]=useState('16:00–17:00');
+  const matches = q.trim().length<1 ? [] : CUSTOMERS.filter(c=>(fullName(c)+' '+c.addr).toLowerCase().includes(q.toLowerCase())).slice(0,6);
+  const chosen = customerId ? custById(customerId) : null;
+  const create=()=>{ if(!customerId)return;
+    onCreate({ id:'j'+Date.now(), driverId, type, customerId, window:window_, status:'pending', packaging, instructions,
+      returnDate: type==='collection'?returnDate:undefined, paidInAdvance:paid,
+      ...(type==='delivery'?{bags:1,weight:0,amount:0,service:'—',paymentMethod:'Cash'}:{}) }); onClose(); };
+  return (
+    <div className="fixed inset-0 bg-black/40 flex items-center justify-center p-4 z-50" onClick={onClose}>
+      <div className="bg-white rounded-2xl p-6 w-full max-w-md max-h-[92vh] overflow-y-auto" onClick={e=>e.stopPropagation()}>
+        <div className="flex items-center justify-between mb-1">
+          <h3 className="text-lg font-bold text-ink">New job from WhatsApp / SMS</h3>
+          <button onClick={onClose} className="text-slate2 hover:text-ink"><Ic name="close" size={20}/></button>
+        </div>
+        <p className="text-xs text-slate2 mb-4">Log a booking so it appears in the driver's run. Price is captured on collection — no need to enter it here.</p>
+        <Field label="Find customer by name or address">
+          <div className="relative mt-1">
+            <span className="absolute left-3 top-1/2 -translate-y-1/2 text-slate2"><Ic name="search" size={16}/></span>
+            <input value={q} onChange={e=>{setQ(e.target.value);setCustomerId(null);}} placeholder="e.g. Myrtle Rd or Grace" className={inputCls+' pl-9'} />
+          </div>
+        </Field>
+        {!chosen && matches.map(c=>(
+          <button key={c.id} onClick={()=>{setCustomerId(c.id);setQ(fullName(c));}} className="w-full text-left px-3 py-2 hover:bg-gray-50 border-b border-gray-100 text-sm">
+            <div className="font-medium text-ink">{fullName(c)}</div><div className="text-slate2 text-xs">{c.addr}</div></button>))}
+        {chosen && <div className="bg-teal-light rounded-xl px-3 py-2 mt-2 text-sm">
+          <div className="font-semibold text-ink">{fullName(chosen)}</div><div className="text-slate2 text-xs">{chosen.addr} · {chosen.mob}</div></div>}
+        {q.trim() && !chosen && matches.length===0 && <p className="text-xs text-amber-600 mt-1">No match — in the full build you could add a new customer here.</p>}
+        <div className="grid grid-cols-2 gap-3 mt-4">
+          <Field label="Type"><select value={type} onChange={e=>setType(e.target.value)} className={inputCls+' mt-1'}>
+            <option value="collection">Collection</option><option value="delivery">Delivery</option></select></Field>
+          <Field label="Assign driver"><select value={driverId} onChange={e=>setDriverId(e.target.value)} className={inputCls+' mt-1'}>
+            {drivers.map(d=><option key={d.id} value={d.id}>{d.name}</option>)}</select></Field>
+          {type==='collection' && <Field label="Return by"><input type="date" value={returnDate} onChange={e=>setReturnDate(e.target.value)} className={inputCls+' mt-1'}/></Field>}
+          <Field label="Time window"><input value={window_} onChange={e=>setWindow(e.target.value)} className={inputCls+' mt-1'}/></Field>
+          <div className="col-span-2"><Field label="Packaging"><select value={packaging} onChange={e=>setPackaging(e.target.value)} className={inputCls+' mt-1'}>
+            {PACKAGING.map(p=><option key={p}>{p}</option>)}</select></Field></div>
+        </div>
+        <div className="mt-3"><Field label="Delivery / collection instructions (shown to driver)">
+          <textarea value={instructions} onChange={e=>setInstructions(e.target.value)} rows="2" placeholder="e.g. doesn't mind doorstep collection" className={inputCls+' mt-1'}></textarea></Field></div>
+        <label className="flex items-center gap-2 mt-3 text-sm text-ink"><input type="checkbox" checked={paid} onChange={e=>setPaid(e.target.checked)} className="accent-teal"/> Paid in advance</label>
+        <div className="flex gap-2 mt-5">
+          <Btn kind="ghost" onClick={onClose} className="flex-1">Cancel</Btn>
+          <Btn kind="rose" icon="plus" onClick={create} className="flex-1" {...(!customerId?{disabled:true}:{})}>Add to run</Btn>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function Stat({ label, value }) {
+  return <div className="bg-white card rounded-2xl p-4"><div className="text-2xl font-extrabold text-ink">{value}</div><div className="text-xs text-slate2 mt-0.5">{label}</div></div>;
+}
+function Overview({ jobs, orders, audit, onNew }) {
+  const done = jobs.filter(j=>j.status==='done');
+  const revenue = done.reduce((s,j)=>s+(j.amount||0),0);
+  const cols = jobs.filter(j=>j.type==='collection').length;
+  const needp = orders.filter(o=>o.needsPricing).length;
+  return (
+    <div>
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-4">
+        <Stat label="Customers" value={CUSTOMERS.length}/>
+        <Stat label="Jobs today" value={jobs.length}/>
+        <Stat label="Collections / deliveries" value={`${cols} / ${jobs.length-cols}`}/>
+        <Stat label="Awaiting shop pricing" value={needp}/>
+      </div>
+      <div className="bg-white card rounded-2xl p-4">
+        <div className="flex items-center justify-between mb-2">
+          <h3 className="font-bold text-ink">Audit trail</h3>
+          <Btn kind="subtle" icon="plus" onClick={onNew} className="!py-1 !px-3 text-xs">New job</Btn>
+        </div>
+        <p className="text-xs text-slate2 mb-3">Who did what, and when. Updates live as drivers confirm jobs and the shop prices extras.</p>
+        {audit.length===0 ? <p className="text-sm text-slate2">No activity yet. Log in as a driver and confirm a job, or price an order as the store team, to see it here.</p>
+          : <div className="space-y-2">{audit.map((a,i)=>(
+              <div key={i} className="flex gap-3 text-sm border-b border-gray-50 last:border-0 pb-2"><span className="text-slate2 tabular-nums">{a.time}</span><span className="text-ink">{a.text}</span></div>))}</div>}
+      </div>
+    </div>
+  );
+}
+function TableWrap({ head, children }) {
+  return <div className="bg-white card rounded-2xl overflow-x-auto">
+    <table className="w-full text-sm"><thead><tr className="bg-gray-50 text-left text-xs text-slate2 uppercase tracking-wide">
+      {head.map(h=><th key={h} className="px-4 py-2.5 font-semibold whitespace-nowrap">{h}</th>)}</tr></thead><tbody>{children}</tbody></table></div>;
+}
+function Customers() {
+  return (<div>
+    <div className="flex justify-between items-center mb-3"><h3 className="font-bold text-ink">Customers</h3>
+      <Btn kind="subtle" icon="plus" onClick={()=>alert('In the full build this opens an add-customer form (mock).')}>Add customer</Btn></div>
+    <TableWrap head={['Name','Address','Mobile','Email']}>
+      {CUSTOMERS.map(c=>(<tr key={c.id} className="border-t border-gray-50 hover:bg-gray-50">
+        <td className="px-4 py-2.5 font-medium text-ink">{fullName(c)}</td><td className="px-4 py-2.5 text-slate2">{c.addr}</td>
+        <td className="px-4 py-2.5 text-slate2">{c.mob}</td><td className="px-4 py-2.5 text-slate2">{c.email}</td></tr>))}
+    </TableWrap></div>);
+}
+function Orders({ orders, rates, updateOrder, addAudit }) {
+  const [sel,setSel]=useState(null);
+  const sorted=[...orders].sort((a,b)=>a.dueDate.localeCompare(b.dueDate));
+  return (<div><h3 className="font-bold text-ink mb-3">Orders in the shop</h3>
+    <TableWrap head={['Customer','Services','Bags/Weight','Price','Paid','Due','Status','']}>
+      {sorted.map(o=>{ const c=custById(o.customerId); return (
+        <tr key={o.id} className="border-t border-gray-50 hover:bg-gray-50 cursor-pointer" onClick={()=>setSel(o)}>
+          <td className="px-4 py-2.5 font-medium text-ink">{fullName(c)}</td>
+          <td className="px-4 py-2.5 text-slate2">{o.services.join(', ')}{o.extras.length?<span className="text-amber-600"> +{o.extras.length}</span>:''}</td>
+          <td className="px-4 py-2.5 text-slate2">{o.bagsCount} · {o.weight}kg</td>
+          <td className="px-4 py-2.5 text-ink">{gbp(o.amount)}{o.needsPricing?' *':''}</td>
+          <td className="px-4 py-2.5">{o.paidInAdvance?<Badge tone="green">Paid</Badge>:<span className="text-slate2">{o.paymentMethod}</span>}</td>
+          <td className="px-4 py-2.5 text-slate2">{fmtDate(o.dueDate)}</td>
+          <td className="px-4 py-2.5"><Badge tone={statusTone(o.status)}>{o.status}</Badge></td>
+          <td className="px-4 py-2.5 text-teal-dark"><Ic name="right" size={16}/></td></tr>);})}
+    </TableWrap>
+    <p className="text-xs text-slate2 mt-2">* provisional price — extras still to be added at the shop. Click a row to view or amend.</p>
+    {sel && <OrderModal order={orders.find(o=>o.id===sel.id)||sel} rates={rates} onClose={()=>setSel(null)} onSave={updateOrder} addAudit={addAudit}/>}
+  </div>);
+}
+function Pricing({ rates, setRates }) {
+  const setW=(k,v)=>setRates({...rates,weight:rates.weight.map(r=>r.key===k?{...r,price:parseFloat(v)||0}:r)});
+  const setI=(k,v)=>setRates({...rates,items:rates.items.map(r=>r.key===k?{...r,price:parseFloat(v)||0}:r)});
+  return (<div>
+    <h3 className="font-bold text-ink mb-1">Pricing</h3>
+    <p className="text-xs text-slate2 mb-3">Edit rates — the driver's calculator and the shop's amend-price tool update instantly.</p>
+    <div className="grid md:grid-cols-2 gap-4">
+      <div className="bg-white card rounded-2xl p-4">
+        <h4 className="font-bold text-ink text-sm mb-2">Weight-based (per kg)</h4>
+        {rates.weight.map(r=>(<div key={r.key} className="flex items-center justify-between py-1">
+          <span className="text-sm text-ink">{r.label}</span>
+          <div className="flex items-center gap-1"><span className="text-slate2 text-sm">£</span>
+            <input type="number" step="0.5" value={r.price} onChange={e=>setW(r.key,e.target.value)} className={inputCls+' !w-20 text-right !py-1'}/></div></div>))}
+        <div className="mt-3 pt-3 border-t border-gray-100 text-sm flex justify-between"><span className="text-slate2">Minimum order</span><span className="font-semibold text-ink">{gbp(rates.minOrder)}</span></div>
+        <div className="text-sm flex justify-between"><span className="text-slate2">First-order discount</span><span className="font-semibold text-ink">{Math.round(rates.firstOrderDiscount*100)}%</span></div>
+      </div>
+      <div className="bg-white card rounded-2xl p-4">
+        <h4 className="font-bold text-ink text-sm mb-2">Per-item</h4>
+        <div className="max-h-80 overflow-y-auto pr-1">
+          {rates.items.map(r=>(<div key={r.key} className="flex items-center justify-between py-1">
+            <span className="text-sm text-ink">{r.label}</span>
+            <div className="flex items-center gap-1"><span className="text-slate2 text-sm">£</span>
+              <input type="number" step="0.5" value={r.price} onChange={e=>setI(r.key,e.target.value)} className={inputCls+' !w-20 text-right !py-1'}/></div></div>))}
+        </div>
+      </div>
+    </div></div>);
+}
+function DriversAdmin({ drivers, setDrivers }) {
+  const [name,setName]=useState('');
+  const add=()=>{ if(!name.trim())return; setDrivers([...drivers,{id:'d'+(drivers.length+1),name:name.trim(),pin:'1234'}]); setName(''); };
+  return (<div><h3 className="font-bold text-ink mb-3">Drivers</h3>
+    <div className="bg-white card rounded-2xl p-4 mb-3 flex gap-2 items-end">
+      <div className="flex-1"><Field label="Enrol new driver"><input value={name} onChange={e=>setName(e.target.value)} placeholder="Full name" className={inputCls+' mt-1'} onKeyDown={e=>e.key==='Enter'&&add()}/></Field></div>
+      <Btn icon="plus" onClick={add}>Add driver</Btn></div>
+    <TableWrap head={['Driver','Login PIN','Status']}>
+      {drivers.map(d=>(<tr key={d.id} className="border-t border-gray-50 hover:bg-gray-50">
+        <td className="px-4 py-2.5 font-medium text-ink">{d.name}</td><td className="px-4 py-2.5 text-slate2">{d.pin}</td>
+        <td className="px-4 py-2.5"><Badge tone="green">Active</Badge></td></tr>))}
+    </TableWrap></div>);
+}
+function Logistics({ jobs, setJobs, drivers, onNew }) {
+  const [drag,setDrag]=useState(null);
+  const move=(driverId,jobId,dir)=>setJobs(prev=>moveJob(prev,driverId,jobId,dir));
+  const dropOnJob=(toDriverId,targetId)=>{ if(drag) setJobs(prev=>moveJobTo(prev,drag.jobId,toDriverId,targetId)); setDrag(null); };
+  const dropOnColumn=(toDriverId)=>{ if(drag) setJobs(prev=>moveJobTo(prev,drag.jobId,toDriverId,null)); setDrag(null); };
+  const reassign=(jobId,toDriverId)=>setJobs(prev=>moveJobTo(prev,jobId,toDriverId,null));
+  return (
+    <div>
+      <div className="flex items-center justify-between mb-1 flex-wrap gap-2">
+        <h3 className="font-bold text-ink">Logistics &amp; route planning</h3>
+        <Btn kind="rose" icon="plus" onClick={onNew} className="!py-1.5 !px-3">New job</Btn>
+      </div>
+      <p className="text-xs text-slate2 mb-3">Each driver's collections + deliveries for today. Drag a card to reorder <b>or drop it on the other driver</b> to reassign — or use the <b>Move to</b> menu. Chevrons nudge within a driver. <span className="text-rose-500 font-semibold">Pink = collection</span>, white = delivery.</p>
+      <div className="grid md:grid-cols-2 gap-4">
+        {drivers.map(d=>{
+          const list=jobs.filter(j=>j.driverId===d.id).sort((a,b)=>a.seq-b.seq);
+          const isDropTarget = drag && drag.fromDriverId!==d.id;
+          return (
+            <div key={d.id}
+              onDragOver={e=>{ if(isDropTarget){ e.preventDefault(); e.currentTarget.classList.add('drag-over'); } }}
+              onDragLeave={e=>e.currentTarget.classList.remove('drag-over')}
+              onDrop={e=>{ e.currentTarget.classList.remove('drag-over'); dropOnColumn(d.id); }}
+              className="bg-white card rounded-2xl p-4">
+              <h4 className="font-bold text-ink text-sm mb-2 inline-flex items-center gap-1.5"><Ic name="truck" size={16}/>{d.name} <span className="text-slate2 font-normal">· {list.length} stops</span>
+                {isDropTarget && <span className="text-teal-dark text-xs font-normal ml-1">— drop to reassign</span>}</h4>
+              {list.length===0 ? <p className="text-sm text-slate2 border-2 border-dashed border-gray-200 rounded-xl p-4 text-center">No route assigned{isDropTarget?' — drop a job here':''}.</p> :
+                <div className="space-y-2">
+                  {list.map((j,idx)=>{ const c=custById(j.customerId);
+                    return (
+                      <div key={j.id} draggable onDragStart={()=>setDrag({fromDriverId:d.id,jobId:j.id})} onDragEnd={()=>setDrag(null)}
+                        onDragOver={e=>{e.preventDefault(); e.stopPropagation(); e.currentTarget.classList.add('drag-over');}}
+                        onDragLeave={e=>e.currentTarget.classList.remove('drag-over')}
+                        onDrop={e=>{e.preventDefault(); e.stopPropagation(); e.currentTarget.classList.remove('drag-over'); dropOnJob(d.id,j.id);}}
+                        className={`rounded-xl border px-2 py-2 cursor-move ${j.type==='collection'?'bg-rose-50/70 border-rose-100':'bg-white border-gray-100'}`}>
+                        <div className="flex items-center gap-2">
+                          <span className="text-gray-300"><Ic name="grip" size={16}/></span>
+                          <span className={`w-6 h-6 rounded-full flex items-center justify-center text-xs font-bold text-white shrink-0 ${j.type==='collection'?'bg-rose-500':'bg-teal'}`}>{j.seq}</span>
+                          <div className="flex-1 min-w-0">
+                            <div className="flex items-center gap-1.5"><TypeBadge type={j.type}/><span className="text-xs text-slate2">{j.window}</span></div>
+                            <div className="text-sm text-ink truncate">{fullName(c)}</div>
+                            <div className="text-xs text-slate2 truncate">{c.addr}</div>
+                          </div>
+                          <div className="flex flex-col text-slate2">
+                            <button onClick={()=>move(d.id,j.id,'up')} disabled={idx===0} className={idx===0?'text-gray-200':'hover:text-teal'}><Ic name="up" size={16}/></button>
+                            <button onClick={()=>move(d.id,j.id,'down')} disabled={idx===list.length-1} className={idx===list.length-1?'text-gray-200':'hover:text-teal'}><Ic name="down" size={16}/></button>
+                          </div>
+                        </div>
+                        {drivers.length>1 &&
+                          <div className="flex items-center gap-1 mt-1.5 pl-8">
+                            <span className="text-[11px] text-slate2">Move to:</span>
+                            <select value={d.id} onChange={e=>reassign(j.id,e.target.value)} className="text-[11px] border border-gray-200 rounded-lg px-1 py-0.5 bg-white text-ink">
+                              {drivers.map(dr=><option key={dr.id} value={dr.id}>{dr.name}</option>)}</select>
+                          </div>}
+                      </div>);
+                  })}
+                </div>}
+            </div>);
+        })}
+      </div>
+    </div>
+  );
+}
+
+/* =================================================================== */
+/*  ROOT                                                              */
+/* =================================================================== */
+function App() {
+  const [view,setView]=useState('landing');
+  const [driver,setDriver]=useState(null);
+  const [jobs,setJobs]=useState(INITIAL_JOBS);
+  const [orders,setOrders]=useState(INITIAL_ORDERS);
+  const [rates,setRates]=useState(INITIAL_RATES);
+  const [drivers,setDrivers]=useState(DRIVERS);
+  const [audit,setAudit]=useState([]);
+  const addAudit=useCallback(text=>setAudit(prev=>[{time:now(),text},...prev]),[]);
+  const addOrder=useCallback(o=>setOrders(prev=>[o,...prev]),[]);
+  const updateOrder=useCallback((id,patch)=>setOrders(prev=>prev.map(o=>o.id===id?{...o,...patch}:o)),[]);
+  const addJob=useCallback(j=>{
+    if (j.type==='collection') {
+      const orderId='o'+Date.now(); // boss booking -> Pending Collection order, linked to the driver job
+      setOrders(prev=>[{ id:orderId, customerId:j.customerId, services:[], extras:[], needsPricing:false, addedItems:{}, firstOrder:false,
+        bagsCount:0, bagWeights:[], weight:0, weightCharge:0, amount:0, initialAmount:0,
+        packaging:j.packaging, paymentMethod:'—', paidInAdvance:j.paidInAdvance, collectedDate:null, collectedAt:null,
+        dueDate:j.returnDate||addDays(TODAY,2), status:'Pending Collection', notes:j.instructions }, ...prev]);
+      setJobs(prev=>{ const n=prev.filter(x=>x.driverId===j.driverId).length; return [...prev,{...j,orderId,seq:n+1}]; });
+    } else {
+      setJobs(prev=>{ const n=prev.filter(x=>x.driverId===j.driverId).length; return [...prev,{...j,seq:n+1}]; });
+    }
+  },[]);
+  const go=useCallback(v=>setView(v),[]);
+
+  if (view==='landing')      return <Landing go={go}/>;
+  if (view==='driver-login') return <DriverLogin go={go} onLogin={d=>{setDriver(d);go('driver-app');}}/>;
+  if (view==='driver-app')   return <DriverApp driver={driver} go={go} jobs={jobs} setJobs={setJobs} rates={rates} addAudit={addAudit} addOrder={addOrder} updateOrder={updateOrder}/>;
+  if (view==='store-login')  return <StoreLogin go={go} onLogin={()=>go('store-app')}/>;
+  if (view==='store-app')    return <StoreApp go={go} orders={orders} rates={rates} updateOrder={updateOrder} addAudit={addAudit}/>;
+  if (view==='admin-login')  return <AdminLogin go={go} onLogin={()=>go('admin-app')}/>;
+  if (view==='admin-app')    return <AdminApp go={go} jobs={jobs} setJobs={setJobs} rates={rates} setRates={setRates} audit={audit} drivers={drivers} setDrivers={setDrivers} orders={orders} addJob={addJob} updateOrder={updateOrder} addAudit={addAudit}/>;
+  return null;
+}
+ReactDOM.createRoot(document.getElementById('root')).render(<App/>);
+</script>
+</body>
+</html>
