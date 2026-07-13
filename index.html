@@ -33,6 +33,8 @@
   select { -webkit-appearance:none; appearance:none; padding-right:2rem !important;
     background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='16' height='16' fill='none' stroke='%236b7a82' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='m4 6 4 4 4-4'/></svg>");
     background-repeat:no-repeat; background-position:right 0.65rem center; }
+  /* iOS native date fields won't shrink to their container by default — constrain them */
+  input[type=date] { -webkit-appearance:none; appearance:none; min-width:0; text-align:left; }
 </style>
 </head>
 <body>
@@ -289,7 +291,7 @@ function LoginCard({ title, sub, go, children }) {
   );
 }
 function Field({ label, children, hint }) {
-  return <div><label className="text-xs font-semibold text-slate2">{label}</label>{children}{hint&&<p className="text-[11px] text-slate2 mt-1">{hint}</p>}</div>;
+  return <div className="min-w-0"><label className="text-xs font-semibold text-slate2">{label}</label>{children}{hint&&<p className="text-[11px] text-slate2 mt-1">{hint}</p>}</div>;
 }
 const inputCls = "w-full bg-white border border-gray-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-teal/40 focus:border-teal";
 
