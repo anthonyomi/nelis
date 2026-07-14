@@ -954,8 +954,11 @@ function Overview({ jobs, orders, audit, onNew }) {
         </div>
         <p className="text-xs text-slate2 mb-3">Who did what, and when. Updates live as drivers confirm jobs and the shop prices extras.</p>
         {audit.length===0 ? <p className="text-sm text-slate2">No activity yet. Log in as a driver and confirm a job, or price an order as the store team, to see it here.</p>
-          : <div className="space-y-2">{audit.map((a,i)=>(
-              <div key={i} className="flex gap-3 text-sm border-b border-gray-50 last:border-0 pb-2"><span className="text-slate2 tabular-nums">{a.time}</span><span className="text-ink">{a.text}</span></div>))}</div>}
+          : <div className="space-y-2">{audit.map((a,i)=>{ const alert=/^No answer/.test(a.text); return (
+              <div key={i} className={`flex gap-3 text-sm border-b border-gray-50 last:border-0 pb-2 ${alert?'bg-rose-50 -mx-2 px-2 rounded-lg':''}`}>
+                <span className={`tabular-nums ${alert?'text-rose-500':'text-slate2'}`}>{a.time}</span>
+                <span className={alert?'text-rose-600 font-semibold inline-flex items-start gap-1':'text-ink'}>{alert&&<Ic name="alert" size={14} className="mt-0.5 shrink-0"/>}{a.text}</span>
+              </div>);})}</div>}
       </div>
     </div>
   );
@@ -979,19 +982,24 @@ function Orders({ orders, rates, updateOrder, addAudit }) {
   const [sel,setSel]=useState(null);
   const sorted=[...orders].sort((a,b)=>a.dueDate.localeCompare(b.dueDate));
   return (<div><h3 className="font-bold text-ink mb-3">Orders in the shop</h3>
-    <TableWrap head={['Customer','Services','Bags/Weight','Price','Paid','Due','Status','']}>
+    <div className="space-y-2">
       {sorted.map(o=>{ const c=custById(o.customerId); return (
-        <tr key={o.id} className="border-t border-gray-50 hover:bg-gray-50 cursor-pointer" onClick={()=>setSel(o)}>
-          <td className="px-4 py-2.5 font-medium text-ink">{fullName(c)}</td>
-          <td className="px-4 py-2.5 text-slate2">{o.services.join(', ')}{o.extras.length?<span className="text-amber-600"> +{o.extras.length}</span>:''}</td>
-          <td className="px-4 py-2.5 text-slate2">{o.bagsCount} · {o.weight}kg</td>
-          <td className="px-4 py-2.5 text-ink">{gbp(o.amount)}{o.needsPricing?' *':''}</td>
-          <td className="px-4 py-2.5">{o.paidInAdvance?<Badge tone="green">Paid</Badge>:<span className="text-slate2">{o.paymentMethod}</span>}</td>
-          <td className="px-4 py-2.5 text-slate2">{fmtDate(o.dueDate)}</td>
-          <td className="px-4 py-2.5"><Badge tone={statusTone(o.status)}>{o.status}</Badge></td>
-          <td className="px-4 py-2.5 text-teal-dark"><Ic name="right" size={16}/></td></tr>);})}
-    </TableWrap>
-    <p className="text-xs text-slate2 mt-2">* provisional price — extras still to be added at the shop. Click a row to view or amend.</p>
+        <button key={o.id} onClick={()=>setSel(o)} className="w-full text-left bg-white card rounded-2xl p-3.5 hover:ring-2 hover:ring-teal/40 transition">
+          <div className="flex items-center justify-between gap-2">
+            <span className="font-semibold text-ink truncate">{fullName(c)}</span>
+            <Badge tone={statusTone(o.status)}>{o.status}</Badge>
+          </div>
+          <div className="flex items-center justify-between gap-2 mt-1 text-sm">
+            <span className="text-slate2 truncate">{o.services.join(', ')}{o.extras.length?<span className="text-amber-600"> +{o.extras.length}</span>:''}</span>
+            <span className="text-slate2 shrink-0">{o.bagsCount} · {o.weight}kg</span>
+          </div>
+          <div className="flex items-center justify-between gap-2 mt-1.5 text-sm">
+            <span className="font-bold text-ink inline-flex items-center gap-2">{gbp(o.amount)}{o.needsPricing&&<span className="text-rose-500 font-normal text-xs">prov.</span>}{o.paidInAdvance&&<Badge tone="green">Paid</Badge>}</span>
+            <span className="text-slate2 text-xs inline-flex items-center gap-1"><Ic name="clock" size={13}/>Due {fmtDate(o.dueDate)}</span>
+          </div>
+        </button>);})}
+    </div>
+    <p className="text-xs text-slate2 mt-2">Tap an order to view details or amend the price. “prov.” = provisional, extras still to be added at the shop.</p>
     {sel && <OrderModal order={orders.find(o=>o.id===sel.id)||sel} rates={rates} onClose={()=>setSel(null)} onSave={updateOrder} addAudit={addAudit}/>}
   </div>);
 }
