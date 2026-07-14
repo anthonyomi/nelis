@@ -583,7 +583,7 @@ function CollectionForm({ job, rates, onBack, onConfirm, onNoAnswer }) {
 
         <Btn kind="green" className="w-full mt-4" onClick={()=>setConfirmed(true)} {...(!canConfirm?{disabled:true}:{})}>
           Confirm collection{!isShirts&&result.charged>0?` · ${gbp(result.charged)}`:''}</Btn>
-        <button onClick={()=>onNoAnswer(job)} className="w-full mt-2 text-sm font-semibold text-rose-600 py-2 inline-flex items-center justify-center gap-1.5"><Ic name="alert" size={15}/>No answer — reschedule</button>
+        <button onClick={()=>onNoAnswer(job)} className="w-full mt-2 border-2 border-rose-200 bg-white text-rose-600 rounded-xl py-2 text-sm font-semibold inline-flex items-center justify-center gap-1.5 hover:bg-rose-50 transition"><Ic name="alert" size={15}/>No answer — reschedule</button>
       </div>
     </div>
   );
@@ -619,7 +619,7 @@ function DeliveryView({ job, onBack, onConfirm, onNoAnswer }) {
               </div>
             </>}
         <Btn kind="green" icon="check" className="w-full mt-4" onClick={()=>onConfirm(job, paid?'Paid in advance':payment)}>Confirm bags delivered</Btn>
-        <button onClick={()=>onNoAnswer(job)} className="w-full mt-2 text-sm font-semibold text-rose-600 py-2 inline-flex items-center justify-center gap-1.5"><Ic name="alert" size={15}/>No answer — reschedule</button>
+        <button onClick={()=>onNoAnswer(job)} className="w-full mt-2 border-2 border-rose-200 bg-white text-rose-600 rounded-xl py-2 text-sm font-semibold inline-flex items-center justify-center gap-1.5 hover:bg-rose-50 transition"><Ic name="alert" size={15}/>No answer — reschedule</button>
       </div>
     </div>
   );
