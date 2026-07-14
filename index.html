@@ -972,11 +972,17 @@ function Customers() {
   return (<div>
     <div className="flex justify-between items-center mb-3"><h3 className="font-bold text-ink">Customers</h3>
       <Btn kind="subtle" icon="plus" onClick={()=>alert('In the full build this opens an add-customer form (mock).')}>Add customer</Btn></div>
-    <TableWrap head={['Name','Address','Mobile','Email']}>
-      {CUSTOMERS.map(c=>(<tr key={c.id} className="border-t border-gray-50 hover:bg-gray-50">
-        <td className="px-4 py-2.5 font-medium text-ink">{fullName(c)}</td><td className="px-4 py-2.5 text-slate2">{c.addr}</td>
-        <td className="px-4 py-2.5 text-slate2">{c.mob}</td><td className="px-4 py-2.5 text-slate2">{c.email}</td></tr>))}
-    </TableWrap></div>);
+    <div className="space-y-2">
+      {CUSTOMERS.map(c=>(
+        <div key={c.id} className="bg-white card rounded-2xl p-3.5">
+          <div className="font-semibold text-ink">{fullName(c)}</div>
+          <div className="text-sm text-slate2 mt-0.5 flex items-start gap-1.5"><Ic name="pin" size={14} className="mt-0.5 shrink-0"/>{c.addr}</div>
+          <div className="flex flex-wrap gap-x-4 gap-y-1 mt-1.5 text-sm text-slate2">
+            <a href={`tel:${c.mob.replace(/\s/g,'')}`} className="inline-flex items-center gap-1.5 text-teal-dark font-medium"><Ic name="phone" size={14}/>{c.mob}</a>
+            <span className="inline-flex items-center gap-1.5 truncate"><Ic name="mail" size={14} className="shrink-0"/>{c.email}</span>
+          </div>
+        </div>))}
+    </div></div>);
 }
 function Orders({ orders, rates, updateOrder, addAudit }) {
   const [sel,setSel]=useState(null);
