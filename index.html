@@ -72,6 +72,7 @@ const ICONS = {
   logout:<g><path d="M15 4h3a1 1 0 0 1 1 1v14a1 1 0 0 1-1 1h-3"/><path d="M10 8l-4 4 4 4M6 12h9"/></g>,
   alert:<g><path d="M12 4 2.5 20h19z"/><path d="M12 10v4M12 17.5v.2"/></g>,
   info:<g><circle cx="12" cy="12" r="9"/><path d="M12 11v5M12 8v.2"/></g>,
+  phone:<path d="M6.5 3h3l1.5 4-2 1.3a12 12 0 0 0 5.7 5.7l1.3-2 4 1.5v3a2 2 0 0 1-2.2 2A17 17 0 0 1 4.5 5.2 2 2 0 0 1 6.5 3z"/>,
 };
 function Ic({ name, size=18, className='', stroke=1.9 }) {
   const grip = name==='grip';
@@ -96,6 +97,10 @@ const INITIAL_RATES = {
     { key:'dc_2piece',   label:'Dry clean — 2-piece suit',price:10.00, group:'Dry Cleaning' },
     { key:'dc_dress',    label:'Dry clean — dress',       price:10.00, group:'Dry Cleaning' },
     { key:'dc_coat',     label:'Dry clean — coat',        price:10.00, group:'Dry Cleaning' },
+    { key:'sh_io',       label:'Shirt — iron only',       price:2.00,  group:'Shirt Service' },
+    { key:'sh_wi',       label:'Shirt — wash & iron',     price:3.00,  group:'Shirt Service' },
+    { key:'sh_starch',   label:'Shirt starching',         price:0.25,  group:'Shirt Service' },
+    { key:'sh_fold',     label:'Shirt folding',           price:0.50,  group:'Shirt Service' },
     { key:'hh_duvet_s',  label:'Duvet — single',          price:15.00, group:'Bedding' },
     { key:'hh_duvet_d',  label:'Duvet — double',          price:20.00, group:'Bedding' },
     { key:'hh_duvet_k',  label:'Duvet — king',            price:22.00, group:'Bedding' },
@@ -345,27 +350,34 @@ function DriverApp({ driver, go, jobs, setJobs, rates, addAudit, addOrder, updat
   const [openId,setOpenId]=useState(null);
   const myJobs = jobs.filter(j=>j.driverId===driver.id).sort((a,b)=>a.seq-b.seq);
   const nextPendingId = (myJobs.find(j=>j.status==='pending')||{}).id;
-  const done = myJobs.filter(j=>j.status==='done').length;
+  const done = myJobs.filter(j=>j.status!=='pending').length;
   const openJob = openId ? myJobs.find(j=>j.id===openId) : null;
 
   const completeCollection = (job, data) => {
     setJobs(prev => prev.map(j => j.id===job.id ? {...j, status:'done', doneAt:now(), ...data} : j));
     const c = custById(job.customerId);
-    const patch = { services:[data.service], extras:data.extras, needsPricing:data.extras.length>0,
+    const patch = { services:[data.service], extras:data.extras, needsPricing:data.needsPricing,
       bagsCount:data.bagWeights.length, bagWeights:data.bagWeights, weight:data.weight,
       weightCharge:data.weightCharge, amount:data.amount, initialAmount:data.amount,
       paymentMethod:data.paymentMethod, collectedDate:TODAY, collectedAt:now(),
-      status:data.extras.length>0?'Needs pricing':'Collected',
-      notes:[job.instructions,data.customerNotes].filter(Boolean).join(' · ') };
+      status:data.needsPricing?'Needs pricing':'Collected',
+      notes:[job.instructions,data.customerNotes,data.shirtCount?`Customer said ~${data.shirtCount} shirts (confirm at shop)`:''].filter(Boolean).join(' · ') };
     if (job.orderId) updateOrder(job.orderId, patch); // move the Pending Collection order to Collected
     else addOrder({ id:'ord'+Date.now(), customerId:job.customerId, addedItems:{}, firstOrder:data.firstOrder,
       packaging:job.packaging, paidInAdvance:job.paidInAdvance, dueDate:job.returnDate||addDays(TODAY,2), ...patch });
-    addAudit(`${driver.name} collected from ${fullName(c)} · ${gbp(data.amount)}${data.extras.length? ' (provisional)':''} · ${data.paymentMethod}`);
+    const priceStr = data.needsPricing ? (data.amount>0?gbp(data.amount)+' (provisional)':'priced at shop') : gbp(data.amount);
+    addAudit(`${driver.name} collected from ${fullName(c)} · ${priceStr} · ${data.paymentMethod}`);
     setOpenId(null);
   };
-  const completeDelivery = (job) => {
-    setJobs(prev => prev.map(j => j.id===job.id ? {...j, status:'done', doneAt:now()} : j));
-    addAudit(`${driver.name} delivered to ${fullName(custById(job.customerId))}`);
+  const completeDelivery = (job, payment) => {
+    setJobs(prev => prev.map(j => j.id===job.id ? {...j, status:'done', doneAt:now(), paymentMethod:payment} : j));
+    addAudit(`${driver.name} delivered to ${fullName(custById(job.customerId))} · ${payment}`);
+    setOpenId(null);
+  };
+  const markNoAnswer = (job) => {
+    setJobs(prev => prev.map(j => j.id===job.id ? {...j, status:'no-answer', doneAt:now()} : j));
+    if (job.orderId) updateOrder(job.orderId, {status:'No answer'});
+    addAudit(`No answer at ${fullName(custById(job.customerId))} (${job.type}) — needs rescheduling`);
     setOpenId(null);
   };
 
@@ -384,26 +396,31 @@ function DriverApp({ driver, go, jobs, setJobs, rates, addAudit, addOrder, updat
           <div className="space-y-3">
             {myJobs.map(job => {
               const c = custById(job.customerId);
-              const isNext = job.id===nextPendingId, isDone = job.status==='done';
+              const isDone = job.status==='done', isNoAnswer = job.status==='no-answer';
+              const resolved = isDone || isNoAnswer;
+              const isNext = job.id===nextPendingId;
               return (
-                <div key={job.id} className={`rounded-2xl p-4 border transition card ${rowTint(job.type,isDone)} ${isNext?'ring-2 ring-teal':''}`}>
+                <div key={job.id} className={`rounded-2xl p-4 border transition card ${rowTint(job.type,resolved)} ${isNext?'ring-2 ring-teal':''}`}>
                   <div className="flex items-start justify-between gap-3">
                     <div className="flex gap-3">
-                      <div className={`w-8 h-8 rounded-full flex items-center justify-center font-bold text-sm shrink-0 ${isDone?'bg-gray-300 text-white':job.type==='collection'?'bg-rose-500 text-white':'bg-teal text-white'}`}>{job.seq}</div>
+                      <div className={`w-8 h-8 rounded-full flex items-center justify-center font-bold text-sm shrink-0 ${resolved?'bg-gray-300 text-white':job.type==='collection'?'bg-rose-500 text-white':'bg-teal text-white'}`}>{job.seq}</div>
                       <div>
                         <div className="flex items-center gap-2 flex-wrap">
                           <TypeBadge type={job.type}/>
                           <span className="text-xs text-slate2 inline-flex items-center gap-1"><Ic name="clock" size={13}/>{job.window}</span>
                           {job.paidInAdvance && <Badge tone="green">Paid</Badge>}
                           {isDone && <span className="text-xs text-emerald-600 font-semibold inline-flex items-center gap-1"><Ic name="check" size={13}/>{job.doneAt}</span>}
+                          {isNoAnswer && <Badge tone="rose">No answer</Badge>}
                         </div>
                         <div className="font-semibold text-ink mt-1">{fullName(c)}</div>
                         <div className="text-sm text-slate2">{c.addr}</div>
-                        <div className="text-xs text-slate2 mt-0.5 inline-flex items-center gap-1"><Ic name="box" size={13}/>{job.packaging}{job.type==='collection'&&job.returnDate?` · return ${fmtDate(job.returnDate)}`:''}</div>
+                        {job.type==='delivery'
+                          ? <div className="text-xs text-slate2 mt-0.5 inline-flex items-center gap-1"><Ic name="box" size={13}/>{job.packaging}</div>
+                          : job.returnDate && <div className="text-xs text-slate2 mt-0.5">Return {fmtDate(job.returnDate)}</div>}
                         {job.instructions && <div className="text-xs text-rose-700 mt-1 bg-rose-50 rounded-lg px-2 py-1 inline-flex items-start gap-1"><Ic name="note" size={13}/><span>{job.instructions}</span></div>}
                       </div>
                     </div>
-                    {!isDone && <Btn kind={isNext?(job.type==='collection'?'rose':'primary'):'subtle'} onClick={()=>setOpenId(job.id)} className="!py-1.5 !px-3 shrink-0">Open</Btn>}
+                    {!resolved && <Btn kind={isNext?(job.type==='collection'?'rose':'primary'):'subtle'} onClick={()=>setOpenId(job.id)} className="!py-1.5 !px-3 shrink-0">Open</Btn>}
                   </div>
                 </div>
               );
@@ -412,8 +429,8 @@ function DriverApp({ driver, go, jobs, setJobs, rates, addAudit, addOrder, updat
         </>}
 
         {openJob && (openJob.type==='collection'
-          ? <CollectionForm job={openJob} rates={rates} onBack={()=>setOpenId(null)} onConfirm={completeCollection} />
-          : <DeliveryView job={openJob} onBack={()=>setOpenId(null)} onConfirm={completeDelivery} />)}
+          ? <CollectionForm job={openJob} rates={rates} onBack={()=>setOpenId(null)} onConfirm={completeCollection} onNoAnswer={markNoAnswer} />
+          : <DeliveryView job={openJob} onBack={()=>setOpenId(null)} onConfirm={completeDelivery} onNoAnswer={markNoAnswer} />)}
       </div>
     </div>
   );
@@ -424,21 +441,34 @@ function DirectionsBtn({ addr }) {
     className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl text-sm font-semibold bg-white border border-gray-200 text-ink hover:bg-gray-50">
     <Ic name="pin" size={16}/>Directions</a>;
 }
+function CallBtn({ mob }) {
+  return <a href={`tel:${mob.replace(/\s/g,'')}`}
+    className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl text-sm font-semibold bg-white border border-gray-200 text-ink hover:bg-gray-50">
+    <Ic name="phone" size={16}/>Call</a>;
+}
 
-function CollectionForm({ job, rates, onBack, onConfirm }) {
+function CollectionForm({ job, rates, onBack, onConfirm, onNoAnswer }) {
   const c = custById(job.customerId);
   const [bags,setBags]=useState([{id:1,weight:''}]);
   const [serviceKey,setServiceKey]=useState('iron');
+  const [shirtType,setShirtType]=useState('io');
+  const [shirtCount,setShirtCount]=useState('');
   const [extras,setExtras]=useState([]);
   const [firstOrder,setFirstOrder]=useState(false);
   const [payment,setPayment]=useState('Cash');
   const [notes,setNotes]=useState('');
   const [confirmed,setConfirmed]=useState(false);
 
+  const isShirts = serviceKey==='shirts';
   const totalWeight = useMemo(()=>sum(bags.map(b=>b.weight)), [bags]);
-  const result = useMemo(()=>calcPrice(rates,{[serviceKey]:totalWeight},{},firstOrder), [rates,serviceKey,totalWeight,firstOrder]);
-  const svcLabel = rates.weight.find(r=>r.key===serviceKey).label.replace(/ \(.*\)/,'');
-  const needsPricing = extras.length>0;
+  const result = useMemo(()=>calcPrice(rates, isShirts?{}:{[serviceKey]:totalWeight},{},firstOrder), [rates,serviceKey,isShirts,totalWeight,firstOrder]);
+  const wsvc = rates.weight.find(r=>r.key===serviceKey);
+  const svcLabel = isShirts ? `Shirt service (${shirtType==='io'?'iron only':'wash & iron'})` : wsvc.label.replace(/ \(.*\)/,'');
+  const needsPricing = extras.length>0 || isShirts;
+  const canConfirm = isShirts || result.charged>0;
+  const confirmData = { bagWeights:isShirts?[]:bags.map(b=>parseFloat(b.weight)||0), weight:isShirts?0:totalWeight,
+    service:svcLabel, weightCharge:isShirts?0:result.subtotal, amount:isShirts?0:result.charged, firstOrder,
+    paymentMethod:payment, customerNotes:notes, extras, needsPricing, shirtCount:isShirts?shirtCount:'' };
 
   const addBag=()=>setBags(b=>[...b,{id:(b[b.length-1]?.id||0)+1,weight:''}]);
   const rmBag=id=>setBags(b=>b.length>1?b.filter(x=>x.id!==id):b);
@@ -449,11 +479,10 @@ function CollectionForm({ job, rates, onBack, onConfirm }) {
     <div className="bg-white card rounded-2xl p-8 text-center">
       <div className="w-16 h-16 mx-auto rounded-full bg-emerald-50 text-emerald-600 flex items-center justify-center"><Ic name="check" size={34} stroke={2.4}/></div>
       <h3 className="text-xl font-bold text-ink mt-3">Collection confirmed</h3>
-      <p className="text-slate2 mt-1">{fullName(c)} · {gbp(result.charged)}{needsPricing?' (provisional)':''} · {payment}</p>
-      {needsPricing && <div className="bg-amber-50 text-amber-700 rounded-xl p-3 mt-4 text-sm inline-flex items-center gap-2"><Ic name="alert" size={16}/>Extras noted — shop will price {extras.join(', ').toLowerCase()} and finalise the total.</div>}
+      <p className="text-slate2 mt-1">{fullName(c)} · {isShirts?'priced at shop':gbp(result.charged)+(needsPricing?' (provisional)':'')} · {payment}</p>
+      {needsPricing && <div className="bg-amber-50 text-amber-700 rounded-xl p-3 mt-4 text-sm inline-flex items-center gap-2"><Ic name="alert" size={16}/>{isShirts?`Shirts will be counted & priced at the shop${extras.length?`, along with ${extras.join(', ').toLowerCase()}`:''}.`:`Extras noted — shop will price ${extras.join(', ').toLowerCase()} and finalise the total.`}</div>}
       <div className="bg-teal-light text-teal-dark rounded-xl p-3 mt-3 text-sm flex items-center justify-center gap-2"><Ic name="mail" size={16}/>{needsPricing?'Provisional':'Receipt'} email sent to {c.email}</div>
-      <div className="mt-6"><Btn icon="right" onClick={()=>onConfirm(job,{ bagWeights:bags.map(b=>parseFloat(b.weight)||0), weight:totalWeight,
-        service:svcLabel, weightCharge:result.subtotal, amount:result.charged, firstOrder, paymentMethod:payment, customerNotes:notes, extras })}>Back to run</Btn></div>
+      <div className="mt-6"><Btn icon="right" onClick={()=>onConfirm(job,confirmData)}>Back to run</Btn></div>
     </div>
   );
 
@@ -465,36 +494,54 @@ function CollectionForm({ job, rates, onBack, onConfirm }) {
           <div><TypeBadge type="collection"/>
             <h3 className="text-lg font-bold text-ink mt-1">{fullName(c)}</h3>
             <p className="text-sm text-slate2">{c.addr}</p>
-            <p className="text-xs text-slate2 mt-0.5 inline-flex items-center gap-1"><Ic name="box" size={13}/>{job.packaging}{job.returnDate?` · return ${fmtDate(job.returnDate)}`:''}</p>
+            {job.returnDate && <p className="text-xs text-slate2 mt-0.5">Return {fmtDate(job.returnDate)}</p>}
           </div>
-          <DirectionsBtn addr={c.addr}/>
+          <div className="flex flex-col gap-2 shrink-0"><DirectionsBtn addr={c.addr}/><CallBtn mob={c.mob}/></div>
         </div>
         {job.instructions && <div className="text-xs text-rose-700 mt-3 bg-rose-50 rounded-lg px-2 py-1.5 inline-flex items-start gap-1"><Ic name="note" size={14}/><span>Boss note: {job.instructions}</span></div>}
 
         <hr className="my-4 border-gray-100"/>
-        <div className="flex items-center justify-between">
-          <h4 className="font-bold text-ink text-sm">Bags &amp; weight</h4>
-          <Btn kind="subtle" icon="plus" onClick={addBag} className="!py-1 !px-2 text-xs">Add bag</Btn>
-        </div>
-        <div className="space-y-2 mt-2">
-          {bags.map((b,i)=>(
-            <div key={b.id} className="flex items-center gap-2">
-              <span className="text-sm text-slate2 w-14">Bag {i+1}</span>
-              <input type="number" min="0" step="0.1" value={b.weight} onChange={e=>setBagW(b.id,e.target.value)} className={inputCls+' !w-24 text-right'} placeholder="0.0"/>
-              <span className="text-xs text-slate2">kg</span>
-              {bags.length>1 && <button onClick={()=>rmBag(b.id)} className="text-rose-400 text-xs ml-1 hover:text-rose-600 inline-flex items-center gap-0.5"><Ic name="close" size={13}/>remove</button>}
-            </div>
-          ))}
-          <div className="text-sm text-ink font-semibold pt-1">Total weight: {totalWeight.toFixed(1)} kg <span className="text-slate2 font-normal">across {bags.length} bag{bags.length>1?'s':''}</span></div>
-        </div>
-
-        <h4 className="font-bold text-ink text-sm mt-4 mb-1">Service <span className="text-slate2 font-normal">(applied to total weight)</span></h4>
+        <h4 className="font-bold text-ink text-sm mb-1">Service</h4>
         <div className="space-y-1">
           {rates.weight.map(r=>(
             <label key={r.key} className="flex items-center gap-2 text-sm text-ink">
               <input type="radio" name="svc" checked={serviceKey===r.key} onChange={()=>setServiceKey(r.key)} className="accent-teal"/>
               {r.label} <span className="text-slate2">({gbp(r.price)}/kg)</span></label>))}
+          <label className="flex items-center gap-2 text-sm text-ink">
+            <input type="radio" name="svc" checked={isShirts} onChange={()=>setServiceKey('shirts')} className="accent-teal"/>
+            Shirt service <span className="text-slate2">(counted at the shop)</span></label>
         </div>
+
+        {!isShirts ? <>
+          <div className="flex items-center justify-between mt-4">
+            <h4 className="font-bold text-ink text-sm">Bags &amp; weight</h4>
+            <Btn kind="subtle" icon="plus" onClick={addBag} className="!py-1 !px-2 text-xs">Add bag</Btn>
+          </div>
+          <div className="space-y-2 mt-2">
+            {bags.map((b,i)=>(
+              <div key={b.id} className="flex items-center gap-2">
+                <span className="text-sm text-slate2 w-14">Bag {i+1}</span>
+                <input type="number" min="0" step="0.1" value={b.weight} onChange={e=>setBagW(b.id,e.target.value)} className={inputCls+' !w-24 text-right'} placeholder="0.0"/>
+                <span className="text-xs text-slate2">kg</span>
+                {bags.length>1 && <button onClick={()=>rmBag(b.id)} className="text-rose-400 text-xs ml-1 hover:text-rose-600 inline-flex items-center gap-0.5"><Ic name="close" size={13}/>remove</button>}
+              </div>
+            ))}
+            <div className="text-sm text-ink font-semibold pt-1">Total weight: {totalWeight.toFixed(1)} kg <span className="text-slate2 font-normal">across {bags.length} bag{bags.length>1?'s':''}</span></div>
+          </div>
+        </> : <>
+          <div className="mt-3 bg-amber-50 border border-amber-100 rounded-xl p-3">
+            <div className="text-sm font-semibold text-ink">Shirts — counted at the shop</div>
+            <p className="text-xs text-amber-700 mb-2">No need to count or price on the doorstep. Just take the bag; the shop confirms the count.</p>
+            <div className="space-y-1">
+              <label className="flex items-center gap-2 text-sm text-ink"><input type="radio" name="shirt" checked={shirtType==='io'} onChange={()=>setShirtType('io')} className="accent-teal"/>Iron only <span className="text-slate2">(£2.00/shirt)</span></label>
+              <label className="flex items-center gap-2 text-sm text-ink"><input type="radio" name="shirt" checked={shirtType==='wi'} onChange={()=>setShirtType('wi')} className="accent-teal"/>Wash &amp; iron <span className="text-slate2">(£3.00/shirt)</span></label>
+            </div>
+            <div className="flex items-center gap-2 mt-2">
+              <span className="text-sm text-slate2">Shirts (only if the customer gave a number)</span>
+              <input type="number" min="0" step="1" value={shirtCount} onChange={e=>setShirtCount(e.target.value)} className={inputCls+' !w-20 text-right'} placeholder="—"/>
+            </div>
+          </div>
+        </>}
 
         <h4 className="font-bold text-ink text-sm mt-4 mb-1">Extras in the bag <span className="text-slate2 font-normal">— priced at the shop</span></h4>
         <p className="text-xs text-slate2 mb-2">Just tick what the customer says is in there. No need to unpack or price it at the door.</p>
@@ -504,7 +551,7 @@ function CollectionForm({ job, rates, onBack, onConfirm }) {
               className={`inline-flex items-center gap-1 px-3 py-1.5 rounded-full text-xs font-semibold border transition ${extras.includes(x)?'bg-amber-50 border-amber-300 text-amber-700':'bg-white border-gray-200 text-slate2 hover:border-gray-300'}`}>
               {extras.includes(x)&&<Ic name="check" size={13}/>}{x}</button>))}
         </div>
-        {needsPricing && <div className="text-xs text-amber-700 bg-amber-50 rounded-lg px-2 py-1.5 mt-2 inline-flex items-center gap-1"><Ic name="alert" size={14}/>Price below is provisional — shop finalises it.</div>}
+        {needsPricing && <div className="text-xs text-amber-700 bg-amber-50 rounded-lg px-2 py-1.5 mt-2 inline-flex items-center gap-1"><Ic name="alert" size={14}/>{isShirts?'Shirts and any extras are counted & priced at the shop.':'Price below is provisional — shop finalises it.'}</div>}
 
         <label className="flex items-center gap-2 mt-3 text-sm text-ink">
           <input type="checkbox" checked={firstOrder} onChange={e=>setFirstOrder(e.target.checked)} className="accent-teal"/> Apply first-order discount (10%)</label>
@@ -520,45 +567,59 @@ function CollectionForm({ job, rates, onBack, onConfirm }) {
         <textarea value={notes} onChange={e=>setNotes(e.target.value)} rows="2" placeholder="e.g. stain on white shirt collar, handle silk gently…" className={inputCls}></textarea>
 
         <div className="bg-gray-50 rounded-xl p-4 mt-4">
-          {result.lines.length===0
-            ? <p className="text-slate2 text-sm">Enter bag weights to calculate the price…</p>
-            : <div className="space-y-1">
-                {result.lines.map((l,i)=>(<div key={i} className="flex justify-between text-sm text-slate2"><span>{l.label}</span><span>{gbp(l.amt)}</span></div>))}
-                {result.discount>0 && <div className="flex justify-between text-sm text-emerald-600"><span>First-order discount</span><span>−{gbp(result.discount)}</span></div>}
-                {result.belowMin && <div className="flex justify-between text-xs text-amber-600"><span>Below {gbp(rates.minOrder)} minimum — rounded up</span><span></span></div>}
-              </div>}
+          {isShirts
+            ? <p className="text-slate2 text-sm">Shirts are counted and priced at the shop.</p>
+            : result.lines.length===0
+              ? <p className="text-slate2 text-sm">Enter bag weights to calculate the price…</p>
+              : <div className="space-y-1">
+                  {result.lines.map((l,i)=>(<div key={i} className="flex justify-between text-sm text-slate2"><span>{l.label}</span><span>{gbp(l.amt)}</span></div>))}
+                  {result.discount>0 && <div className="flex justify-between text-sm text-emerald-600"><span>First-order discount</span><span>−{gbp(result.discount)}</span></div>}
+                  {result.belowMin && <div className="flex justify-between text-xs text-amber-600"><span>Below {gbp(rates.minOrder)} minimum — rounded up</span><span></span></div>}
+                </div>}
           <div className="flex justify-between items-center mt-2 pt-2 border-t border-gray-200">
-            <span className="font-bold text-ink">{needsPricing?'Provisional total':'Total to charge'}</span>
-            <span className="text-2xl font-extrabold text-teal-dark">{gbp(result.charged)}</span></div>
+            <span className="font-bold text-ink">{(isShirts||needsPricing)?'Provisional total':'Total to charge'}</span>
+            <span className="text-2xl font-extrabold text-teal-dark">{isShirts?'At shop':gbp(result.charged)}</span></div>
         </div>
 
-        <Btn kind="green" className="w-full mt-4" onClick={()=>setConfirmed(true)} {...(result.charged<=0?{disabled:true}:{})}>
-          Confirm collection {result.charged>0?`· ${gbp(result.charged)}`:''}</Btn>
+        <Btn kind="green" className="w-full mt-4" onClick={()=>setConfirmed(true)} {...(!canConfirm?{disabled:true}:{})}>
+          Confirm collection{!isShirts&&result.charged>0?` · ${gbp(result.charged)}`:''}</Btn>
+        <button onClick={()=>onNoAnswer(job)} className="w-full mt-2 text-sm font-semibold text-rose-600 py-2 inline-flex items-center justify-center gap-1.5"><Ic name="alert" size={15}/>No answer — reschedule</button>
       </div>
     </div>
   );
 }
 
-function DeliveryView({ job, onBack, onConfirm }) {
+function DeliveryView({ job, onBack, onConfirm, onNoAnswer }) {
   const c = custById(job.customerId);
+  const [payment,setPayment]=useState('Cash');
+  const paid = job.paidInAdvance;
   return (
     <div>
       <button onClick={onBack} className="text-slate2 text-sm mb-3 inline-flex items-center gap-1"><Ic name="left" size={15}/>Back to run</button>
       <div className="bg-white card rounded-2xl p-5">
-        <div className="flex items-start justify-between">
+        <div className="flex items-start justify-between gap-2">
           <div><TypeBadge type="delivery"/>
             <h3 className="text-lg font-bold text-ink mt-1">{fullName(c)}</h3>
             <p className="text-sm text-slate2">{c.addr}</p></div>
-          <DirectionsBtn addr={c.addr}/>
+          <div className="flex flex-col gap-2 shrink-0"><DirectionsBtn addr={c.addr}/><CallBtn mob={c.mob}/></div>
         </div>
         <div className="bg-gray-50 rounded-xl p-4 mt-4 text-sm text-ink space-y-1">
           <div className="flex justify-between"><span className="text-slate2">Service</span><span>{job.service}</span></div>
           <div className="flex justify-between"><span className="text-slate2">Bags</span><span>{job.bags} · {job.weight}kg</span></div>
           <div className="flex justify-between"><span className="text-slate2">Packaging</span><span>{job.packaging}</span></div>
           <div className="flex justify-between"><span className="text-slate2">Amount</span><span>{gbp(job.amount)}</span></div>
-          <div className="flex justify-between"><span className="text-slate2">Payment</span><span>{job.paidInAdvance?'Paid in advance':job.paymentMethod}</span></div>
         </div>
-        <Btn kind="green" icon="check" className="w-full mt-4" onClick={()=>onConfirm(job)}>Confirm bags delivered</Btn>
+        {paid
+          ? <div className="mt-4 bg-emerald-50 text-emerald-700 rounded-xl p-3 text-sm flex items-center gap-2"><Ic name="check" size={16}/>Paid in advance — nothing to collect.</div>
+          : <>
+              <h4 className="font-bold text-ink text-sm mt-4 mb-1">Payment on delivery</h4>
+              <div className="flex gap-4">
+                <label className="flex items-center gap-1.5 text-sm text-ink"><input type="radio" name="dpay" checked={payment==='Cash'} onChange={()=>setPayment('Cash')} className="accent-teal"/> Cash collected</label>
+                <label className="flex items-center gap-1.5 text-sm text-ink"><input type="radio" name="dpay" checked={payment==='Online'} onChange={()=>setPayment('Online')} className="accent-teal"/> Paying online</label>
+              </div>
+            </>}
+        <Btn kind="green" icon="check" className="w-full mt-4" onClick={()=>onConfirm(job, paid?'Paid in advance':payment)}>Confirm bags delivered</Btn>
+        <button onClick={()=>onNoAnswer(job)} className="w-full mt-2 text-sm font-semibold text-rose-600 py-2 inline-flex items-center justify-center gap-1.5"><Ic name="alert" size={15}/>No answer — reschedule</button>
       </div>
     </div>
   );
@@ -568,9 +629,9 @@ function DeliveryView({ job, onBack, onConfirm }) {
 /*  ORDER TIMELINE + DETAIL / PRICING MODAL                            */
 /* =================================================================== */
 const LIFECYCLE = ['Pending Collection','Collected','In Shop','Ready','Delivered'];
-const statusToStep = s => ({ 'Pending Collection':0,'Booked':0,'Needs pricing':1,'Collected':1,'In Shop':2,'In progress':2,'Ready':3,'Delivered':4 }[s] ?? 1);
+const statusToStep = s => ({ 'Pending Collection':0,'No answer':0,'Booked':0,'Needs pricing':1,'Collected':1,'In Shop':2,'In progress':2,'Ready':3,'Delivered':4 }[s] ?? 1);
 const NEXT_STATUS = { 'Collected':'In Shop', 'In Shop':'Ready', 'Ready':'Delivered' };
-function statusTone(s){ return s==='Ready'?'green':s==='In Shop'?'amber':s==='Collected'?'teal':s==='Needs pricing'?'rose':s==='Pending Collection'?'slate':'grey'; }
+function statusTone(s){ return s==='Ready'?'green':s==='In Shop'?'amber':s==='Collected'?'teal':s==='Needs pricing'?'rose':s==='No answer'?'rose':s==='Pending Collection'?'slate':'grey'; }
 
 function Timeline({ status }) {
   const active = statusToStep(status);
@@ -633,6 +694,8 @@ function OrderModal({ order, rates, onClose, onSave, addAudit }) {
             <Timeline status={order.status}/>
             {order.status==='Pending Collection' &&
               <p className="text-xs text-slate2 mt-2 inline-flex items-center gap-1"><Ic name="clock" size={14}/>Awaiting driver collection.</p>}
+            {order.status==='No answer' &&
+              <p className="text-xs text-rose-600 mt-2 inline-flex items-center gap-1"><Ic name="alert" size={14}/>No answer at the door — needs rescheduling.</p>}
             {order.needsPricing &&
               <p className="text-xs text-rose-600 mt-2 inline-flex items-center gap-1"><Ic name="alert" size={14}/>Price the extras before advancing.</p>}
             {NEXT_STATUS[order.status] && !order.needsPricing &&
@@ -697,7 +760,7 @@ function StoreApp({ go, orders, rates, updateOrder, addAudit }) {
   const [scope,setScope]=useState('today');
   const [sel,setSel]=useState(null);
   const list = useMemo(()=>{
-    const inShop = o => o.status!=='Pending Collection' && o.status!=='Delivered'; // garments physically in the shop
+    const inShop = o => ['Collected','Needs pricing','In Shop','Ready'].includes(o.status); // garments physically in the shop
     const f = orders.filter(o => inShop(o) && (scope==='today' ? o.dueDate===TODAY : withinWeek(o.dueDate)));
     return [...f].sort((a,b)=> a.dueDate.localeCompare(b.dueDate) || (a.collectedAt||'').localeCompare(b.collectedAt||''));
   }, [orders,scope]);
