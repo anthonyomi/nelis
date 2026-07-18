@@ -11,6 +11,9 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Plus+Jakarta+Sans:wght@600;700;800&display=swap" rel="stylesheet">
+<!-- Free map: Leaflet + OpenStreetMap tiles (no API key, no billing account) -->
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
 <script>
   tailwind.config = { theme: { extend: {
     fontFamily: { sans:['Inter','sans-serif'], display:['"Plus Jakarta Sans"','Inter','sans-serif'] },
@@ -41,7 +44,7 @@
 <div id="root"></div>
 
 <script type="text/babel" data-presets="react">
-const { useState, useMemo, useCallback } = React;
+const { useState, useMemo, useCallback, useEffect, useRef } = React;
 
 /* =================================================================== */
 /*  ICONS — inline SVG line set (no emoji anywhere)                    */
@@ -126,14 +129,17 @@ const addDays = (iso,n)=>{ const d=new Date(iso+'T00:00:00'); d.setDate(d.getDat
 const withinWeek = iso => iso>=TODAY && iso<=addDays(TODAY,6);
 
 /* ------------------------------- mock DB ------------------------------- */
+// lat/lng let us plot each stop on the map. In the real build these are looked up
+// from the address once, when the customer is added, and saved with their record.
 const CUSTOMERS = [
-  { id:'c1', title:'Mrs', first:'Laila',   last:'Hassan',  addr:'12 Orford Rd, Walthamstow, E17 9NL',  mob:'07700 900112', email:'laila@example.com' },
-  { id:'c2', title:'Mr',  first:'John',    last:'Adeyemi', addr:'4 Grove Rd, Chingford, E4 7DA',        mob:'07700 900233', email:'john@example.com' },
-  { id:'c3', title:'Ms',  first:'Adriana', last:'Costa',   addr:'88 Church Ln, Loughton, IG10 1PD',     mob:'07700 900344', email:'adriana@example.com' },
-  { id:'c4', title:'Mr',  first:'Tunde',   last:'Balogun', addr:'21 High Rd, Leyton, E10 5QH',          mob:'07700 900455', email:'tunde@example.com' },
-  { id:'c5', title:'Mrs', first:'Priya',   last:'Sharma',  addr:'9 Nightingale Ln, Wanstead, E11 2EW',  mob:'07700 900566', email:'priya@example.com' },
-  { id:'c6', title:'Ms',  first:'Grace',   last:'Bennett', addr:'5 Myrtle Rd, Walthamstow, E17 8BX',    mob:'07700 900677', email:'grace@example.com' },
+  { id:'c1', title:'Mrs', first:'Laila',   last:'Hassan',  addr:'12 Orford Rd, Walthamstow, E17 9NL',  mob:'07700 900112', email:'laila@example.com',   lat:51.5860, lng:-0.0170 },
+  { id:'c2', title:'Mr',  first:'John',    last:'Adeyemi', addr:'4 Grove Rd, Chingford, E4 7DA',        mob:'07700 900233', email:'john@example.com',    lat:51.6285, lng:-0.0075 },
+  { id:'c3', title:'Ms',  first:'Adriana', last:'Costa',   addr:'88 Church Ln, Loughton, IG10 1PD',     mob:'07700 900344', email:'adriana@example.com', lat:51.6510, lng: 0.0555 },
+  { id:'c4', title:'Mr',  first:'Tunde',   last:'Balogun', addr:'21 High Rd, Leyton, E10 5QH',          mob:'07700 900455', email:'tunde@example.com',   lat:51.5625, lng:-0.0115 },
+  { id:'c5', title:'Mrs', first:'Priya',   last:'Sharma',  addr:'9 Nightingale Ln, Wanstead, E11 2EW',  mob:'07700 900566', email:'priya@example.com',   lat:51.5725, lng: 0.0175 },
+  { id:'c6', title:'Ms',  first:'Grace',   last:'Bennett', addr:'5 Myrtle Rd, Walthamstow, E17 8BX',    mob:'07700 900677', email:'grace@example.com',   lat:51.5895, lng:-0.0225 },
 ];
+const SHOP = { name:'NEL Ironing Service', addr:'5 Blackhorse Road, Walthamstow, E17 7AH', lat:51.5865, lng:-0.0410 };
 const DRIVERS = [ { id:'d1', name:'Sam Okoro', pin:'1234' }, { id:'d2', name:'Maria Silva', pin:'1234' } ];
 
 const INITIAL_JOBS = [
@@ -234,6 +240,61 @@ function moveJobTo(jobs, jobId, toDriverId, targetJobId) {
   let idx = targetJobId ? target.findIndex(j=>j.id===targetJobId) : target.length; if (idx<0) idx = target.length;
   const nt = target.slice(); nt.splice(idx,0,{...job, driverId:toDriverId});
   return [...others, ...source, ...nt.map((j,i)=>({...j, seq:i+1}))];
+}
+
+/* ---- PURE route optimiser (unit-tested). Free: runs in the app, no API. ---- */
+function haversineKm(a,b){
+  const R=6371, rad=x=>x*Math.PI/180;
+  const dLat=rad(b.lat-a.lat), dLng=rad(b.lng-a.lng);
+  const s=Math.sin(dLat/2)**2 + Math.cos(rad(a.lat))*Math.cos(rad(b.lat))*Math.sin(dLng/2)**2;
+  return 2*R*Math.asin(Math.sqrt(s));
+}
+function routeLengthKm(points){ let t=0; for(let i=0;i<points.length-1;i++) t+=haversineKm(points[i],points[i+1]); return t; }
+// nearest-neighbour, then 2-opt clean-up. Round starts and ends at `depot`.
+function optimiseStops(stops, depot){
+  if (stops.length<2) return stops.slice();
+  const remaining=stops.slice(), order=[]; let cur=depot;
+  while(remaining.length){
+    let bi=0,bd=Infinity;
+    remaining.forEach((s,i)=>{ const d=haversineKm(cur,s); if(d<bd){bd=d;bi=i;} });
+    cur=remaining[bi]; order.push(cur); remaining.splice(bi,1);
+  }
+  let improved=true, guard=0;
+  while(improved && guard++<40){
+    improved=false;
+    for(let i=0;i<order.length-1;i++){
+      for(let k=i+1;k<order.length;k++){
+        const cur=routeLengthKm([depot,...order,depot]);
+        const cand=[...order.slice(0,i),...order.slice(i,k+1).reverse(),...order.slice(k+1)];
+        if(routeLengthKm([depot,...cand,depot]) < cur-1e-9){ order.splice(0,order.length,...cand); improved=true; }
+      }
+    }
+  }
+  return order;
+}
+// reorder one driver's PENDING stops; already-done stops keep their place at the front
+function optimiseDriver(jobs, driverId){
+  const mine = jobs.filter(j=>j.driverId===driverId).sort((a,b)=>a.seq-b.seq);
+  const doneJobs = mine.filter(j=>j.status!=='pending');
+  const pending  = mine.filter(j=>j.status==='pending');
+  const stops = pending.map(j=>{ const c=custById(j.customerId);
+    return (c&&c.lat!=null)?{id:j.id,lat:c.lat,lng:c.lng}:null; }).filter(Boolean);
+  if (stops.length<2) return jobs;
+  const lastDone = doneJobs.length ? custById(doneJobs[doneJobs.length-1].customerId) : null;
+  const start = (lastDone&&lastDone.lat!=null) ? {lat:lastDone.lat,lng:lastDone.lng} : SHOP;
+  const rank={}; optimiseStops(stops,start).forEach((s,i)=>rank[s.id]=i+1);
+  const newPending=[...pending].sort((a,b)=>(rank[a.id]||99)-(rank[b.id]||99));
+  return [...jobs.filter(j=>j.driverId!==driverId),
+          ...[...doneJobs,...newPending].map((j,i)=>({...j,seq:i+1}))];
+}
+function totalMiles(jobs, driverIds){
+  let km=0;
+  driverIds.forEach(did=>{
+    const pts=jobs.filter(j=>j.driverId===did).sort((a,b)=>a.seq-b.seq)
+      .map(j=>custById(j.customerId)).filter(c=>c&&c.lat!=null);
+    if(pts.length) km+=routeLengthKm([SHOP,...pts,SHOP]);
+  });
+  return km*0.621371;
 }
 
 /* =================================================================== */
@@ -1057,8 +1118,71 @@ function DriversAdmin({ drivers, setDrivers }) {
         <td className="px-4 py-2.5"><Badge tone="green">Active</Badge></td></tr>))}
     </TableWrap></div>);
 }
+/* Free map — Leaflet + OpenStreetMap tiles. No API key, no billing account. */
+function RouteMap({ jobs, drivers, filterDriver }) {
+  const elRef = useRef(null), mapRef = useRef(null), layerRef = useRef(null);
+
+  useEffect(()=>{
+    if (typeof L === 'undefined' || !elRef.current || mapRef.current) return;
+    const map = L.map(elRef.current, { scrollWheelZoom:false }).setView([51.60,-0.01], 12);
+    L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+      { maxZoom:19, attribution:'&copy; OpenStreetMap contributors' }).addTo(map);
+    mapRef.current = map;
+    layerRef.current = L.layerGroup().addTo(map);
+    return ()=>{ map.remove(); mapRef.current=null; layerRef.current=null; };
+  },[]);
+
+  useEffect(()=>{
+    const map = mapRef.current, group = layerRef.current;
+    if (!map || !group) return;
+    group.clearLayers();
+    const bounds = [[SHOP.lat,SHOP.lng]];
+    const pin = (html,bg) => L.divIcon({ className:'', iconSize:[28,28], iconAnchor:[14,14],
+      html:`<div style="background:${bg};color:#fff;width:28px;height:28px;border-radius:50%;display:flex;
+        align-items:center;justify-content:center;font:bold 12px Inter,Arial;border:2px solid #fff;
+        box-shadow:0 1px 4px rgba(0,0,0,.35)">${html}</div>` });
+
+    L.marker([SHOP.lat,SHOP.lng],{icon:pin('S','#1f2a30')})
+      .bindPopup(`<b>${SHOP.name}</b><br>${SHOP.addr}<br><i>Start &amp; end of the round</i>`).addTo(group);
+
+    drivers.forEach((d,di)=>{
+      if (filterDriver!=='all' && filterDriver!==d.id) return;
+      const list = jobs.filter(j=>j.driverId===d.id).sort((a,b)=>a.seq-b.seq);
+      const pts = [[SHOP.lat,SHOP.lng]];
+      list.forEach(j=>{
+        const c = custById(j.customerId);
+        if (!c || c.lat==null) return;
+        const resolved = j.status!=='pending';
+        const bg = resolved ? '#9aa5ab' : (j.type==='collection' ? '#f43f5e' : '#3AAFCB');
+        L.marker([c.lat,c.lng],{icon:pin(j.seq,bg)}).bindPopup(
+          `<b>${fullName(c)}</b><br>${c.addr}<br>${j.type==='collection'?'Collection':'Delivery'} · ${j.window}` +
+          `<br><i>${d.name}${resolved?' · done':''}</i>`).addTo(group);
+        pts.push([c.lat,c.lng]); bounds.push([c.lat,c.lng]);
+      });
+      pts.push([SHOP.lat,SHOP.lng]);
+      if (pts.length>2) L.polyline(pts,{ color: di===0?'#2b93ac':'#7c3aed', weight:3, opacity:.55, dashArray:'6,7' }).addTo(group);
+    });
+    if (bounds.length>1) map.fitBounds(bounds,{ padding:[35,35] });
+  },[jobs,drivers,filterDriver]);
+
+  if (typeof L === 'undefined') return (
+    <div className="h-40 rounded-2xl border border-gray-100 bg-gray-50 flex items-center justify-center text-sm text-slate2">
+      Map needs an internet connection to load.</div>);
+  return <div ref={elRef} style={{height:'340px'}} className="w-full rounded-2xl overflow-hidden border border-gray-100 z-0"/>;
+}
+
 function Logistics({ jobs, setJobs, drivers, onNew }) {
+  const [mapDriver,setMapDriver]=useState('all');
+  const [saving,setSaving]=useState(null);
   const [drag,setDrag]=useState(null);
+  const targets = mapDriver==='all' ? drivers.map(d=>d.id) : [mapDriver];
+  const roundMiles = useMemo(()=>totalMiles(jobs,targets), [jobs,mapDriver,drivers]);
+  const optimise = () => {
+    const before = totalMiles(jobs,targets);
+    let next = jobs; targets.forEach(did=>{ next = optimiseDriver(next,did); });
+    const after = totalMiles(next,targets);
+    setJobs(next); setSaving({before,after});
+  };
   const move=(driverId,jobId,dir)=>setJobs(prev=>moveJob(prev,driverId,jobId,dir));
   const dropOnJob=(toDriverId,targetId)=>{ if(drag) setJobs(prev=>moveJobTo(prev,drag.jobId,toDriverId,targetId)); setDrag(null); };
   const dropOnColumn=(toDriverId)=>{ if(drag) setJobs(prev=>moveJobTo(prev,drag.jobId,toDriverId,null)); setDrag(null); };
@@ -1070,6 +1194,31 @@ function Logistics({ jobs, setJobs, drivers, onNew }) {
         <Btn kind="rose" icon="plus" onClick={onNew} className="!py-1.5 !px-3">New job</Btn>
       </div>
       <p className="text-xs text-slate2 mb-3">Each driver's collections + deliveries for today. Drag a card to reorder <b>or drop it on the other driver</b> to reassign — or use the <b>Move to</b> menu. Chevrons nudge within a driver. <span className="text-rose-500 font-semibold">Pink = collection</span>, white = delivery.</p>
+
+      <div className="bg-white card rounded-2xl p-3 mb-4">
+        <div className="flex items-center justify-between mb-2 flex-wrap gap-2">
+          <h4 className="font-bold text-ink text-sm">Today’s stops on the map</h4>
+          <div className="flex items-center gap-2 flex-wrap">
+            <div className="flex items-center gap-1 bg-gray-50 rounded-xl p-1">
+              {[['all','All drivers'],...drivers.map(d=>[d.id,d.name.split(' ')[0]])].map(([k,l])=>(
+                <button key={k} onClick={()=>{setMapDriver(k);setSaving(null);}}
+                  className={`px-2.5 py-1 rounded-lg text-xs font-semibold ${mapDriver===k?'bg-teal text-white':'text-slate2'}`}>{l}</button>))}
+            </div>
+            <Btn kind="primary" icon="pin" onClick={optimise} className="!py-1.5 !px-3 text-xs">Suggest best order</Btn>
+          </div>
+        </div>
+        <RouteMap jobs={jobs} drivers={drivers} filterDriver={mapDriver}/>
+        <div className="flex items-center justify-between gap-3 flex-wrap mt-2">
+          <p className="text-[11px] text-slate2 flex-1 min-w-[220px]">
+            <span className="text-rose-500 font-semibold">Pink = collection</span>, <span className="text-teal-dark font-semibold">blue = delivery</span>,
+            grey = already done. Numbers show the driving order, and <b>S</b> is the shop (start &amp; end). Tap a pin for details.</p>
+          <span className="text-xs font-bold text-ink whitespace-nowrap">Round: ~{roundMiles.toFixed(1)} miles</span>
+        </div>
+        {saving && <div className={`text-xs rounded-lg px-2.5 py-1.5 mt-2 inline-flex items-center gap-1.5 ${saving.after < saving.before-0.05 ? 'bg-emerald-50 text-emerald-700':'bg-gray-50 text-slate2'}`}>
+          <Ic name="check" size={14}/>{saving.after < saving.before-0.05
+            ? `Reordered — about ${(saving.before-saving.after).toFixed(1)} miles shorter (${saving.before.toFixed(1)} → ${saving.after.toFixed(1)} miles).`
+            : `Already in a good order — no shorter route found (${saving.before.toFixed(1)} miles).`}</div>}
+      </div>
       <div className="grid md:grid-cols-2 gap-4">
         {drivers.map(d=>{
           const list=jobs.filter(j=>j.driverId===d.id).sort((a,b)=>a.seq-b.seq);
