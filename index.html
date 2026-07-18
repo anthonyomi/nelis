@@ -366,7 +366,7 @@ function DriverApp({ driver, go, jobs, setJobs, rates, addAudit, addOrder, updat
     else addOrder({ id:'ord'+Date.now(), customerId:job.customerId, addedItems:{}, firstOrder:data.firstOrder,
       packaging:job.packaging, paidInAdvance:job.paidInAdvance, dueDate:job.returnDate||addDays(TODAY,2), ...patch });
     const priceStr = data.needsPricing ? (data.amount>0?gbp(data.amount)+' (provisional)':'priced at shop') : gbp(data.amount);
-    addAudit(`${driver.name} collected from ${fullName(c)} · ${priceStr} · ${data.paymentMethod}`);
+    addAudit(`${driver.name} collected from ${fullName(c)} · ${priceStr}`);
     setOpenId(null);
   };
   const completeDelivery = (job, payment) => {
@@ -455,7 +455,6 @@ function CollectionForm({ job, rates, onBack, onConfirm, onNoAnswer }) {
   const [shirtCount,setShirtCount]=useState('');
   const [extras,setExtras]=useState([]);
   const [firstOrder,setFirstOrder]=useState(false);
-  const [payment,setPayment]=useState('Cash');
   const [notes,setNotes]=useState('');
   const [confirmed,setConfirmed]=useState(false);
 
@@ -468,7 +467,7 @@ function CollectionForm({ job, rates, onBack, onConfirm, onNoAnswer }) {
   const canConfirm = isShirts || result.charged>0;
   const confirmData = { bagWeights:isShirts?[]:bags.map(b=>parseFloat(b.weight)||0), weight:isShirts?0:totalWeight,
     service:svcLabel, weightCharge:isShirts?0:result.subtotal, amount:isShirts?0:result.charged, firstOrder,
-    paymentMethod:payment, customerNotes:notes, extras, needsPricing, shirtCount:isShirts?shirtCount:'' };
+    paymentMethod:'On delivery', customerNotes:notes, extras, needsPricing, shirtCount:isShirts?shirtCount:'' };
 
   const addBag=()=>setBags(b=>[...b,{id:(b[b.length-1]?.id||0)+1,weight:''}]);
   const rmBag=id=>setBags(b=>b.length>1?b.filter(x=>x.id!==id):b);
@@ -479,7 +478,7 @@ function CollectionForm({ job, rates, onBack, onConfirm, onNoAnswer }) {
     <div className="bg-white card rounded-2xl p-8 text-center">
       <div className="w-16 h-16 mx-auto rounded-full bg-emerald-50 text-emerald-600 flex items-center justify-center"><Ic name="check" size={34} stroke={2.4}/></div>
       <h3 className="text-xl font-bold text-ink mt-3">Collection confirmed</h3>
-      <p className="text-slate2 mt-1">{fullName(c)} · {isShirts?'priced at shop':gbp(result.charged)+(needsPricing?' (provisional)':'')} · {payment}</p>
+      <p className="text-slate2 mt-1">{fullName(c)} · {isShirts?'priced at shop':gbp(result.charged)+(needsPricing?' (provisional)':'')}</p>
       {needsPricing && <div className="bg-amber-50 text-amber-700 rounded-xl p-3 mt-4 text-sm inline-flex items-center gap-2"><Ic name="alert" size={16}/>{isShirts?`Shirts will be counted & priced at the shop${extras.length?`, along with ${extras.join(', ').toLowerCase()}`:''}.`:`Extras noted — shop will price ${extras.join(', ').toLowerCase()} and finalise the total.`}</div>}
       <div className="bg-teal-light text-teal-dark rounded-xl p-3 mt-3 text-sm flex items-center justify-center gap-2"><Ic name="mail" size={16}/>{needsPricing?'Provisional':'Receipt'} email sent to {c.email}</div>
       <div className="mt-6"><Btn icon="right" onClick={()=>onConfirm(job,confirmData)}>Back to run</Btn></div>
@@ -555,13 +554,6 @@ function CollectionForm({ job, rates, onBack, onConfirm, onNoAnswer }) {
 
         <label className="flex items-center gap-2 mt-3 text-sm text-ink">
           <input type="checkbox" checked={firstOrder} onChange={e=>setFirstOrder(e.target.checked)} className="accent-teal"/> Apply first-order discount (10%)</label>
-
-        <h4 className="font-bold text-ink text-sm mt-4 mb-1">Payment</h4>
-        <div className="flex gap-4">
-          {['Cash','Bank transfer'].map(m=>(
-            <label key={m} className="flex items-center gap-1.5 text-sm text-ink">
-              <input type="radio" name="pay" checked={payment===m} onChange={()=>setPayment(m)} className="accent-teal"/> {m}</label>))}
-        </div>
 
         <h4 className="font-bold text-ink text-sm mt-4 mb-1">Customer notes <span className="text-slate2 font-normal">(seen by boss &amp; store team)</span></h4>
         <textarea value={notes} onChange={e=>setNotes(e.target.value)} rows="2" placeholder="e.g. stain on white shirt collar, handle silk gently…" className={inputCls}></textarea>
@@ -768,14 +760,14 @@ function StoreApp({ go, orders, rates, updateOrder, addAudit }) {
   const printList = () => {
     const rows = list.map(o=>{ const c=custById(o.customerId);
       return `<tr><td><b>${fmtDate(o.dueDate)}</b></td><td>${fullName(c)}<br><span class="a">${c.addr}</span></td>
-        <td>${o.services.join(', ')}${o.extras.length?` <b>+ ${o.extras.join(', ')}</b>`:''}</td>
+        <td>${o.services.join(', ')}${o.extras.length?` <span class="r">+ ${o.extras.join(', ')}</span>`:''}</td>
         <td>${o.bagsCount} (${o.bagWeights.join('+')}kg) · ${o.weight}kg</td>
-        <td>${gbp(o.amount)}${o.needsPricing?' <b>(prov.)</b>':''}<br><span class="a">${o.paidInAdvance?'PAID':o.paymentMethod}</span></td>
-        <td>${o.packaging}</td><td>${fmtDate(o.collectedDate)} ${o.collectedAt}</td><td>${o.status}</td><td>${o.notes||''}</td></tr>`; }).join('');
+        <td>${gbp(o.amount)}${o.needsPricing?' <span class="r">(prov.)</span>':''}<br><span class="a">${o.paidInAdvance?'PAID':o.paymentMethod}</span></td>
+        <td>${o.packaging}</td><td>${fmtDate(o.collectedDate)} ${o.collectedAt}</td><td>${o.status==='Needs pricing'?`<span class="r">${o.status}</span>`:o.status}</td><td>${o.notes||''}</td></tr>`; }).join('');
     const html = `<html><head><title>NELIS — ${scope==='today'?'Today':'This week'}</title>
       <style>body{font-family:Arial;padding:18px;color:#1f2a30}h1{font-size:16px;margin:0}.sub{color:#777;font-size:12px;margin:2px 0 12px}
       table{width:100%;border-collapse:collapse;font-size:11px}th{background:#3AAFCB;color:#fff;text-align:left;padding:5px 6px}
-      td{border-bottom:1px solid #ddd;padding:5px 6px;vertical-align:top}.a{color:#888;font-size:10px}@media print{@page{size:landscape;margin:10mm}}</style></head>
+      td{border-bottom:1px solid #ddd;padding:5px 6px;vertical-align:top}.a{color:#888;font-size:10px}.r{color:#dc2626;font-weight:bold}@media print{@page{size:landscape;margin:10mm}}</style></head>
       <body><h1>NEL Ironing Service — Production list</h1><div class="sub">${scope==='today'?'Due today':'Due this week'} · printed ${fmtDate(TODAY)} · ${list.length} order(s)</div>
       <table><thead><tr><th>Due</th><th>Customer</th><th>Services</th><th>Bags / weight</th><th>Price</th><th>Pack</th><th>Collected</th><th>Status</th><th>Notes</th></tr></thead>
       <tbody>${rows}</tbody></table></body></html>`;
