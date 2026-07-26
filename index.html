@@ -14,6 +14,8 @@
 <!-- Free map: Leaflet + OpenStreetMap tiles (no API key, no billing account) -->
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<!-- Supabase client — real database (persists data, syncs across devices) -->
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <script>
   tailwind.config = { theme: { extend: {
     fontFamily: { sans:['Inter','sans-serif'], display:['"Plus Jakarta Sans"','Inter','sans-serif'] },
@@ -76,6 +78,7 @@ const ICONS = {
   alert:<g><path d="M12 4 2.5 20h19z"/><path d="M12 10v4M12 17.5v.2"/></g>,
   info:<g><circle cx="12" cy="12" r="9"/><path d="M12 11v5M12 8v.2"/></g>,
   phone:<path d="M6.5 3h3l1.5 4-2 1.3a12 12 0 0 0 5.7 5.7l1.3-2 4 1.5v3a2 2 0 0 1-2.2 2A17 17 0 0 1 4.5 5.2 2 2 0 0 1 6.5 3z"/>,
+  trash:<g><path d="M4 7h16M9 7V5a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/><path d="M6 7l1 13a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1l1-13"/><path d="M10 11v6M14 11v6"/></g>,
 };
 function Ic({ name, size=18, className='', stroke=1.9 }) {
   const grip = name==='grip';
@@ -123,7 +126,7 @@ const TIME_WINDOWS = ['09:00–10:00','10:00–11:00','11:00–12:00','12:00–1
   '14:00–15:00','15:00–16:00','16:00–17:00','17:00–18:00','18:00–19:00 (evening)'];
 
 /* ------------------------------- dates -------------------------------- */
-const TODAY = '2026-07-10';
+const TODAY = new Date().toISOString().slice(0,10); // real "today" so it matches the database dates
 const fmtDate = iso => new Date(iso+'T00:00:00').toLocaleDateString('en-GB',{weekday:'short',day:'numeric',month:'short'});
 const addDays = (iso,n)=>{ const d=new Date(iso+'T00:00:00'); d.setDate(d.getDate()+n); return d.toISOString().slice(0,10); };
 const withinWeek = iso => iso>=TODAY && iso<=addDays(TODAY,6);
@@ -131,7 +134,8 @@ const withinWeek = iso => iso>=TODAY && iso<=addDays(TODAY,6);
 /* ------------------------------- mock DB ------------------------------- */
 // lat/lng let us plot each stop on the map. In the real build these are looked up
 // from the address once, when the customer is added, and saved with their record.
-const CUSTOMERS = [
+// CUSTOMERS and DRIVERS are filled from the database at startup; these are fallback demo values.
+let CUSTOMERS = [
   { id:'c1', title:'Mrs', first:'Laila',   last:'Hassan',  addr:'12 Orford Rd, Walthamstow, E17 9NL',  mob:'07700 900112', email:'laila@example.com',   lat:51.5860, lng:-0.0170 },
   { id:'c2', title:'Mr',  first:'John',    last:'Adeyemi', addr:'4 Grove Rd, Chingford, E4 7DA',        mob:'07700 900233', email:'john@example.com',    lat:51.6285, lng:-0.0075 },
   { id:'c3', title:'Ms',  first:'Adriana', last:'Costa',   addr:'88 Church Ln, Loughton, IG10 1PD',     mob:'07700 900344', email:'adriana@example.com', lat:51.6510, lng: 0.0555 },
@@ -140,7 +144,7 @@ const CUSTOMERS = [
   { id:'c6', title:'Ms',  first:'Grace',   last:'Bennett', addr:'5 Myrtle Rd, Walthamstow, E17 8BX',    mob:'07700 900677', email:'grace@example.com',   lat:51.5895, lng:-0.0225 },
 ];
 const SHOP = { name:'NEL Ironing Service', addr:'5 Blackhorse Road, Walthamstow, E17 7AH', lat:51.5865, lng:-0.0410 };
-const DRIVERS = [ { id:'d1', name:'Sam Okoro', pin:'1234' }, { id:'d2', name:'Maria Silva', pin:'1234' } ];
+let DRIVERS = [ { id:'d1', name:'Sam Okoro', pin:'1234' }, { id:'d2', name:'Maria Silva', pin:'1234' } ];
 
 const INITIAL_JOBS = [
   { id:'j1', driverId:'d1', seq:1, type:'collection', customerId:'c1', window:'09:00–10:00', status:'pending', orderId:'o7',
@@ -298,6 +302,80 @@ function totalMiles(jobs, driverIds){
 }
 
 /* =================================================================== */
+/*  SUPABASE DATA LAYER — real database (persist + sync)               */
+/* =================================================================== */
+const SUPABASE_URL = 'https://natbffwqalxxqeacehsk.supabase.co';
+const SUPABASE_KEY = 'sb_publishable_zgc-wGOojSP-KGEr6eLs-g_oL2y8Gne';
+const db = (window.supabase && SUPABASE_URL) ? window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY) : null;
+const uuid = () => (crypto.randomUUID ? crypto.randomUUID() :
+  'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g,c=>{const r=Math.random()*16|0;return (c==='x'?r:(r&0x3|0x8)).toString(16);}));
+const num = v => v==null ? v : Number(v);
+
+// map between the app's shapes and the database rows
+const fromCustomerRow = r => ({ id:r.id, title:r.title, first:r.first_name, last:r.last_name, addr:r.address,
+  mob:r.mobile, email:r.email, lat:num(r.lat), lng:num(r.lng) });
+const fromDriverRow = r => ({ id:r.id, name:r.name, pin:r.pin });
+const ratesFromRows = (rows, settings) => ({
+  weight: rows.filter(r=>r.kind==='weight').sort((a,b)=>a.sort-b.sort).map(r=>({key:r.key,label:r.label,unit:r.unit||'kg',price:num(r.price)})),
+  items:  rows.filter(r=>r.kind==='item').sort((a,b)=>a.sort-b.sort).map(r=>({key:r.key,label:r.label,price:num(r.price),group:r.group_name})),
+  minOrder: num(settings?.min_order ?? 25), firstOrderDiscount: num(settings?.first_order_discount ?? 0.10) });
+
+const fromJobRow = r => ({ id:r.id, driverId:r.driver_id, seq:num(r.seq), type:r.type, customerId:r.customer_id,
+  orderId:r.order_id||undefined, window:r.time_window, status:r.status, packaging:r.packaging, instructions:r.instructions,
+  returnDate:r.return_date||undefined, paidInAdvance:r.paid_in_advance, bags:num(r.bags), weight:num(r.weight),
+  amount:num(r.amount), service:r.service, paymentMethod:r.payment_method, doneAt:r.done_at||undefined });
+const toJobRow = j => ({ id:j.id, run_date:TODAY, driver_id:j.driverId, seq:j.seq, type:j.type, customer_id:j.customerId,
+  order_id:j.orderId ?? null, time_window:j.window ?? null, status:j.status, packaging:j.packaging ?? null,
+  instructions:j.instructions ?? null, return_date:j.returnDate ?? null, paid_in_advance:!!j.paidInAdvance,
+  bags:j.bags ?? null, weight:j.weight ?? null, amount:j.amount ?? null, service:j.service ?? null,
+  payment_method:j.paymentMethod ?? null, done_at:j.doneAt ?? null });
+
+const fromOrderRow = r => ({ id:r.id, customerId:r.customer_id, status:r.status, services:r.services||[], extras:r.extras||[],
+  needsPricing:r.needs_pricing, bagsCount:num(r.bags_count), bagWeights:(r.bag_weights||[]).map(num), weight:num(r.weight),
+  weightCharge:num(r.weight_charge), amount:num(r.amount), initialAmount:num(r.initial_amount), addedItems:r.added_items||{},
+  firstOrder:r.first_order, packaging:r.packaging, paymentMethod:r.payment_method, paidInAdvance:r.paid_in_advance,
+  collectedDate:r.collected_date||null, collectedAt:r.collected_at||null, dueDate:r.due_date, notes:r.notes });
+const toOrderRow = o => ({ id:o.id, customer_id:o.customerId, status:o.status, services:o.services||[], extras:o.extras||[],
+  needs_pricing:!!o.needsPricing, bags_count:o.bagsCount||0, bag_weights:o.bagWeights||[], weight:o.weight||0,
+  weight_charge:o.weightCharge||0, amount:o.amount||0, initial_amount:o.initialAmount||0, added_items:o.addedItems||{},
+  first_order:!!o.firstOrder, packaging:o.packaging ?? null, payment_method:o.paymentMethod ?? null,
+  paid_in_advance:!!o.paidInAdvance, collected_date:o.collectedDate ?? null, collected_at:o.collectedAt ?? null,
+  due_date:o.dueDate ?? null, notes:o.notes ?? null });
+
+async function loadAll() {
+  const [cust, drv, rateRows, settings, ord, jb, aud] = await Promise.all([
+    db.from('customers').select('*'),
+    db.from('drivers').select('*').eq('active',true).order('created_at'),
+    db.from('service_rates').select('*'),
+    db.from('app_settings').select('*').limit(1).maybeSingle(),
+    db.from('orders').select('*'),
+    db.from('jobs').select('*').order('seq'),   // load the active run (not filtered by date)
+    db.from('audit_log').select('*').order('created_at',{ascending:false}).limit(200),
+  ]);
+  const err = cust.error||drv.error||rateRows.error||ord.error||jb.error||aud.error;
+  if (err) throw err;
+  CUSTOMERS = (cust.data||[]).map(fromCustomerRow);
+  DRIVERS   = (drv.data||[]).map(fromDriverRow);
+  return { drivers: DRIVERS, rates: ratesFromRows(rateRows.data||[], settings.data),
+    orders: (ord.data||[]).map(fromOrderRow), jobs: (jb.data||[]).map(fromJobRow),
+    audit: (aud.data||[]).map(r=>({time:r.at, text:r.text})) };
+}
+let onSaveError = null; // App registers this to surface DB errors on screen
+const reportErr = (where, error) => { const msg=(error&&(error.message||error.details||error.hint))||'unknown error';
+  console.error('DB '+where, error); if(onSaveError) onSaveError(`Couldn’t save (${where}): ${msg}`); };
+const logErr = (where) => (r) => { if (r && r.error) reportErr(where, r.error); };
+// save jobs one row at a time — resilient (one bad row can't block the others)
+const saveJobs   = arr => { if(!db) return; arr.forEach(j => db.from('jobs').upsert(toJobRow(j)).then(logErr('saveJob'))); };
+const saveOrder  = o   => db && db.from('orders').upsert(toOrderRow(o)).then(logErr('saveOrder'));
+const saveDrivers= arr => db && db.from('drivers').upsert(arr.map(d=>({id:d.id,name:d.name,pin:d.pin}))).then(logErr('saveDrivers'));
+const insertAudit= e   => db && db.from('audit_log').insert({at:e.time, text:e.text, is_alert:/^No answer/.test(e.text)}).then(logErr('insertAudit'));
+const saveRates  = r   => { if(!db) return;
+  const rows=[ ...r.weight.map((x,i)=>({key:x.key,kind:'weight',label:x.label,price:x.price,unit:x.unit||'kg',sort:i+1})),
+               ...r.items.map((x,i)=>({key:x.key,kind:'item',label:x.label,price:x.price,group_name:x.group,sort:100+i})) ];
+  db.from('service_rates').upsert(rows,{onConflict:'key'}).then(logErr('saveRates'));
+  db.from('app_settings').upsert({id:1,min_order:r.minOrder,first_order_discount:r.firstOrderDiscount}).then(logErr('saveSettings')); };
+
+/* =================================================================== */
 /*  SHARED UI                                                          */
 /* =================================================================== */
 function Logo({ h=34 }) {
@@ -316,7 +394,7 @@ function Logo({ h=34 }) {
 function Badge({ children, tone='teal' }) {
   const tones = { teal:'bg-teal-light text-teal-dark', green:'bg-emerald-50 text-emerald-700',
     amber:'bg-amber-50 text-amber-700', grey:'bg-gray-100 text-gray-500',
-    rose:'bg-rose-50 text-rose-600', slate:'bg-slate-100 text-slate-600' };
+    rose:'bg-rose-50 text-rose-600', slate:'bg-slate-100 text-slate-600', violet:'bg-violet-50 text-violet-600' };
   return <span className={`text-[11px] font-semibold px-2 py-0.5 rounded-full ${tones[tone]}`}>{children}</span>;
 }
 function Btn({ children, onClick, kind='primary', className='', icon, ...p }) {
@@ -393,8 +471,8 @@ function Landing({ go }) {
 /*  DRIVER                                                             */
 /* =================================================================== */
 function DriverLogin({ go, onLogin }) {
-  const [driverId,setDriverId]=useState('d1'); const [pin,setPin]=useState(''); const [err,setErr]=useState('');
-  const submit=()=>{ const d=DRIVERS.find(x=>x.id===driverId); if(pin!==d.pin){setErr('Incorrect PIN (hint: 1234)');return;} onLogin(d); };
+  const [driverId,setDriverId]=useState(DRIVERS[0] && DRIVERS[0].id); const [pin,setPin]=useState(''); const [err,setErr]=useState('');
+  const submit=()=>{ const d=DRIVERS.find(x=>x.id===driverId); if(!d){setErr('Please pick a driver');return;} if(pin!==d.pin){setErr('Incorrect PIN (hint: 1234)');return;} onLogin(d); };
   return (
     <LoginCard go={go} title="Driver sign in" sub="Each driver has their own login for the audit trail.">
       <Field label="Driver"><select value={driverId} onChange={e=>setDriverId(e.target.value)} className={inputCls+' mt-1 mb-3'}>
@@ -424,7 +502,7 @@ function DriverApp({ driver, go, jobs, setJobs, rates, addAudit, addOrder, updat
       status:data.needsPricing?'Needs pricing':'Collected',
       notes:[job.instructions,data.customerNotes,data.shirtCount?`Customer said ~${data.shirtCount} shirts (confirm at shop)`:''].filter(Boolean).join(' · ') };
     if (job.orderId) updateOrder(job.orderId, patch); // move the Pending Collection order to Collected
-    else addOrder({ id:'ord'+Date.now(), customerId:job.customerId, addedItems:{}, firstOrder:data.firstOrder,
+    else addOrder({ id:uuid(), customerId:job.customerId, addedItems:{}, firstOrder:data.firstOrder,
       packaging:job.packaging, paidInAdvance:job.paidInAdvance, dueDate:job.returnDate||addDays(TODAY,2), ...patch });
     const priceStr = data.needsPricing ? (data.amount>0?gbp(data.amount)+' (provisional)':'priced at shop') : gbp(data.amount);
     addAudit(`${driver.name} collected from ${fullName(c)} · ${priceStr}`);
@@ -432,12 +510,15 @@ function DriverApp({ driver, go, jobs, setJobs, rates, addAudit, addOrder, updat
   };
   const completeDelivery = (job, payment) => {
     setJobs(prev => prev.map(j => j.id===job.id ? {...j, status:'done', doneAt:now(), paymentMethod:payment} : j));
-    addAudit(`${driver.name} delivered to ${fullName(custById(job.customerId))} · ${payment}`);
+    if (job.orderId) updateOrder(job.orderId, { status:'Delivered' }); // sync the order
+    const payLabel = payment==='Online' ? 'paid online' : payment==='Cash' ? 'paid cash' : payment; // 'Paid in advance'
+    addAudit(`${driver.name} delivered to ${fullName(custById(job.customerId))} · ${payLabel}`);
     setOpenId(null);
   };
   const markNoAnswer = (job) => {
     setJobs(prev => prev.map(j => j.id===job.id ? {...j, status:'no-answer', doneAt:now()} : j));
-    if (job.orderId) updateOrder(job.orderId, {status:'No answer'});
+    // collection no-answer -> order can't be collected; delivery no-answer -> back to Ready for another attempt
+    if (job.orderId) updateOrder(job.orderId, { status: job.type==='delivery' ? 'Ready' : 'No answer' });
     addAudit(`No answer at ${fullName(custById(job.customerId))} (${job.type}) — needs rescheduling`);
     setOpenId(null);
   };
@@ -681,10 +762,11 @@ function DeliveryView({ job, onBack, onConfirm, onNoAnswer }) {
 /* =================================================================== */
 /*  ORDER TIMELINE + DETAIL / PRICING MODAL                            */
 /* =================================================================== */
-const LIFECYCLE = ['Pending Collection','Collected','In Shop','Ready','Delivered'];
-const statusToStep = s => ({ 'Pending Collection':0,'No answer':0,'Booked':0,'Needs pricing':1,'Collected':1,'In Shop':2,'In progress':2,'Ready':3,'Delivered':4 }[s] ?? 1);
-const NEXT_STATUS = { 'Collected':'In Shop', 'In Shop':'Ready', 'Ready':'Delivered' };
-function statusTone(s){ return s==='Ready'?'green':s==='In Shop'?'amber':s==='Collected'?'teal':s==='Needs pricing'?'rose':s==='No answer'?'rose':s==='Pending Collection'?'slate':'grey'; }
+const LIFECYCLE = ['Pending Collection','Collected','In Shop','Ready','Out for delivery','Delivered'];
+const statusToStep = s => ({ 'Pending Collection':0,'No answer':0,'Booked':0,'Needs pricing':1,'Collected':1,'In Shop':2,'In progress':2,'Ready':3,'Out for delivery':4,'Delivered':5 }[s] ?? 1);
+// generic "Mark next" only up to Ready — after Ready the shop dispatches (Send out for delivery)
+const NEXT_STATUS = { 'Collected':'In Shop', 'In Shop':'Ready' };
+function statusTone(s){ return s==='Ready'?'green':s==='In Shop'?'amber':s==='Collected'?'teal':s==='Out for delivery'?'violet':s==='Needs pricing'?'rose':s==='No answer'?'rose':s==='Pending Collection'?'slate':'grey'; }
 
 function Timeline({ status }) {
   const active = statusToStep(status);
@@ -706,10 +788,14 @@ function Timeline({ status }) {
   );
 }
 
-function OrderModal({ order, rates, onClose, onSave, addAudit }) {
+function OrderModal({ order, rates, onClose, onSave, addAudit, onDelete, onDispatch, jobs, drivers }) {
   const c = custById(order.customerId);
+  const assignedJob = (jobs||[]).find(j=>j.orderId===order.id);
+  const assignedDriver = assignedJob && (drivers||[]).find(d=>d.id===assignedJob.driverId);
   const [pricing,setPricing]=useState(order.needsPricing);
   const [added,setAdded]=useState(order.addedItems||{});
+  const [dispDriver,setDispDriver]=useState((drivers&&drivers[0]&&drivers[0].id)||'');
+  const [dispWindow,setDispWindow]=useState('18:00–19:00 (evening)');
   const groups = useMemo(()=>{ const g={}; rates.items.forEach(r=>{(g[r.group]=g[r.group]||[]).push(r)}); return g; },[rates]);
   const calc = useMemo(()=>orderTotal(rates, order.weightCharge, added, order.firstOrder), [rates,order,added]);
 
@@ -721,6 +807,7 @@ function OrderModal({ order, rates, onClose, onSave, addAudit }) {
   };
   const advance = () => { const ns=NEXT_STATUS[order.status]; if(!ns) return;
     onSave(order.id, { status:ns }); addAudit(`${fullName(c)}'s order marked ${ns}`); };
+  const dispatch = () => { if(!dispDriver) return; onDispatch(order, dispDriver, dispWindow); onClose(); };
 
   return (
     <div className="fixed inset-0 bg-black/40 flex items-center justify-center p-4 z-50" onClick={onClose}>
@@ -737,6 +824,7 @@ function OrderModal({ order, rates, onClose, onSave, addAudit }) {
               {order.extras.length>0 && <Row k="Extras" v={<span className="text-amber-700">{order.extras.join(', ')}</span>}/>}
               <Row k="Bags" v={order.bagsCount>0?`${order.bagsCount} · ${order.bagWeights.join('+')}kg = ${order.weight}kg`:'—'}/>
               <Row k="Packaging" v={order.packaging}/>
+              {assignedDriver && <Row k="Driver" v={<span className="inline-flex items-center gap-1"><Ic name="truck" size={13}/>{assignedDriver.name}</span>}/>}
               <Row k="Collected" v={order.collectedDate?`${fmtDate(order.collectedDate)} · ${order.collectedAt}`:'Not yet collected'}/>
               <Row k="Deliver by" v={fmtDate(order.dueDate)}/>
               <Row k="Payment" v={order.paidInAdvance?'Paid in advance':(order.paymentMethod==='—'?'—':order.paymentMethod)}/>
@@ -749,10 +837,24 @@ function OrderModal({ order, rates, onClose, onSave, addAudit }) {
               <p className="text-xs text-slate2 mt-2 inline-flex items-center gap-1"><Ic name="clock" size={14}/>Awaiting driver collection.</p>}
             {order.status==='No answer' &&
               <p className="text-xs text-rose-600 mt-2 inline-flex items-center gap-1"><Ic name="alert" size={14}/>No answer at the door — needs rescheduling.</p>}
+            {order.status==='Out for delivery' &&
+              <p className="text-xs text-violet-600 mt-2 inline-flex items-center gap-1"><Ic name="truck" size={14}/>On {assignedDriver?assignedDriver.name+"’s":'a driver’s'} run — delivers when confirmed.</p>}
+            {order.status==='Delivered' &&
+              <p className="text-xs text-emerald-600 mt-2 inline-flex items-center gap-1"><Ic name="check" size={14}/>Delivered.</p>}
             {order.needsPricing &&
               <p className="text-xs text-rose-600 mt-2 inline-flex items-center gap-1"><Ic name="alert" size={14}/>Price the extras before advancing.</p>}
             {NEXT_STATUS[order.status] && !order.needsPricing &&
               <Btn kind="dark" icon="right" className="mt-3 w-full" onClick={advance}>Mark {NEXT_STATUS[order.status]}</Btn>}
+            {order.status==='Ready' && onDispatch && <div className="mt-3 bg-violet-50 border border-violet-100 rounded-xl p-3">
+              <div className="text-xs font-semibold text-violet-700 mb-1.5 inline-flex items-center gap-1"><Ic name="truck" size={14}/>Send out for delivery</div>
+              <div className="grid grid-cols-2 gap-2">
+                <select value={dispDriver} onChange={e=>setDispDriver(e.target.value)} className={inputCls+' !py-1.5'}>
+                  {(drivers||[]).map(d=><option key={d.id} value={d.id}>{d.name}</option>)}</select>
+                <select value={dispWindow} onChange={e=>setDispWindow(e.target.value)} className={inputCls+' !py-1.5'}>
+                  {TIME_WINDOWS.map(t=><option key={t}>{t}</option>)}</select>
+              </div>
+              <Btn kind="primary" icon="truck" className="w-full mt-2" onClick={dispatch}>Add to driver’s run</Btn>
+            </div>}
           </div>
 
           <div>
@@ -762,7 +864,16 @@ function OrderModal({ order, rates, onClose, onSave, addAudit }) {
             </div>
             {order.needsPricing && <div className="text-xs text-rose-600 bg-rose-50 rounded-lg px-2 py-1.5 mb-2 inline-flex items-center gap-1"><Ic name="alert" size={14}/>Driver flagged extras — add them to finalise the price.</div>}
             {!pricing
-              ? <div className="text-sm text-slate2">Current total <span className="font-bold text-ink">{gbp(order.amount)}</span>. Tap <b>Amend price</b> to add dry cleaning, bedding or repairs found in the bag.</div>
+              ? <div>
+                  <div className="bg-gray-50 rounded-xl p-3 text-sm space-y-1">
+                    {order.weightCharge>0 && <div className="flex justify-between text-slate2"><span>{order.services[0]||'Weight-based'} ({order.weight}kg)</span><span>{gbp(order.weightCharge)}</span></div>}
+                    {calc.lines.map((l,i)=>(<div key={i} className="flex justify-between text-slate2"><span>{l.label}</span><span>{gbp(l.amt)}</span></div>))}
+                    {calc.discount>0 && <div className="flex justify-between text-emerald-600"><span>First-order discount</span><span>−{gbp(calc.discount)}</span></div>}
+                    {order.weightCharge===0 && calc.lines.length===0 && <div className="text-slate2">Nothing priced yet.</div>}
+                    <div className="flex justify-between items-center pt-1.5 border-t border-gray-200"><span className="font-bold text-ink">Total</span><span className="font-extrabold text-ink">{gbp(order.amount)}</span></div>
+                  </div>
+                  <p className="text-xs text-slate2 mt-2">{calc.lines.length>0?'Extras added at the shop are listed above. ':''}Tap <b>Amend price</b> to add or change dry cleaning, bedding or repairs.</p>
+                </div>
               : <>
                   <div className="bg-gray-50 rounded-xl p-3 text-sm mb-3">
                     <div className="flex justify-between text-slate2"><span>Weight-based ({order.services[0]})</span><span>{gbp(order.weightCharge)}</span></div>
@@ -788,6 +899,11 @@ function OrderModal({ order, rates, onClose, onSave, addAudit }) {
                 </>}
           </div>
         </div>
+        {onDelete && <div className="px-5 pb-5">
+          <button onClick={()=>{ if(window.confirm(`Delete this order for ${fullName(c)}? This can’t be undone.`)){ onDelete(order.id); onClose(); } }}
+            className="w-full border-2 border-rose-200 bg-white text-rose-600 rounded-xl py-2 text-sm font-semibold inline-flex items-center justify-center gap-1.5 hover:bg-rose-50 transition">
+            <Ic name="trash" size={15}/>Delete this order</button>
+        </div>}
       </div>
     </div>
   );
@@ -809,7 +925,7 @@ function StoreLogin({ go, onLogin }) {
     </LoginCard>
   );
 }
-function StoreApp({ go, orders, rates, updateOrder, addAudit }) {
+function StoreApp({ go, orders, rates, updateOrder, addAudit, deleteOrder, jobs, drivers, onDispatch }) {
   const [scope,setScope]=useState('today');
   const [sel,setSel]=useState(null);
   const list = useMemo(()=>{
@@ -819,9 +935,11 @@ function StoreApp({ go, orders, rates, updateOrder, addAudit }) {
   }, [orders,scope]);
 
   const printList = () => {
-    const rows = list.map(o=>{ const c=custById(o.customerId);
+    const itemLabel = k => { const r=rates.items.find(x=>x.key===k); return r ? r.label.replace(/^Dry clean — /,'') : k; };
+    const addedStr = o => Object.entries(o.addedItems||{}).filter(([k,q])=>parseInt(q)>0).map(([k,q])=>`${itemLabel(k)} ×${q}`).join(', ');
+    const rows = list.map(o=>{ const c=custById(o.customerId); const extra = addedStr(o) || (o.extras.length ? o.extras.join(', ') : '');
       return `<tr><td><b>${fmtDate(o.dueDate)}</b></td><td>${fullName(c)}<br><span class="a">${c.addr}</span></td>
-        <td>${o.services.join(', ')}${o.extras.length?` <span class="r">+ ${o.extras.join(', ')}</span>`:''}</td>
+        <td>${o.services.join(', ')}${extra?`<br><span class="r">+ ${extra}</span>`:''}</td>
         <td>${o.bagsCount} (${o.bagWeights.join('+')}kg) · ${o.weight}kg</td>
         <td>${gbp(o.amount)}${o.needsPricing?' <span class="r">(prov.)</span>':''}<br><span class="a">${o.paidInAdvance?'PAID':o.paymentMethod}</span></td>
         <td>${o.packaging}</td><td>${fmtDate(o.collectedDate)} ${o.collectedAt}</td><td>${o.status==='Needs pricing'?`<span class="r">${o.status}</span>`:o.status}</td><td>${o.notes||''}</td></tr>`; }).join('');
@@ -882,7 +1000,7 @@ function StoreApp({ go, orders, rates, updateOrder, addAudit }) {
             })}
           </div>}
       </div>
-      {sel && <OrderModal order={orders.find(o=>o.id===sel.id)||sel} rates={rates} onClose={()=>setSel(null)} onSave={updateOrder} addAudit={addAudit}/>}
+      {sel && <OrderModal order={orders.find(o=>o.id===sel.id)||sel} rates={rates} onClose={()=>setSel(null)} onSave={updateOrder} addAudit={addAudit} onDelete={deleteOrder} onDispatch={onDispatch} jobs={jobs} drivers={drivers}/>}
     </div>
   );
 }
@@ -902,7 +1020,7 @@ function AdminLogin({ go, onLogin }) {
     </LoginCard>
   );
 }
-function AdminApp({ go, jobs, setJobs, rates, setRates, audit, drivers, setDrivers, orders, addJob, updateOrder, addAudit }) {
+function AdminApp({ go, jobs, setJobs, rates, setRates, audit, drivers, setDrivers, orders, addJob, updateOrder, addAudit, deleteJob, deleteOrder, dispatchDelivery }) {
   const [tab,setTab]=useState('overview');
   const [intake,setIntake]=useState(false);
   const [ordersFilter,setOrdersFilter]=useState('all');
@@ -926,10 +1044,10 @@ function AdminApp({ go, jobs, setJobs, rates, setRates, audit, drivers, setDrive
         </div>
         {tab==='overview'  && <Overview jobs={jobs} orders={orders} audit={audit} onNew={()=>setIntake(true)} goStat={goStat}/>}
         {tab==='customers' && <Customers/>}
-        {tab==='orders'    && <Orders orders={orders} rates={rates} updateOrder={updateOrder} addAudit={addAudit} filter={ordersFilter} onClearFilter={()=>setOrdersFilter('all')}/>}
+        {tab==='orders'    && <Orders orders={orders} rates={rates} updateOrder={updateOrder} addAudit={addAudit} filter={ordersFilter} onClearFilter={()=>setOrdersFilter('all')} deleteOrder={deleteOrder} jobs={jobs} drivers={drivers} onDispatch={dispatchDelivery}/>}
         {tab==='pricing'   && <Pricing rates={rates} setRates={setRates}/>}
         {tab==='drivers'   && <DriversAdmin drivers={drivers} setDrivers={setDrivers}/>}
-        {tab==='logistics' && <Logistics jobs={jobs} setJobs={setJobs} drivers={drivers} onNew={()=>setIntake(true)}/>}
+        {tab==='logistics' && <Logistics jobs={jobs} setJobs={setJobs} drivers={drivers} onNew={()=>setIntake(true)} deleteJob={deleteJob}/>}
       </div>
       {intake && <IntakeModal drivers={drivers} onClose={()=>setIntake(false)} onCreate={addJob}/>}
     </div>
@@ -944,7 +1062,7 @@ function IntakeModal({ drivers, onClose, onCreate }) {
   const matches = q.trim().length<1 ? [] : CUSTOMERS.filter(c=>(fullName(c)+' '+c.addr).toLowerCase().includes(q.toLowerCase())).slice(0,6);
   const chosen = customerId ? custById(customerId) : null;
   const create=()=>{ if(!customerId)return;
-    onCreate({ id:'j'+Date.now(), driverId, type, customerId, window:window_, status:'pending', packaging, instructions,
+    onCreate({ id:uuid(), driverId, type, customerId, window:window_, status:'pending', packaging, instructions,
       returnDate: type==='collection'?returnDate:undefined, paidInAdvance:paid,
       ...(type==='delivery'?{bags:1,weight:0,amount:0,service:'—',paymentMethod:'Cash'}:{}) }); onClose(); };
   return (
@@ -1047,15 +1165,16 @@ function Customers() {
         </div>))}
     </div></div>);
 }
-function Orders({ orders, rates, updateOrder, addAudit, filter, onClearFilter }) {
+function Orders({ orders, rates, updateOrder, addAudit, filter, onClearFilter, deleteOrder, jobs, drivers, onDispatch }) {
   const [sel,setSel]=useState(null);
   const base = filter==='needsPricing' ? orders.filter(o=>o.needsPricing) : orders;
   const sorted=[...base].sort((a,b)=>a.dueDate.localeCompare(b.dueDate));
   return (<div>
     <div className="flex items-center justify-between mb-3">
-      <h3 className="font-bold text-ink">{filter==='needsPricing'?'Orders awaiting pricing':'Orders in the shop'}</h3>
+      <h3 className="font-bold text-ink">{filter==='needsPricing'?'Orders awaiting pricing':'All orders'}</h3>
       {filter==='needsPricing' && <button onClick={onClearFilter} className="text-sm text-teal-dark font-semibold inline-flex items-center gap-1"><Ic name="left" size={14}/>Show all</button>}
     </div>
+    {filter!=='needsPricing' && <p className="text-xs text-slate2 -mt-2 mb-3">Every order and its stage — booked, collected, in the shop, ready and delivered.</p>}
     <div className="space-y-2">
       {sorted.length===0 && <div className="bg-white card rounded-2xl p-8 text-center text-slate2">No orders awaiting pricing right now.</div>}
       {sorted.map(o=>{ const c=custById(o.customerId); return (
@@ -1075,7 +1194,7 @@ function Orders({ orders, rates, updateOrder, addAudit, filter, onClearFilter })
         </button>);})}
     </div>
     <p className="text-xs text-slate2 mt-2">Tap an order to view details or amend the price. “prov.” = provisional, extras still to be added at the shop.</p>
-    {sel && <OrderModal order={orders.find(o=>o.id===sel.id)||sel} rates={rates} onClose={()=>setSel(null)} onSave={updateOrder} addAudit={addAudit}/>}
+    {sel && <OrderModal order={orders.find(o=>o.id===sel.id)||sel} rates={rates} onClose={()=>setSel(null)} onSave={updateOrder} addAudit={addAudit} onDelete={deleteOrder} onDispatch={onDispatch} jobs={jobs} drivers={drivers}/>}
   </div>);
 }
 function Pricing({ rates, setRates }) {
@@ -1107,7 +1226,7 @@ function Pricing({ rates, setRates }) {
 }
 function DriversAdmin({ drivers, setDrivers }) {
   const [name,setName]=useState('');
-  const add=()=>{ if(!name.trim())return; setDrivers([...drivers,{id:'d'+(drivers.length+1),name:name.trim(),pin:'1234'}]); setName(''); };
+  const add=()=>{ if(!name.trim())return; setDrivers([...drivers,{id:uuid(),name:name.trim(),pin:'1234'}]); setName(''); };
   return (<div><h3 className="font-bold text-ink mb-3">Drivers</h3>
     <div className="bg-white card rounded-2xl p-4 mb-3 flex gap-2 items-end">
       <div className="flex-1"><Field label="Enrol new driver"><input value={name} onChange={e=>setName(e.target.value)} placeholder="Full name" className={inputCls+' mt-1'} onKeyDown={e=>e.key==='Enter'&&add()}/></Field></div>
@@ -1137,16 +1256,21 @@ function RouteMap({ jobs, drivers, filterDriver }) {
     if (!map || !group) return;
     group.clearLayers();
     const bounds = [[SHOP.lat,SHOP.lng]];
-    const pin = (html,bg) => L.divIcon({ className:'', iconSize:[28,28], iconAnchor:[14,14],
-      html:`<div style="background:${bg};color:#fff;width:28px;height:28px;border-radius:50%;display:flex;
-        align-items:center;justify-content:center;font:bold 12px Inter,Arial;border:2px solid #fff;
-        box-shadow:0 1px 4px rgba(0,0,0,.35)">${html}</div>` });
+    const initials = n => (n||'').split(' ').filter(Boolean).map(w=>w[0]).join('').slice(0,2).toUpperCase();
+    const shopIcon = L.divIcon({ className:'', iconSize:[30,30], iconAnchor:[15,15],
+      html:`<div style="background:#1f2a30;width:30px;height:30px;border-radius:50%;display:flex;align-items:center;justify-content:center;border:2px solid #fff;box-shadow:0 1px 4px rgba(0,0,0,.35)">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 11l8-6 8 6"/><path d="M6 10v9h12v-9"/></svg></div>` });
+    // stop pin: driver initials + driving order (e.g. "SO | 1")
+    const stopIcon = (ini, seq, bg) => L.divIcon({ className:'', iconSize:[42,24], iconAnchor:[21,12],
+      html:`<div style="background:${bg};color:#fff;height:24px;padding:0 7px;border-radius:12px;display:inline-flex;align-items:center;gap:3px;font:bold 11px Inter,Arial;border:2px solid #fff;box-shadow:0 1px 4px rgba(0,0,0,.35);white-space:nowrap">
+        <span>${ini}</span><span style="opacity:.5">|</span><span>${seq}</span></div>` });
 
-    L.marker([SHOP.lat,SHOP.lng],{icon:pin('S','#1f2a30')})
+    L.marker([SHOP.lat,SHOP.lng],{icon:shopIcon})
       .bindPopup(`<b>${SHOP.name}</b><br>${SHOP.addr}<br><i>Start &amp; end of the round</i>`).addTo(group);
 
     drivers.forEach((d,di)=>{
       if (filterDriver!=='all' && filterDriver!==d.id) return;
+      const ini = initials(d.name);
       const list = jobs.filter(j=>j.driverId===d.id).sort((a,b)=>a.seq-b.seq);
       const pts = [[SHOP.lat,SHOP.lng]];
       list.forEach(j=>{
@@ -1154,7 +1278,7 @@ function RouteMap({ jobs, drivers, filterDriver }) {
         if (!c || c.lat==null) return;
         const resolved = j.status!=='pending';
         const bg = resolved ? '#9aa5ab' : (j.type==='collection' ? '#f43f5e' : '#3AAFCB');
-        L.marker([c.lat,c.lng],{icon:pin(j.seq,bg)}).bindPopup(
+        L.marker([c.lat,c.lng],{icon:stopIcon(ini, j.seq, bg)}).bindPopup(
           `<b>${fullName(c)}</b><br>${c.addr}<br>${j.type==='collection'?'Collection':'Delivery'} · ${j.window}` +
           `<br><i>${d.name}${resolved?' · done':''}</i>`).addTo(group);
         pts.push([c.lat,c.lng]); bounds.push([c.lat,c.lng]);
@@ -1171,7 +1295,7 @@ function RouteMap({ jobs, drivers, filterDriver }) {
   return <div ref={elRef} style={{height:'340px'}} className="w-full rounded-2xl overflow-hidden border border-gray-100 z-0"/>;
 }
 
-function Logistics({ jobs, setJobs, drivers, onNew }) {
+function Logistics({ jobs, setJobs, drivers, onNew, deleteJob }) {
   const [mapDriver,setMapDriver]=useState('all');
   const [saving,setSaving]=useState(null);
   const [drag,setDrag]=useState(null);
@@ -1211,7 +1335,7 @@ function Logistics({ jobs, setJobs, drivers, onNew }) {
         <div className="flex items-center justify-between gap-3 flex-wrap mt-2">
           <p className="text-[11px] text-slate2 flex-1 min-w-[220px]">
             <span className="text-rose-500 font-semibold">Pink = collection</span>, <span className="text-teal-dark font-semibold">blue = delivery</span>,
-            grey = already done. Numbers show the driving order, and <b>S</b> is the shop (start &amp; end). Tap a pin for details.</p>
+            grey = already done. Each pin shows the driver’s initials and driving order (e.g. SO | 1); the house marker is the shop (start &amp; end). Tap a pin for details.</p>
           <span className="text-xs font-bold text-ink whitespace-nowrap">Round: ~{roundMiles.toFixed(1)} miles</span>
         </div>
         {saving && <div className={`text-xs rounded-lg px-2.5 py-1.5 mt-2 inline-flex items-center gap-1.5 ${saving.after < saving.before-0.05 ? 'bg-emerald-50 text-emerald-700':'bg-gray-50 text-slate2'}`}>
@@ -1229,22 +1353,22 @@ function Logistics({ jobs, setJobs, drivers, onNew }) {
               onDragLeave={e=>e.currentTarget.classList.remove('drag-over')}
               onDrop={e=>{ e.currentTarget.classList.remove('drag-over'); dropOnColumn(d.id); }}
               className="bg-white card rounded-2xl p-4">
-              <h4 className="font-bold text-ink text-sm mb-2 inline-flex items-center gap-1.5"><Ic name="truck" size={16}/>{d.name} <span className="text-slate2 font-normal">· {list.length} stops</span>
+              <h4 className="font-bold text-ink text-sm mb-2 inline-flex items-center gap-1.5"><Ic name="truck" size={16}/>{d.name} <span className="text-slate2 font-normal">· {list.length} stops{list.filter(x=>x.status!=='pending').length?` · ${list.filter(x=>x.status!=='pending').length} done`:''}</span>
                 {isDropTarget && <span className="text-teal-dark text-xs font-normal ml-1">— drop to reassign</span>}</h4>
               {list.length===0 ? <p className="text-sm text-slate2 border-2 border-dashed border-gray-200 rounded-xl p-4 text-center">No route assigned{isDropTarget?' — drop a job here':''}.</p> :
                 <div className="space-y-2">
-                  {list.map((j,idx)=>{ const c=custById(j.customerId);
+                  {list.map((j,idx)=>{ const c=custById(j.customerId); const done=j.status==='done', na=j.status==='no-answer', resolved=done||na;
                     return (
                       <div key={j.id} draggable onDragStart={()=>setDrag({fromDriverId:d.id,jobId:j.id})} onDragEnd={()=>setDrag(null)}
                         onDragOver={e=>{e.preventDefault(); e.stopPropagation(); e.currentTarget.classList.add('drag-over');}}
                         onDragLeave={e=>e.currentTarget.classList.remove('drag-over')}
                         onDrop={e=>{e.preventDefault(); e.stopPropagation(); e.currentTarget.classList.remove('drag-over'); dropOnJob(d.id,j.id);}}
-                        className={`rounded-xl border px-2 py-2 cursor-move ${j.type==='collection'?'bg-rose-50/70 border-rose-100':'bg-white border-gray-100'}`}>
+                        className={`rounded-xl border px-2 py-2 cursor-move ${resolved?'opacity-60 bg-gray-50 border-gray-100':j.type==='collection'?'bg-rose-50/70 border-rose-100':'bg-white border-gray-100'}`}>
                         <div className="flex items-center gap-2">
                           <span className="text-gray-300"><Ic name="grip" size={16}/></span>
-                          <span className={`w-6 h-6 rounded-full flex items-center justify-center text-xs font-bold text-white shrink-0 ${j.type==='collection'?'bg-rose-500':'bg-teal'}`}>{j.seq}</span>
+                          <span className={`w-6 h-6 rounded-full flex items-center justify-center text-xs font-bold text-white shrink-0 ${resolved?'bg-gray-300':j.type==='collection'?'bg-rose-500':'bg-teal'}`}>{j.seq}</span>
                           <div className="flex-1 min-w-0">
-                            <div className="flex items-center gap-1.5"><TypeBadge type={j.type}/><span className="text-xs text-slate2">{j.window}</span></div>
+                            <div className="flex items-center gap-1.5 flex-wrap"><TypeBadge type={j.type}/><span className="text-xs text-slate2">{j.window}</span>{done && <Badge tone="green">Done</Badge>}{na && <Badge tone="rose">No answer</Badge>}</div>
                             <div className="text-sm text-ink truncate">{fullName(c)}</div>
                             <div className="text-xs text-slate2 truncate">{c.addr}</div>
                           </div>
@@ -1252,6 +1376,8 @@ function Logistics({ jobs, setJobs, drivers, onNew }) {
                             <button onClick={()=>move(d.id,j.id,'up')} disabled={idx===0} className={idx===0?'text-gray-200':'hover:text-teal'}><Ic name="up" size={16}/></button>
                             <button onClick={()=>move(d.id,j.id,'down')} disabled={idx===list.length-1} className={idx===list.length-1?'text-gray-200':'hover:text-teal'}><Ic name="down" size={16}/></button>
                           </div>
+                          <button onClick={()=>{ if(window.confirm(`Cancel this ${j.type} for ${fullName(c)}?`)) deleteJob(j); }}
+                            className="text-gray-300 hover:text-rose-500 self-center" title="Cancel / delete this job"><Ic name="trash" size={16}/></button>
                         </div>
                         {drivers.length>1 &&
                           <div className="flex items-center gap-1 mt-1.5 pl-8">
@@ -1272,39 +1398,120 @@ function Logistics({ jobs, setJobs, drivers, onNew }) {
 /* =================================================================== */
 /*  ROOT                                                              */
 /* =================================================================== */
+function LoadingScreen() {
+  return <div className="min-h-screen flex flex-col items-center justify-center gap-4">
+    <Logo h={54}/><div className="text-slate2 text-sm">Loading your data…</div>
+    <div className="w-6 h-6 border-2 border-teal border-t-transparent rounded-full animate-spin"></div></div>;
+}
+function ErrorScreen({ msg }) {
+  return <div className="min-h-screen flex items-center justify-center p-6">
+    <div className="bg-white card rounded-2xl p-6 max-w-md text-center">
+      <div className="w-12 h-12 mx-auto rounded-full bg-rose-50 text-rose-600 flex items-center justify-center"><Ic name="alert" size={24}/></div>
+      <h2 className="font-bold text-ink mt-3">Couldn’t reach the database</h2>
+      <p className="text-sm text-slate2 mt-2">{msg}</p>
+      <p className="text-xs text-slate2 mt-3">Check the internet connection and that the Supabase project URL and key are correct, then reload.</p>
+    </div></div>;
+}
+
 function App() {
+  const [phase,setPhase]=useState(db ? 'loading' : 'ready'); // no db -> offline demo fallback
+  const [err,setErr]=useState('');
   const [view,setView]=useState('landing');
   const [driver,setDriver]=useState(null);
-  const [jobs,setJobs]=useState(INITIAL_JOBS);
-  const [orders,setOrders]=useState(INITIAL_ORDERS);
-  const [rates,setRates]=useState(INITIAL_RATES);
-  const [drivers,setDrivers]=useState(DRIVERS);
+  const [jobs,setJobsState]=useState(INITIAL_JOBS);
+  const [orders,setOrdersState]=useState(INITIAL_ORDERS);
+  const [rates,setRatesState]=useState(INITIAL_RATES);
+  const [drivers,setDriversState]=useState(DRIVERS);
   const [audit,setAudit]=useState([]);
-  const addAudit=useCallback(text=>setAudit(prev=>[{time:now(),text},...prev]),[]);
-  const addOrder=useCallback(o=>setOrders(prev=>[o,...prev]),[]);
-  const updateOrder=useCallback((id,patch)=>setOrders(prev=>prev.map(o=>o.id===id?{...o,...patch}:o)),[]);
+  const [saveError,setSaveError]=useState('');
+
+  useEffect(()=>{ if(!db) return;
+    loadAll().then(d=>{ setDriversState(d.drivers); setJobsState(d.jobs); setOrdersState(d.orders); setRatesState(d.rates); setAudit(d.audit); setPhase('ready'); })
+      .catch(e=>{ console.error(e); setErr(e.message||String(e)); setPhase('error'); });
+  },[]);
+  useEffect(()=>{ onSaveError=(m)=>setSaveError(m); return ()=>{ onSaveError=null; }; },[]);
+
+  // write-through setters: update the screen AND save to the database
+  const setJobs=useCallback(u=>setJobsState(prev=>{ const next=typeof u==='function'?u(prev):u; saveJobs(next); return next; }),[]);
+  const setRates=useCallback(u=>setRatesState(prev=>{ const next=typeof u==='function'?u(prev):u; saveRates(next); return next; }),[]);
+  const setDrivers=useCallback(u=>setDriversState(prev=>{ const next=typeof u==='function'?u(prev):u; DRIVERS=next; saveDrivers(next); return next; }),[]);
+  const addAudit=useCallback(text=>{ const e={time:now(),text}; setAudit(prev=>[e,...prev]); insertAudit(e); },[]);
+  const addOrder=useCallback(o=>{ setOrdersState(prev=>[o,...prev]); saveOrder(o); },[]);
+  const updateOrder=useCallback((id,patch)=>setOrdersState(prev=>{ const next=prev.map(o=>o.id===id?{...o,...patch}:o);
+    const upd=next.find(o=>o.id===id); if(upd) saveOrder(upd); return next; }),[]);
+  const reseqDriver=(arr,did)=>{ const mine=arr.filter(j=>j.driverId===did).sort((a,b)=>a.seq-b.seq).map((j,i)=>({...j,seq:i+1}));
+    if(db) mine.forEach(j=>db.from('jobs').upsert(toJobRow(j)).then(logErr('reseq'))); return [...arr.filter(j=>j.driverId!==did),...mine]; };
+  const deleteJob=useCallback(job=>{
+    setJobsState(prev=>{ const rest=prev.filter(j=>j.id!==job.id);
+      if(db) db.from('jobs').delete().eq('id',job.id).then(logErr('deleteJob'));
+      return reseqDriver(rest, job.driverId); });
+    // cancelling a booking that was never collected removes its pending order too
+    if(job.orderId) setOrdersState(prev=>{ const o=prev.find(x=>x.id===job.orderId);
+      if(o && o.status==='Pending Collection'){ if(db) db.from('orders').delete().eq('id',job.orderId).then(logErr('cancelOrder')); return prev.filter(x=>x.id!==job.orderId); }
+      return prev; });
+  },[]);
+  const dispatchDelivery=useCallback((order, driverId, window)=>{
+    const nj={ id:uuid(), driverId, type:'delivery', customerId:order.customerId, orderId:order.id, window, status:'pending',
+      packaging:order.packaging, bags:order.bagsCount, weight:order.weight, amount:order.amount,
+      service:(order.services||[]).join(', ')||'—', paymentMethod:order.paymentMethod, paidInAdvance:order.paidInAdvance };
+    setJobsState(prev=>{ const n=prev.filter(x=>x.driverId===driverId).length; const job={...nj,seq:n+1};
+      if(db) db.from('jobs').insert(toJobRow(job)).then(r=>{ if(r&&r.error) reportErr('dispatch job', r.error); });
+      return [...prev, job]; });
+    updateOrder(order.id, { status:'Out for delivery' });
+    addAudit(`${fullName(custById(order.customerId))}'s order sent out for delivery`);
+  },[updateOrder,addAudit]);
+  const deleteOrder=useCallback(orderId=>{
+    setOrdersState(prev=>prev.filter(o=>o.id!==orderId));
+    if(db) db.from('orders').delete().eq('id',orderId).then(logErr('deleteOrder'));
+    // also remove any still-pending collection job linked to this order
+    setJobsState(prev=>{ const linked=prev.filter(j=>j.orderId===orderId && j.status==='pending');
+      if(!linked.length) return prev; const ids=new Set(linked.map(j=>j.id));
+      if(db) linked.forEach(j=>db.from('jobs').delete().eq('id',j.id).then(logErr('deleteLinkedJob')));
+      let next=prev.filter(j=>!ids.has(j.id));
+      [...new Set(linked.map(j=>j.driverId))].forEach(did=>{ next=reseqDriver(next,did); });
+      return next; });
+  },[]);
   const addJob=useCallback(j=>{
-    if (j.type==='collection') {
-      const orderId='o'+Date.now(); // boss booking -> Pending Collection order, linked to the driver job
-      setOrders(prev=>[{ id:orderId, customerId:j.customerId, services:[], extras:[], needsPricing:false, addedItems:{}, firstOrder:false,
-        bagsCount:0, bagWeights:[], weight:0, weightCharge:0, amount:0, initialAmount:0,
-        packaging:j.packaging, paymentMethod:'—', paidInAdvance:j.paidInAdvance, collectedDate:null, collectedAt:null,
-        dueDate:j.returnDate||addDays(TODAY,2), status:'Pending Collection', notes:j.instructions }, ...prev]);
-      setJobs(prev=>{ const n=prev.filter(x=>x.driverId===j.driverId).length; return [...prev,{...j,orderId,seq:n+1}]; });
-    } else {
-      setJobs(prev=>{ const n=prev.filter(x=>x.driverId===j.driverId).length; return [...prev,{...j,seq:n+1}]; });
-    }
+    const isCol = j.type==='collection';
+    const orderId = isCol ? uuid() : null;
+    const order = isCol ? { id:orderId, customerId:j.customerId, services:[], extras:[], needsPricing:false, addedItems:{}, firstOrder:false,
+      bagsCount:0, bagWeights:[], weight:0, weightCharge:0, amount:0, initialAmount:0,
+      packaging:j.packaging, paymentMethod:'—', paidInAdvance:j.paidInAdvance, collectedDate:null, collectedAt:null,
+      dueDate:j.returnDate||addDays(TODAY,2), status:'Pending Collection', notes:j.instructions } : null;
+    if (order) setOrdersState(prev=>[order,...prev]);
+    setJobsState(prev=>{
+      const n=prev.filter(x=>x.driverId===j.driverId).length;
+      const nj={...j, ...(orderId?{orderId}:null), seq:n+1};
+      // persist: order first (if any), THEN the job — awaited so the order exists before the job's FK
+      (async()=>{
+        if(!db) return;
+        try {
+          if (order){ const o=await db.from('orders').insert(toOrderRow(order)); if(o.error){ reportErr('save booking', o.error); return; } }
+          const r=await db.from('jobs').insert(toJobRow(nj)); if(r.error) reportErr('save job', r.error);
+        } catch(e){ reportErr('save job', e); }
+      })();
+      return [...prev, nj];
+    });
   },[]);
   const go=useCallback(v=>setView(v),[]);
 
-  if (view==='landing')      return <Landing go={go}/>;
-  if (view==='driver-login') return <DriverLogin go={go} onLogin={d=>{setDriver(d);go('driver-app');}}/>;
-  if (view==='driver-app')   return <DriverApp driver={driver} go={go} jobs={jobs} setJobs={setJobs} rates={rates} addAudit={addAudit} addOrder={addOrder} updateOrder={updateOrder}/>;
-  if (view==='store-login')  return <StoreLogin go={go} onLogin={()=>go('store-app')}/>;
-  if (view==='store-app')    return <StoreApp go={go} orders={orders} rates={rates} updateOrder={updateOrder} addAudit={addAudit}/>;
-  if (view==='admin-login')  return <AdminLogin go={go} onLogin={()=>go('admin-app')}/>;
-  if (view==='admin-app')    return <AdminApp go={go} jobs={jobs} setJobs={setJobs} rates={rates} setRates={setRates} audit={audit} drivers={drivers} setDrivers={setDrivers} orders={orders} addJob={addJob} updateOrder={updateOrder} addAudit={addAudit}/>;
-  return null;
+  let screen=null;
+  if (phase==='loading') screen=<LoadingScreen/>;
+  else if (phase==='error') screen=<ErrorScreen msg={err}/>;
+  else if (view==='landing')      screen=<Landing go={go}/>;
+  else if (view==='driver-login') screen=<DriverLogin go={go} onLogin={d=>{setDriver(d);go('driver-app');}}/>;
+  else if (view==='driver-app')   screen=<DriverApp driver={driver} go={go} jobs={jobs} setJobs={setJobs} rates={rates} addAudit={addAudit} addOrder={addOrder} updateOrder={updateOrder}/>;
+  else if (view==='store-login')  screen=<StoreLogin go={go} onLogin={()=>go('store-app')}/>;
+  else if (view==='store-app')    screen=<StoreApp go={go} orders={orders} rates={rates} updateOrder={updateOrder} addAudit={addAudit} deleteOrder={deleteOrder} jobs={jobs} drivers={drivers} onDispatch={dispatchDelivery}/>;
+  else if (view==='admin-login')  screen=<AdminLogin go={go} onLogin={()=>go('admin-app')}/>;
+  else if (view==='admin-app')    screen=<AdminApp go={go} jobs={jobs} setJobs={setJobs} rates={rates} setRates={setRates} audit={audit} drivers={drivers} setDrivers={setDrivers} orders={orders} addJob={addJob} updateOrder={updateOrder} addAudit={addAudit} deleteJob={deleteJob} deleteOrder={deleteOrder} dispatchDelivery={dispatchDelivery}/>;
+  return <>
+    {saveError && <div className="fixed top-0 inset-x-0 z-[60] bg-rose-600 text-white text-sm px-4 py-2.5 flex items-center justify-between gap-3 shadow-lg">
+      <span className="inline-flex items-start gap-2"><Ic name="alert" size={16} className="mt-0.5 shrink-0"/><span>{saveError}</span></span>
+      <button onClick={()=>setSaveError('')} className="shrink-0 opacity-90 hover:opacity-100"><Ic name="close" size={18}/></button>
+    </div>}
+    {screen}
+  </>;
 }
 ReactDOM.createRoot(document.getElementById('root')).render(<App/>);
 </script>
