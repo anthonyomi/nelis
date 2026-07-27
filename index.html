@@ -144,7 +144,7 @@ let CUSTOMERS = [
   { id:'c6', title:'Ms',  first:'Grace',   last:'Bennett', addr:'5 Myrtle Rd, Walthamstow, E17 8BX',    mob:'07700 900677', email:'grace@example.com',   lat:51.5895, lng:-0.0225 },
 ];
 const SHOP = { name:'NEL Ironing Service', addr:'5 Blackhorse Road, Walthamstow, E17 7AH', lat:51.5865, lng:-0.0410 };
-let DRIVERS = [ { id:'d1', name:'Sam Okoro', pin:'1234' }, { id:'d2', name:'Maria Silva', pin:'1234' } ];
+let DRIVERS = [ { id:'d1', name:'Sam Okoro', pin:'1234', roles:['driver'] }, { id:'d2', name:'Maria Silva', pin:'1234', roles:['driver'] }, { id:'d0', name:'Boss', pin:'0000', roles:['admin','store','driver'], canDelete:true } ];
 
 const INITIAL_JOBS = [
   { id:'j1', driverId:'d1', seq:1, type:'collection', customerId:'c1', window:'09:00–10:00', status:'pending', orderId:'o7',
@@ -316,7 +316,15 @@ const fromCustomerRow = r => ({ id:r.id, title:r.title, first:r.first_name, last
   mob:r.mobile, email:r.email, lat:num(r.lat), lng:num(r.lng) });
 const toCustomerRow = c => ({ id:c.id, title:c.title, first_name:c.first, last_name:c.last, address:c.addr,
   mobile:c.mob, email:c.email, lat:c.lat ?? null, lng:c.lng ?? null });
-const fromDriverRow = r => ({ id:r.id, name:r.name, pin:r.pin });
+const fromDriverRow = r => ({ id:r.id, name:r.name, pin:r.pin, roles:(r.roles&&r.roles.length?r.roles:['driver']), canDelete:!!r.can_delete, active:r.active!==false });
+const hasRole = (u,role) => !!(u && u.roles && u.roles.includes(role));
+const mayDelete = u => hasRole(u,'admin') || !!(u && u.canDelete);
+// the portals a person can reach, decided by their roles
+const PORTALS = [
+  { key:'driver', view:'driver-app', role:'driver', icon:'truck',  title:'Driver Portal', desc:'Today’s collections & deliveries; take collections and confirm drop-offs.' },
+  { key:'store',  view:'store-app',  role:'store',  icon:'hanger', title:'Store Portal',  desc:'What’s coming in and going out; price extras and print the day’s list.' },
+  { key:'admin',  view:'admin-app',  role:'admin',  icon:'user',   title:'Admin Portal',  desc:'Overview, customers, orders, pricing, staff, job intake and route planning.' },
+];
 // free address -> lat/lng lookup for the map (no key). UK postcode first (very reliable), then full address.
 async function geocode(addr){
   if(!addr) return null;
@@ -331,6 +339,13 @@ async function geocode(addr){
 // fill in coordinates for any customers that don't have them yet (runs one at a time)
 async function backfillCoords(list, onUpdate){
   for (const c of list){ if (!c.addr || c.lat!=null) continue; const pt=await geocode(c.addr); if (pt) onUpdate(c.id, pt); }
+}
+// split a stored address string back into line1 / town / postcode for editing
+function splitAddr(addr){
+  const pc=((addr||'').match(/[A-Z]{1,2}\d[A-Z\d]?\s*\d[A-Z]{2}/i)||[''])[0];
+  const rest=(addr||'').replace(pc,'').replace(/,\s*$/,'').trim();
+  const parts=rest.split(',').map(s=>s.trim()).filter(Boolean);
+  return { line1:parts[0]||'', town:parts.slice(1).join(', ')||'', pc };
 }
 const ratesFromRows = (rows, settings) => ({
   weight: rows.filter(r=>r.kind==='weight').sort((a,b)=>a.sort-b.sort).map(r=>({key:r.key,label:r.label,unit:r.unit||'kg',price:num(r.price)})),
@@ -384,12 +399,14 @@ const logErr = (where) => (r) => { if (r && r.error) reportErr(where, r.error); 
 // save jobs one row at a time — resilient (one bad row can't block the others)
 const saveJobs   = arr => { if(!db) return; arr.forEach(j => db.from('jobs').upsert(toJobRow(j)).then(logErr('saveJob'))); };
 const saveOrder  = o   => db && db.from('orders').upsert(toOrderRow(o)).then(logErr('saveOrder'));
-const saveDrivers= arr => db && db.from('drivers').upsert(arr.map(d=>({id:d.id,name:d.name,pin:d.pin}))).then(logErr('saveDrivers'));
+const saveDrivers= arr => db && db.from('drivers').upsert(arr.map(d=>({id:d.id,name:d.name,pin:d.pin,roles:d.roles||['driver'],can_delete:!!d.canDelete,active:d.active!==false}))).then(logErr('saveDrivers'));
 const insertAudit= e   => db && db.from('audit_log').insert({at:e.time, text:e.text, is_alert:/^No answer/.test(e.text)}).then(logErr('insertAudit'));
 const saveRates  = r   => { if(!db) return;
   const rows=[ ...r.weight.map((x,i)=>({key:x.key,kind:'weight',label:x.label,price:x.price,unit:x.unit||'kg',sort:i+1})),
                ...r.items.map((x,i)=>({key:x.key,kind:'item',label:x.label,price:x.price,group_name:x.group,sort:100+i})) ];
   db.from('service_rates').upsert(rows,{onConflict:'key'}).then(logErr('saveRates'));
+  // remove any rows the boss deleted (keys no longer present)
+  const keys=rows.map(x=>x.key); if(keys.length) db.from('service_rates').delete().not('key','in',`(${keys.join(',')})`).then(logErr('pruneRates'));
   db.from('app_settings').upsert({id:1,min_order:r.minOrder,first_order_discount:r.firstOrderDiscount}).then(logErr('saveSettings')); };
 
 /* =================================================================== */
@@ -457,48 +474,53 @@ function Field({ label, children, hint }) {
 const inputCls = "w-full bg-white border border-gray-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-teal/40 focus:border-teal";
 
 /* =================================================================== */
-/*  LANDING                                                            */
+/*  SIGN IN (person-first) + PORTAL PICKER                             */
 /* =================================================================== */
-function Landing({ go }) {
-  const cards = [
-    ['driver-login','truck','Driver Portal','Today’s collections & deliveries in order; take collections and confirm drop-offs.'],
-    ['store-login','hanger','Store Portal','What’s coming in and going out, sorted by what’s due first. Price extras and print the day’s list.'],
-    ['admin-login','user','Admin Portal','Overview, customers, orders, pricing, drivers, job intake and route planning.'],
-  ];
+function StaffLogin({ staff, onLogin }) {
+  const active = (staff||[]).filter(s=>s.active!==false);
+  const preferred = active.find(s=>/mark/i.test(s.name)) || active.find(s=>hasRole(s,'admin')) || active[0];
+  const [id,setId]=useState((preferred&&preferred.id)||'');
+  const [pin,setPin]=useState(''); const [err,setErr]=useState('');
+  const submit=()=>{ const s=active.find(x=>x.id===id); if(!s){setErr('Please pick your name');return;} if(pin!==s.pin){setErr('Incorrect PIN');return;} onLogin(s); };
   return (
     <div className="min-h-screen flex flex-col items-center justify-center px-4 py-10">
-      <Logo h={62} />
+      <Logo h={60} />
       <h1 className="mt-6 text-2xl font-extrabold text-ink">Operations App</h1>
-      <p className="text-slate2 mt-1 text-sm">Choose how you want to sign in</p>
-      <div className="mt-8 grid sm:grid-cols-3 gap-4 w-full max-w-3xl">
-        {cards.map(([v,ic,t,d])=>(
-          <button key={v} onClick={()=>go(v)}
-            className="group card bg-white rounded-2xl p-6 text-left hover:-translate-y-0.5 hover:ring-2 hover:ring-teal transition">
-            <div className="w-11 h-11 rounded-xl bg-teal-light text-teal-dark flex items-center justify-center"><Ic name={ic} size={22}/></div>
-            <div className="font-bold text-ink mt-3">{t}</div>
-            <div className="text-slate2 text-sm mt-1 leading-snug">{d}</div>
-          </button>))}
+      <p className="text-slate2 mt-1 text-sm">Sign in to continue</p>
+      <div className="bg-white card rounded-3xl p-8 w-full max-w-sm mt-8">
+        <Field label="Your name"><select value={id} onChange={e=>{setId(e.target.value);setErr('')}} className={inputCls+' mt-1 mb-3'}>
+          {active.map(s=><option key={s.id} value={s.id}>{s.name}</option>)}</select></Field>
+        <Field label="PIN"><input value={pin} onChange={e=>{setPin(e.target.value);setErr('')}} type="password" placeholder="••••"
+          className={inputCls+' mt-1'} onKeyDown={e=>e.key==='Enter'&&submit()} /></Field>
+        {err && <p className="text-rose-500 text-xs mt-2">{err}</p>}
+        <Btn onClick={submit} className="w-full mt-4">Sign in</Btn>
+        <div className="mt-5 pt-4 border-t border-gray-100 text-[11px] text-slate2 flex items-start gap-1.5">
+          <Ic name="info" size={13}/><span>Preview build — data saves to a live database and syncs across devices. Still using sample data, not real customers.</span>
+        </div>
       </div>
-      <p className="text-[11px] text-slate2 mt-8 inline-flex items-center gap-1.5"><Ic name="info" size={13}/>Preview build · saves to a live database and syncs across devices · still using sample data.</p>
     </div>
   );
 }
-
-/* =================================================================== */
-/*  DRIVER                                                             */
-/* =================================================================== */
-function DriverLogin({ go, onLogin }) {
-  const [driverId,setDriverId]=useState(DRIVERS[0] && DRIVERS[0].id); const [pin,setPin]=useState(''); const [err,setErr]=useState('');
-  const submit=()=>{ const d=DRIVERS.find(x=>x.id===driverId); if(!d){setErr('Please pick a driver');return;} if(pin!==d.pin){setErr('Incorrect PIN (hint: 1234)');return;} onLogin(d); };
+function PortalPicker({ user, onPick, onLogout }) {
+  const allowed = PORTALS.filter(p=>hasRole(user,p.role));
   return (
-    <LoginCard go={go} title="Driver sign in" sub="Each driver has their own login for the audit trail.">
-      <Field label="Driver"><select value={driverId} onChange={e=>setDriverId(e.target.value)} className={inputCls+' mt-1 mb-3'}>
-        {DRIVERS.map(d=><option key={d.id} value={d.id}>{d.name}</option>)}</select></Field>
-      <Field label="PIN"><input value={pin} onChange={e=>{setPin(e.target.value);setErr('')}} type="password" placeholder="1234"
-        className={inputCls+' mt-1'} onKeyDown={e=>e.key==='Enter'&&submit()} /></Field>
-      {err && <p className="text-rose-500 text-xs mt-2">{err}</p>}
-      <Btn onClick={submit} className="w-full mt-4">Log in</Btn>
-    </LoginCard>
+    <div className="min-h-screen flex flex-col items-center justify-center px-4 py-10">
+      <Logo h={54} />
+      <h1 className="mt-5 text-xl font-extrabold text-ink">Welcome, {user.name.split(' ')[0]}</h1>
+      <p className="text-slate2 mt-1 text-sm">Choose a portal</p>
+      {allowed.length===0
+        ? <p className="text-sm text-rose-600 mt-6 max-w-sm text-center">Your account has no portal access yet. Ask an admin to give you a role.</p>
+        : <div className={`mt-8 grid gap-4 w-full max-w-3xl sm:grid-cols-${Math.min(allowed.length,3)}`}>
+            {allowed.map(p=>(
+              <button key={p.key} onClick={()=>onPick(p.view)}
+                className="group card bg-white rounded-2xl p-6 text-left hover:-translate-y-0.5 hover:ring-2 hover:ring-teal transition">
+                <div className="w-11 h-11 rounded-xl bg-teal-light text-teal-dark flex items-center justify-center"><Ic name={p.icon} size={22}/></div>
+                <div className="font-bold text-ink mt-3">{p.title}</div>
+                <div className="text-slate2 text-sm mt-1 leading-snug">{p.desc}</div>
+              </button>))}
+          </div>}
+      <button onClick={onLogout} className="text-slate2 text-sm mt-8 inline-flex items-center gap-1"><Ic name="logout" size={15}/>Not you? Sign out</button>
+    </div>
   );
 }
 
@@ -542,9 +564,13 @@ function DriverApp({ driver, go, jobs, setJobs, rates, addAudit, addOrder, updat
 
   return (
     <div className="min-h-screen">
-      <TopBar left={<Logo h={26}/>} right={
-        <div className="flex items-center gap-3"><span className="text-sm text-ink font-semibold">{driver.name}</span>
-          <Btn kind="ghost" icon="logout" onClick={()=>go('landing')} className="!py-1.5 !px-3">Log out</Btn></div>} />
+      <TopBar left={
+        <div className="flex items-center gap-2">
+          {PORTALS.filter(p=>hasRole(driver,p.role)).length>1 && <button onClick={()=>go('picker')} title="Back to portals" className="w-8 h-8 rounded-lg border border-gray-200 flex items-center justify-center text-slate2 hover:bg-gray-50"><Ic name="left" size={18}/></button>}
+          <Logo h={26}/></div>} right={
+        <div className="flex items-center gap-2"><span className="text-sm text-ink font-semibold hidden sm:inline">{driver.name}</span>
+          {PORTALS.filter(p=>hasRole(driver,p.role)).length>1 && <Btn kind="ghost" icon="layers" onClick={()=>go('picker')} className="!py-1.5 !px-3">Portals</Btn>}
+          <Btn kind="ghost" icon="logout" onClick={()=>go('logout')} className="!py-1.5 !px-3">Log out</Btn></div>} />
       <div className="max-w-2xl mx-auto p-4">
         {!openJob && <>
           <div className="flex items-center justify-between mb-1">
@@ -805,13 +831,15 @@ function Timeline({ status }) {
   );
 }
 
-function OrderModal({ order, rates, onClose, onSave, addAudit, onDelete, onDispatch, jobs, drivers }) {
+function OrderModal({ order, rates, onClose, onSave, addAudit, onDelete, onDispatch, jobs, drivers, user }) {
   const c = custById(order.customerId);
+  const driverStaff = (drivers||[]).filter(d=>hasRole(d,'driver'));
+  const actor = (user&&user.name) || 'Someone';
   const assignedJob = (jobs||[]).find(j=>j.orderId===order.id);
   const assignedDriver = assignedJob && (drivers||[]).find(d=>d.id===assignedJob.driverId);
   const [pricing,setPricing]=useState(order.needsPricing);
   const [added,setAdded]=useState(order.addedItems||{});
-  const [dispDriver,setDispDriver]=useState((drivers&&drivers[0]&&drivers[0].id)||'');
+  const [dispDriver,setDispDriver]=useState((driverStaff[0]&&driverStaff[0].id)||'');
   const [dispWindow,setDispWindow]=useState('18:00–19:00 (evening)');
   const groups = useMemo(()=>{ const g={}; rates.items.forEach(r=>{(g[r.group]=g[r.group]||[]).push(r)}); return g; },[rates]);
   const calc = useMemo(()=>orderTotal(rates, order.weightCharge, added, order.firstOrder), [rates,order,added]);
@@ -819,11 +847,11 @@ function OrderModal({ order, rates, onClose, onSave, addAudit, onDelete, onDispa
   const save = () => {
     onSave(order.id, { addedItems:added, amount:calc.charged, needsPricing:false,
       status: order.status==='Needs pricing'?'In Shop':order.status });
-    addAudit(`Shop priced ${fullName(c)}: ${gbp(order.initialAmount)} → ${gbp(calc.charged)}`);
+    addAudit(`${actor} priced ${fullName(c)}: ${gbp(order.initialAmount)} → ${gbp(calc.charged)}`);
     onClose();
   };
   const advance = () => { const ns=NEXT_STATUS[order.status]; if(!ns) return;
-    onSave(order.id, { status:ns }); addAudit(`${fullName(c)}'s order marked ${ns}`); };
+    onSave(order.id, { status:ns }); addAudit(`${actor} marked ${fullName(c)}'s order ${ns}`); };
   const dispatch = () => { if(!dispDriver) return; onDispatch(order, dispDriver, dispWindow); onClose(); };
 
   return (
@@ -866,7 +894,7 @@ function OrderModal({ order, rates, onClose, onSave, addAudit, onDelete, onDispa
               <div className="text-xs font-semibold text-violet-700 mb-1.5 inline-flex items-center gap-1"><Ic name="truck" size={14}/>Send out for delivery</div>
               <div className="grid grid-cols-2 gap-2">
                 <select value={dispDriver} onChange={e=>setDispDriver(e.target.value)} className={inputCls+' !py-1.5'}>
-                  {(drivers||[]).map(d=><option key={d.id} value={d.id}>{d.name}</option>)}</select>
+                  {driverStaff.map(d=><option key={d.id} value={d.id}>{d.name}</option>)}</select>
                 <select value={dispWindow} onChange={e=>setDispWindow(e.target.value)} className={inputCls+' !py-1.5'}>
                   {TIME_WINDOWS.map(t=><option key={t}>{t}</option>)}</select>
               </div>
@@ -916,7 +944,7 @@ function OrderModal({ order, rates, onClose, onSave, addAudit, onDelete, onDispa
                 </>}
           </div>
         </div>
-        {onDelete && <div className="px-5 pb-5">
+        {onDelete && mayDelete(user) && <div className="px-5 pb-5">
           <button onClick={()=>{ if(window.confirm(`Delete this order for ${fullName(c)}? This can’t be undone.`)){ onDelete(order.id); onClose(); } }}
             className="w-full border-2 border-rose-200 bg-white text-rose-600 rounded-xl py-2 text-sm font-semibold inline-flex items-center justify-center gap-1.5 hover:bg-rose-50 transition">
             <Ic name="trash" size={15}/>Delete this order</button>
@@ -942,7 +970,7 @@ function StoreLogin({ go, onLogin }) {
     </LoginCard>
   );
 }
-function StoreApp({ go, orders, rates, updateOrder, addAudit, deleteOrder, jobs, drivers, onDispatch }) {
+function StoreApp({ go, orders, rates, updateOrder, addAudit, deleteOrder, jobs, drivers, onDispatch, user }) {
   const [scope,setScope]=useState('today');
   const [sel,setSel]=useState(null);
   const list = useMemo(()=>{
@@ -973,9 +1001,13 @@ function StoreApp({ go, orders, rates, updateOrder, addAudit, deleteOrder, jobs,
 
   return (
     <div className="min-h-screen">
-      <TopBar left={<Logo h={26}/>} right={
-        <div className="flex items-center gap-3"><span className="text-sm text-ink font-semibold hidden sm:inline">Store team</span>
-          <Btn kind="ghost" icon="logout" onClick={()=>go('landing')} className="!py-1.5 !px-3">Log out</Btn></div>} />
+      <TopBar left={
+        <div className="flex items-center gap-2">
+          {user && PORTALS.filter(p=>hasRole(user,p.role)).length>1 && <button onClick={()=>go('picker')} title="Back to portals" className="w-8 h-8 rounded-lg border border-gray-200 flex items-center justify-center text-slate2 hover:bg-gray-50"><Ic name="left" size={18}/></button>}
+          <Logo h={26}/></div>} right={
+        <div className="flex items-center gap-2"><span className="text-sm text-ink font-semibold hidden sm:inline">{user?user.name:'Store team'}</span>
+          {user && PORTALS.filter(p=>hasRole(user,p.role)).length>1 && <Btn kind="ghost" icon="layers" onClick={()=>go('picker')} className="!py-1.5 !px-3">Portals</Btn>}
+          <Btn kind="ghost" icon="logout" onClick={()=>go('logout')} className="!py-1.5 !px-3">Log out</Btn></div>} />
       <div className="max-w-5xl mx-auto p-4">
         <div className="flex items-center justify-between mb-1 flex-wrap gap-2">
           <h2 className="text-xl font-extrabold text-ink">Production list</h2>
@@ -1017,7 +1049,7 @@ function StoreApp({ go, orders, rates, updateOrder, addAudit, deleteOrder, jobs,
             })}
           </div>}
       </div>
-      {sel && <OrderModal order={orders.find(o=>o.id===sel.id)||sel} rates={rates} onClose={()=>setSel(null)} onSave={updateOrder} addAudit={addAudit} onDelete={deleteOrder} onDispatch={onDispatch} jobs={jobs} drivers={drivers}/>}
+      {sel && <OrderModal order={orders.find(o=>o.id===sel.id)||sel} rates={rates} onClose={()=>setSel(null)} onSave={updateOrder} addAudit={addAudit} onDelete={deleteOrder} onDispatch={onDispatch} jobs={jobs} drivers={drivers} user={user}/>}
     </div>
   );
 }
@@ -1037,7 +1069,7 @@ function AdminLogin({ go, onLogin }) {
     </LoginCard>
   );
 }
-function AdminApp({ go, jobs, setJobs, rates, setRates, audit, drivers, setDrivers, orders, addJob, updateOrder, addAudit, deleteJob, deleteOrder, dispatchDelivery, customers, addCustomer }) {
+function AdminApp({ go, jobs, setJobs, rates, setRates, audit, drivers, setDrivers, deleteDriver, orders, addJob, updateOrder, addAudit, deleteJob, deleteOrder, dispatchDelivery, customers, addCustomer, updateCustomer, deleteCustomer, user }) {
   const [tab,setTab]=useState('overview');
   const [intake,setIntake]=useState(false);
   const [ordersFilter,setOrdersFilter]=useState('all');
@@ -1047,24 +1079,29 @@ function AdminApp({ go, jobs, setJobs, rates, setRates, audit, drivers, setDrive
     else if (which==='pricing') { setOrdersFilter('needsPricing'); setTab('orders'); }
   };
   const tabs=[['overview','chart','Overview'],['customers','users','Customers'],['orders','layers','Orders'],
-    ['pricing','tag','Pricing'],['drivers','truck','Drivers'],['logistics','pin','Logistics']];
+    ['pricing','tag','Pricing'],['staff','user','Staff'],['logistics','pin','Logistics']];
   return (
     <div className="min-h-screen">
-      <TopBar left={<Logo h={26}/>} right={
+      <TopBar left={
         <div className="flex items-center gap-2">
+          {user && PORTALS.filter(p=>hasRole(user,p.role)).length>1 && <button onClick={()=>go('picker')} title="Back to portals" className="w-8 h-8 rounded-lg border border-gray-200 flex items-center justify-center text-slate2 hover:bg-gray-50"><Ic name="left" size={18}/></button>}
+          <Logo h={26}/></div>} right={
+        <div className="flex items-center gap-2">
+          <span className="text-sm text-ink font-semibold hidden sm:inline">{user?user.name:'Boss'}</span>
           <Btn kind="rose" icon="plus" onClick={()=>setIntake(true)} className="!py-1.5 !px-3">New job</Btn>
-          <Btn kind="ghost" icon="logout" onClick={()=>go('landing')} className="!py-1.5 !px-3">Log out</Btn></div>} />
+          {user && PORTALS.filter(p=>hasRole(user,p.role)).length>1 && <Btn kind="ghost" icon="layers" onClick={()=>go('picker')} className="!py-1.5 !px-3">Portals</Btn>}
+          <Btn kind="ghost" icon="logout" onClick={()=>go('logout')} className="!py-1.5 !px-3">Log out</Btn></div>} />
       <div className="max-w-5xl mx-auto p-4">
         <div className="flex flex-wrap gap-1 mb-4 bg-white rounded-2xl p-1 card">
           {tabs.map(([k,ic,l])=>(<button key={k} onClick={()=>{ setTab(k); if(k==='orders') setOrdersFilter('all'); }}
             className={`px-3.5 py-2 rounded-xl text-sm font-semibold whitespace-nowrap inline-flex items-center gap-1.5 ${tab===k?'bg-teal text-white':'text-slate2 hover:bg-gray-50'}`}><Ic name={ic} size={15}/>{l}</button>))}
         </div>
         {tab==='overview'  && <Overview jobs={jobs} orders={orders} audit={audit} onNew={()=>setIntake(true)} goStat={goStat}/>}
-        {tab==='customers' && <Customers customers={customers} addCustomer={addCustomer}/>}
-        {tab==='orders'    && <Orders orders={orders} rates={rates} updateOrder={updateOrder} addAudit={addAudit} filter={ordersFilter} onClearFilter={()=>setOrdersFilter('all')} deleteOrder={deleteOrder} jobs={jobs} drivers={drivers} onDispatch={dispatchDelivery}/>}
-        {tab==='pricing'   && <Pricing rates={rates} setRates={setRates}/>}
-        {tab==='drivers'   && <DriversAdmin drivers={drivers} setDrivers={setDrivers}/>}
-        {tab==='logistics' && <Logistics jobs={jobs} setJobs={setJobs} drivers={drivers} onNew={()=>setIntake(true)} deleteJob={deleteJob} customers={customers}/>}
+        {tab==='customers' && <Customers customers={customers} addCustomer={addCustomer} updateCustomer={updateCustomer} deleteCustomer={deleteCustomer} user={user}/>}
+        {tab==='orders'    && <Orders orders={orders} rates={rates} updateOrder={updateOrder} addAudit={addAudit} filter={ordersFilter} onClearFilter={()=>setOrdersFilter('all')} deleteOrder={deleteOrder} jobs={jobs} drivers={drivers} onDispatch={dispatchDelivery} user={user}/>}
+        {tab==='pricing'   && <Pricing rates={rates} setRates={setRates} canDelete={mayDelete(user)}/>}
+        {tab==='staff'     && <StaffAdmin drivers={drivers} setDrivers={setDrivers} deleteDriver={deleteDriver} user={user}/>}
+        {tab==='logistics' && <Logistics jobs={jobs} setJobs={setJobs} drivers={drivers} onNew={()=>setIntake(true)} deleteJob={deleteJob} customers={customers} user={user}/>}
       </div>
       {intake && <IntakeModal drivers={drivers} onClose={()=>setIntake(false)} onCreate={addJob} customers={customers} addCustomer={addCustomer}/>}
     </div>
@@ -1072,8 +1109,9 @@ function AdminApp({ go, jobs, setJobs, rates, setRates, audit, drivers, setDrive
 }
 
 function IntakeModal({ drivers, onClose, onCreate, customers, addCustomer }) {
+  const driverStaff = (drivers||[]).filter(d=>hasRole(d,'driver'));
   const [q,setQ]=useState(''); const [customerId,setCustomerId]=useState(null); const [addingCust,setAddingCust]=useState(false);
-  const [type,setType]=useState('collection'); const [driverId,setDriverId]=useState(drivers[0].id);
+  const [type,setType]=useState('collection'); const [driverId,setDriverId]=useState((driverStaff[0]||{}).id);
   const [returnDate,setReturnDate]=useState(addDays(TODAY,2)); const [packaging,setPackaging]=useState('Hanging');
   const [instructions,setInstructions]=useState(''); const [paid,setPaid]=useState(false); const [window_,setWindow]=useState('16:00–17:00');
   const matches = q.trim().length<1 ? [] : (customers||[]).filter(c=>(fullName(c)+' '+c.addr).toLowerCase().includes(q.toLowerCase())).slice(0,6);
@@ -1110,7 +1148,7 @@ function IntakeModal({ drivers, onClose, onCreate, customers, addCustomer }) {
           <Field label="Type"><select value={type} onChange={e=>setType(e.target.value)} className={inputCls+' mt-1'}>
             <option value="collection">Collection</option><option value="delivery">Delivery</option></select></Field>
           <Field label="Assign driver"><select value={driverId} onChange={e=>setDriverId(e.target.value)} className={inputCls+' mt-1'}>
-            {drivers.map(d=><option key={d.id} value={d.id}>{d.name}</option>)}</select></Field>
+            {driverStaff.map(d=><option key={d.id} value={d.id}>{d.name}</option>)}</select></Field>
           {type==='collection' && <Field label="Return by"><input type="date" value={returnDate} onChange={e=>setReturnDate(e.target.value)} className={inputCls+' mt-1'}/></Field>}
           <Field label="Time window"><select value={window_} onChange={e=>setWindow(e.target.value)} className={inputCls+' mt-1'}>
             {TIME_WINDOWS.map(t=><option key={t}>{t}</option>)}</select></Field>
@@ -1171,13 +1209,15 @@ function TableWrap({ head, children }) {
       {head.map(h=><th key={h} className="px-4 py-2.5 font-semibold whitespace-nowrap">{h}</th>)}</tr></thead><tbody>{children}</tbody></table></div>;
 }
 const TITLES = ['Mr','Mrs','Ms','Miss','Dr','Mx'];
-function AddCustomerModal({ onClose, onCreate, initialName }) {
-  const parts = (initialName||'').trim().split(/\s+/).filter(Boolean);
-  const [title,setTitle]=useState('Mr');
-  const [first,setFirst]=useState(parts[0]||'');
-  const [last,setLast]=useState(parts.slice(1).join(' ')||'');
-  const [line1,setLine1]=useState(''); const [town,setTown]=useState(''); const [pc,setPc]=useState('');
-  const [mob,setMob]=useState(''); const [email,setEmail]=useState('');
+function AddCustomerModal({ onClose, onCreate, onUpdate, onDelete, customer, initialName, user }) {
+  const editing = !!customer;
+  const parsed = editing ? splitAddr(customer.addr||'') : {line1:'',town:'',pc:''};
+  const nParts = (initialName||'').trim().split(/\s+/).filter(Boolean);
+  const [title,setTitle]=useState(editing?(customer.title||'Mr'):'Mr');
+  const [first,setFirst]=useState(editing?customer.first:(nParts[0]||''));
+  const [last,setLast]=useState(editing?customer.last:(nParts.slice(1).join(' ')||''));
+  const [line1,setLine1]=useState(parsed.line1); const [town,setTown]=useState(parsed.town); const [pc,setPc]=useState(parsed.pc);
+  const [mob,setMob]=useState(editing?(customer.mob||''):''); const [email,setEmail]=useState(editing?(customer.email||''):'');
   const [pcStatus,setPcStatus]=useState(null); const [pcInfo,setPcInfo]=useState(null); // {lat,lng,postcode}
 
   // live-validate the postcode against the UK postcode database (postcodes.io)
@@ -1196,14 +1236,17 @@ function AddCustomerModal({ onClose, onCreate, initialName }) {
   const canSave = first.trim() && last.trim() && line1.trim() && pcStatus==='ok' && pcInfo;
   const save=()=>{ if(!canSave) return;
     const addr=[line1.trim(), town.trim(), pcInfo.postcode].filter(Boolean).join(', ');
-    const c = onCreate({ title, first:first.trim(), last:last.trim(), addr, mob:mob.trim(), email:email.trim(), lat:pcInfo.lat, lng:pcInfo.lng });
-    onClose(c); };
+    const data={ title, first:first.trim(), last:last.trim(), addr, mob:mob.trim(), email:email.trim(), lat:pcInfo.lat, lng:pcInfo.lng };
+    if(editing){ onUpdate({ ...customer, ...data }); onClose(); }
+    else { const c = onCreate(data); onClose(c); } };
+  const canDelete = editing && onDelete;
+  const remove=()=>{ if(!canDelete) return; if(window.confirm(`Delete ${first} ${last}? This can't be undone.`)){ onDelete(customer.id); onClose(); } };
 
   return (
     <div className="fixed inset-0 bg-black/40 flex items-center justify-center p-4 z-[55]" onClick={()=>onClose()}>
       <div className="bg-white rounded-2xl p-6 w-full max-w-md max-h-[92vh] overflow-y-auto" onClick={e=>e.stopPropagation()}>
         <div className="flex items-center justify-between mb-4">
-          <h3 className="text-lg font-bold text-ink">New customer</h3>
+          <h3 className="text-lg font-bold text-ink">{editing?'Edit customer':'New customer'}</h3>
           <button onClick={()=>onClose()} className="text-slate2 hover:text-ink"><Ic name="close" size={20}/></button>
         </div>
         <div className="grid grid-cols-3 gap-3">
@@ -1227,34 +1270,40 @@ function AddCustomerModal({ onClose, onCreate, initialName }) {
           <Field label="Email"><input value={email} onChange={e=>setEmail(e.target.value)} type="email" className={inputCls+' mt-1'}/></Field>
         </div>
         <p className="text-[11px] text-slate2 mt-2">A valid UK postcode is required — it's checked against the postcode database and places the customer exactly on the map.</p>
-        <div className="flex gap-2 mt-4">
+        <div className="flex gap-2 mt-4 items-center">
+          {canDelete && <Btn kind="ghost" icon="trash" onClick={remove} className="!text-rose-600 !border-rose-200 hover:!bg-rose-50">Delete</Btn>}
           <Btn kind="ghost" onClick={()=>onClose()} className="flex-1">Cancel</Btn>
-          <Btn kind="primary" icon="plus" onClick={save} className="flex-1" {...(!canSave?{disabled:true}:{})}>Add customer</Btn>
+          <Btn kind="primary" icon={editing?'check':'plus'} onClick={save} className="flex-1" {...(!canSave?{disabled:true}:{})}>{editing?'Save changes':'Add customer'}</Btn>
         </div>
       </div>
     </div>
   );
 }
-function Customers({ customers, addCustomer }) {
+function Customers({ customers, addCustomer, updateCustomer, deleteCustomer, user }) {
   const [adding,setAdding]=useState(false);
+  const [editing,setEditing]=useState(null);
   return (<div>
     <div className="flex justify-between items-center mb-3"><h3 className="font-bold text-ink">Customers <span className="text-slate2 font-normal">· {customers.length}</span></h3>
       <Btn kind="subtle" icon="plus" onClick={()=>setAdding(true)}>Add customer</Btn></div>
     <div className="space-y-2">
       {customers.map(c=>(
-        <div key={c.id} className="bg-white card rounded-2xl p-3.5">
-          <div className="font-semibold text-ink">{fullName(c)}</div>
-          <div className="text-sm text-slate2 mt-0.5 flex items-start gap-1.5"><Ic name="pin" size={14} className="mt-0.5 shrink-0"/>{c.addr}</div>
-          <div className="flex flex-wrap gap-x-4 gap-y-1 mt-1.5 text-sm text-slate2">
-            {c.mob && <a href={`tel:${c.mob.replace(/\s/g,'')}`} className="inline-flex items-center gap-1.5 text-teal-dark font-medium"><Ic name="phone" size={14}/>{c.mob}</a>}
-            {c.email && <span className="inline-flex items-center gap-1.5 truncate"><Ic name="mail" size={14} className="shrink-0"/>{c.email}</span>}
+        <div key={c.id} className="bg-white card rounded-2xl p-3.5 flex items-start justify-between gap-3">
+          <div className="min-w-0">
+            <div className="font-semibold text-ink">{fullName(c)}</div>
+            <div className="text-sm text-slate2 mt-0.5 flex items-start gap-1.5"><Ic name="pin" size={14} className="mt-0.5 shrink-0"/>{c.addr}</div>
+            <div className="flex flex-wrap gap-x-4 gap-y-1 mt-1.5 text-sm text-slate2">
+              {c.mob && <a href={`tel:${c.mob.replace(/\s/g,'')}`} className="inline-flex items-center gap-1.5 text-teal-dark font-medium"><Ic name="phone" size={14}/>{c.mob}</a>}
+              {c.email && <span className="inline-flex items-center gap-1.5 truncate"><Ic name="mail" size={14} className="shrink-0"/>{c.email}</span>}
+            </div>
           </div>
+          <button onClick={()=>setEditing(c)} title="Edit customer" className="shrink-0 w-8 h-8 rounded-lg border border-gray-200 flex items-center justify-center text-slate2 hover:bg-gray-50"><Ic name="edit" size={15}/></button>
         </div>))}
     </div>
-    {adding && <AddCustomerModal onClose={()=>setAdding(false)} onCreate={addCustomer}/>}
+    {adding && <AddCustomerModal onClose={()=>setAdding(false)} onCreate={addCustomer} user={user}/>}
+    {editing && <AddCustomerModal customer={editing} onClose={()=>setEditing(null)} onUpdate={updateCustomer} onDelete={mayDelete(user)?deleteCustomer:null} user={user}/>}
   </div>);
 }
-function Orders({ orders, rates, updateOrder, addAudit, filter, onClearFilter, deleteOrder, jobs, drivers, onDispatch }) {
+function Orders({ orders, rates, updateOrder, addAudit, filter, onClearFilter, deleteOrder, jobs, drivers, onDispatch, user }) {
   const [sel,setSel]=useState(null);
   const base = filter==='needsPricing' ? orders.filter(o=>o.needsPricing) : orders;
   const sorted=[...base].sort((a,b)=>a.dueDate.localeCompare(b.dueDate));
@@ -1283,22 +1332,40 @@ function Orders({ orders, rates, updateOrder, addAudit, filter, onClearFilter, d
         </button>);})}
     </div>
     <p className="text-xs text-slate2 mt-2">Tap an order to view details or amend the price. “prov.” = provisional, extras still to be added at the shop.</p>
-    {sel && <OrderModal order={orders.find(o=>o.id===sel.id)||sel} rates={rates} onClose={()=>setSel(null)} onSave={updateOrder} addAudit={addAudit} onDelete={deleteOrder} onDispatch={onDispatch} jobs={jobs} drivers={drivers}/>}
+    {sel && <OrderModal order={orders.find(o=>o.id===sel.id)||sel} rates={rates} onClose={()=>setSel(null)} onSave={updateOrder} addAudit={addAudit} onDelete={deleteOrder} onDispatch={onDispatch} jobs={jobs} drivers={drivers} user={user}/>}
   </div>);
 }
-function Pricing({ rates, setRates }) {
+const slugKey=(s)=>(s||'').toLowerCase().replace(/[^a-z0-9]+/g,'_').replace(/^_+|_+$/g,'').slice(0,32)||'svc';
+function Pricing({ rates, setRates, canDelete }) {
+  const [addW,setAddW]=useState(false); const [wLabel,setWLabel]=useState(''); const [wPrice,setWPrice]=useState('');
+  const [addI,setAddI]=useState(false); const [iLabel,setILabel]=useState(''); const [iPrice,setIPrice]=useState(''); const [iGroup,setIGroup]=useState('');
   const setW=(k,v)=>setRates({...rates,weight:rates.weight.map(r=>r.key===k?{...r,price:parseFloat(v)||0}:r)});
   const setI=(k,v)=>setRates({...rates,items:rates.items.map(r=>r.key===k?{...r,price:parseFloat(v)||0}:r)});
+  const uniqKey=(base)=>{ const used=new Set([...rates.weight,...rates.items].map(r=>r.key)); let k=base,n=2; while(used.has(k)){k=base+'_'+n;n++;} return k; };
+  const groups=[...new Set(rates.items.map(r=>r.group).filter(Boolean))];
+  const saveW=()=>{ if(!wLabel.trim())return; const r={key:uniqKey(slugKey(wLabel)),label:wLabel.trim(),unit:'kg',price:parseFloat(wPrice)||0};
+    setRates({...rates,weight:[...rates.weight,r]}); setWLabel(''); setWPrice(''); setAddW(false); };
+  const saveIt=()=>{ if(!iLabel.trim())return; const r={key:uniqKey(slugKey(iLabel)),label:iLabel.trim(),price:parseFloat(iPrice)||0,group:(iGroup.trim()||'Other')};
+    setRates({...rates,items:[...rates.items,r]}); setILabel(''); setIPrice(''); setIGroup(''); setAddI(false); };
+  const delW=(k)=>{ if(window.confirm('Remove this service?')) setRates({...rates,weight:rates.weight.filter(r=>r.key!==k)}); };
+  const delI=(k)=>{ if(window.confirm('Remove this item?')) setRates({...rates,items:rates.items.filter(r=>r.key!==k)}); };
   return (<div>
     <h3 className="font-bold text-ink mb-1">Pricing</h3>
-    <p className="text-xs text-slate2 mb-3">Edit rates — the driver's calculator and the shop's amend-price tool update instantly.</p>
+    <p className="text-xs text-slate2 mb-3">Edit rates, and add or remove services &amp; items — the driver's calculator and the shop's amend-price tool update instantly.</p>
     <div className="grid md:grid-cols-2 gap-4">
       <div className="bg-white card rounded-2xl p-4">
         <h4 className="font-bold text-ink text-sm mb-2">Weight-based (per kg)</h4>
-        {rates.weight.map(r=>(<div key={r.key} className="flex items-center justify-between py-1">
+        {rates.weight.map(r=>(<div key={r.key} className="flex items-center justify-between py-1 group">
           <span className="text-sm text-ink">{r.label}</span>
           <div className="flex items-center gap-1"><span className="text-slate2 text-sm">£</span>
-            <input type="number" step="0.5" value={r.price} onChange={e=>setW(r.key,e.target.value)} className={inputCls+' !w-20 text-right !py-1'}/></div></div>))}
+            <input type="number" step="0.5" value={r.price} onChange={e=>setW(r.key,e.target.value)} className={inputCls+' !w-20 text-right !py-1'}/>
+            {canDelete && <button onClick={()=>delW(r.key)} title="Remove service" className="text-gray-300 hover:text-rose-500 ml-1"><Ic name="trash" size={15}/></button>}</div></div>))}
+        {addW ? (<div className="mt-2 p-2 rounded-xl bg-gray-50 flex flex-wrap items-end gap-2">
+          <div className="flex-1 min-w-[8rem]"><Field label="Service name"><input value={wLabel} onChange={e=>setWLabel(e.target.value)} placeholder="e.g. Wash & fold" className={inputCls+' mt-1 !py-1'}/></Field></div>
+          <Field label="£/kg"><input type="number" step="0.5" value={wPrice} onChange={e=>setWPrice(e.target.value)} className={inputCls+' mt-1 !w-20 text-right !py-1'}/></Field>
+          <Btn kind="primary" icon="check" onClick={saveW} className="!py-1.5">Add</Btn>
+          <Btn kind="ghost" onClick={()=>setAddW(false)} className="!py-1.5">Cancel</Btn>
+        </div>) : (<button onClick={()=>setAddW(true)} className="text-teal-dark text-xs font-semibold mt-2 inline-flex items-center gap-1"><Ic name="plus" size={13}/>Add a service</button>)}
         <div className="mt-3 pt-3 border-t border-gray-100 text-sm flex justify-between"><span className="text-slate2">Minimum order</span><span className="font-semibold text-ink">{gbp(rates.minOrder)}</span></div>
         <div className="text-sm flex justify-between"><span className="text-slate2">First-order discount</span><span className="font-semibold text-ink">{Math.round(rates.firstOrderDiscount*100)}%</span></div>
       </div>
@@ -1308,23 +1375,98 @@ function Pricing({ rates, setRates }) {
           {rates.items.map(r=>(<div key={r.key} className="flex items-center justify-between py-1">
             <span className="text-sm text-ink">{r.label}</span>
             <div className="flex items-center gap-1"><span className="text-slate2 text-sm">£</span>
-              <input type="number" step="0.5" value={r.price} onChange={e=>setI(r.key,e.target.value)} className={inputCls+' !w-20 text-right !py-1'}/></div></div>))}
+              <input type="number" step="0.5" value={r.price} onChange={e=>setI(r.key,e.target.value)} className={inputCls+' !w-20 text-right !py-1'}/>
+              {canDelete && <button onClick={()=>delI(r.key)} title="Remove item" className="text-gray-300 hover:text-rose-500 ml-1"><Ic name="trash" size={15}/></button>}</div></div>))}
         </div>
+        {addI ? (<div className="mt-2 p-2 rounded-xl bg-gray-50 space-y-2">
+          <Field label="Item name"><input value={iLabel} onChange={e=>setILabel(e.target.value)} placeholder="e.g. Dry clean — tie" className={inputCls+' mt-1 !py-1'}/></Field>
+          <div className="flex items-end gap-2">
+            <div className="flex-1"><Field label="Group"><input value={iGroup} onChange={e=>setIGroup(e.target.value)} list="rate-groups" placeholder="e.g. Dry Cleaning" className={inputCls+' mt-1 !py-1'}/>
+              <datalist id="rate-groups">{groups.map(g=><option key={g} value={g}/>)}</datalist></Field></div>
+            <Field label="£"><input type="number" step="0.5" value={iPrice} onChange={e=>setIPrice(e.target.value)} className={inputCls+' mt-1 !w-20 text-right !py-1'}/></Field>
+          </div>
+          <div className="flex gap-2"><Btn kind="primary" icon="check" onClick={saveIt} className="!py-1.5">Add item</Btn><Btn kind="ghost" onClick={()=>setAddI(false)} className="!py-1.5">Cancel</Btn></div>
+        </div>) : (<button onClick={()=>setAddI(true)} className="text-teal-dark text-xs font-semibold mt-2 inline-flex items-center gap-1"><Ic name="plus" size={13}/>Add an item</button>)}
       </div>
     </div></div>);
 }
-function DriversAdmin({ drivers, setDrivers }) {
-  const [name,setName]=useState('');
-  const add=()=>{ if(!name.trim())return; setDrivers([...drivers,{id:uuid(),name:name.trim(),pin:'1234'}]); setName(''); };
-  return (<div><h3 className="font-bold text-ink mb-3">Drivers</h3>
-    <div className="bg-white card rounded-2xl p-4 mb-3 flex gap-2 items-end">
-      <div className="flex-1"><Field label="Enrol new driver"><input value={name} onChange={e=>setName(e.target.value)} placeholder="Full name" className={inputCls+' mt-1'} onKeyDown={e=>e.key==='Enter'&&add()}/></Field></div>
-      <Btn icon="plus" onClick={add}>Add driver</Btn></div>
-    <TableWrap head={['Driver','Login PIN','Status']}>
-      {drivers.map(d=>(<tr key={d.id} className="border-t border-gray-50 hover:bg-gray-50">
-        <td className="px-4 py-2.5 font-medium text-ink">{d.name}</td><td className="px-4 py-2.5 text-slate2">{d.pin}</td>
-        <td className="px-4 py-2.5"><Badge tone="green">Active</Badge></td></tr>))}
-    </TableWrap></div>);
+const ROLE_OPTS = [['driver','Driver'],['store','Store'],['admin','Admin']];
+const rolePill = (on,label,onClick,small)=>(
+  <button onClick={onClick} className={`${small?'px-2.5 py-1 text-[11px]':'px-3 py-1.5 text-xs'} rounded-full font-semibold border ${on?'bg-teal text-white border-teal':'bg-white text-slate2 border-gray-200'}`}>{label}</button>);
+function StaffModal({ staff, onClose, onSave, onDelete }) {
+  const [name,setName]=useState(staff.name||''); const [pin,setPin]=useState(staff.pin||'1234');
+  const [roles,setRoles]=useState(staff.roles&&staff.roles.length?staff.roles:['driver']);
+  const [canDel,setCanDel]=useState(!!staff.canDelete);
+  const toggle=(r)=>setRoles(rs=>rs.includes(r)?rs.filter(x=>x!==r):[...rs,r]);
+  const canSave=name.trim()&&pin.trim()&&roles.length;
+  const save=()=>{ if(!canSave)return; onSave({...staff,name:name.trim(),pin:pin.trim(),roles,canDelete:canDel}); onClose(); };
+  const remove=()=>{ if(window.confirm(`Delete ${staff.name}? They will no longer be able to sign in.`)){ onDelete(staff.id); onClose(); } };
+  return (
+    <div className="fixed inset-0 bg-black/40 flex items-center justify-center p-4 z-[55]" onClick={onClose}>
+      <div className="bg-white rounded-2xl p-6 w-full max-w-md max-h-[92vh] overflow-y-auto" onClick={e=>e.stopPropagation()}>
+        <div className="flex items-center justify-between mb-4">
+          <h3 className="text-lg font-bold text-ink">Edit staff member</h3>
+          <button onClick={onClose} className="text-slate2 hover:text-ink"><Ic name="close" size={20}/></button>
+        </div>
+        <div className="grid sm:grid-cols-2 gap-3">
+          <Field label="Full name"><input value={name} onChange={e=>setName(e.target.value)} className={inputCls+' mt-1'}/></Field>
+          <Field label="Login PIN"><input value={pin} onChange={e=>setPin(e.target.value)} className={inputCls+' mt-1'}/></Field>
+        </div>
+        <div className="mt-3"><div className="text-xs font-semibold text-slate2 mb-1">Portals they can use</div>
+          <div className="flex flex-wrap gap-2">{ROLE_OPTS.map(([r,l])=>rolePill(roles.includes(r),l,()=>toggle(r)))}</div></div>
+        <label className="flex items-center gap-2 mt-3 text-sm text-ink"><input type="checkbox" checked={canDel} onChange={e=>setCanDel(e.target.checked)} className="accent-teal"/> Can delete orders &amp; jobs</label>
+        <div className="flex gap-2 mt-4 items-center">
+          {onDelete && <Btn kind="ghost" icon="trash" onClick={remove} className="!text-rose-600 !border-rose-200 hover:!bg-rose-50">Delete</Btn>}
+          <Btn kind="ghost" onClick={onClose} className="flex-1">Cancel</Btn>
+          <Btn kind="primary" icon="check" onClick={save} className="flex-1" {...(!canSave?{disabled:true}:{})}>Save changes</Btn>
+        </div>
+      </div>
+    </div>);
+}
+function StaffAdmin({ drivers, setDrivers, deleteDriver, user }) {
+  const [name,setName]=useState(''); const [pin,setPin]=useState('1234');
+  const [roles,setRoles]=useState(['driver']); const [canDel,setCanDel]=useState(false);
+  const [editing,setEditing]=useState(null);
+  const toggleNewRole=(r)=>setRoles(rs=>rs.includes(r)?rs.filter(x=>x!==r):[...rs,r]);
+  const add=()=>{ if(!name.trim()||!roles.length)return;
+    setDrivers([...drivers,{id:uuid(),name:name.trim(),pin:pin.trim()||'1234',roles,canDelete:canDel,active:true}]);
+    setName(''); setPin('1234'); setRoles(['driver']); setCanDel(false); };
+  const update=(id,patch)=>setDrivers(drivers.map(d=>d.id===id?{...d,...patch}:d));
+  const toggleRole=(d,r)=>update(d.id,{roles: d.roles.includes(r)?d.roles.filter(x=>x!==r):[...d.roles,r]});
+  return (<div>
+    <h3 className="font-bold text-ink mb-1">Staff</h3>
+    <p className="text-xs text-slate2 mb-3">Add team members and choose which portals each can use. Someone can be both a driver and store team. Everyone signs in with their own PIN.</p>
+    <div className="bg-white card rounded-2xl p-4 mb-3">
+      <div className="grid sm:grid-cols-2 gap-3">
+        <Field label="Full name"><input value={name} onChange={e=>setName(e.target.value)} placeholder="e.g. Jamie Lee" className={inputCls+' mt-1'} onKeyDown={e=>e.key==='Enter'&&add()}/></Field>
+        <Field label="Login PIN"><input value={pin} onChange={e=>setPin(e.target.value)} className={inputCls+' mt-1'}/></Field>
+      </div>
+      <div className="mt-3"><div className="text-xs font-semibold text-slate2 mb-1">Portals they can use</div>
+        <div className="flex flex-wrap gap-2">{ROLE_OPTS.map(([r,l])=>rolePill(roles.includes(r),l,()=>toggleNewRole(r)))}</div></div>
+      <label className="flex items-center gap-2 mt-3 text-sm text-ink"><input type="checkbox" checked={canDel} onChange={e=>setCanDel(e.target.checked)} className="accent-teal"/> Can delete orders &amp; jobs</label>
+      <Btn icon="plus" onClick={add} className="mt-3" {...(!name.trim()||!roles.length?{disabled:true}:{})}>Add staff member</Btn>
+    </div>
+    <div className="space-y-2">
+      {drivers.map(d=>(
+        <div key={d.id} className={`bg-white card rounded-2xl p-3.5 ${d.active===false?'opacity-60':''}`}>
+          <div className="flex items-center justify-between gap-2">
+            <div className="font-semibold text-ink">{d.name} <span className="text-slate2 font-normal text-sm">· PIN {d.pin}</span></div>
+            <div className="flex items-center gap-2">
+              <Badge tone={d.active!==false?'green':'grey'}>{d.active!==false?'Active':'Inactive'}</Badge>
+              <button onClick={()=>setEditing(d)} title="Edit staff member" className="w-8 h-8 rounded-lg border border-gray-200 flex items-center justify-center text-slate2 hover:bg-gray-50"><Ic name="edit" size={15}/></button>
+            </div>
+          </div>
+          <div className="flex items-center gap-2 mt-2 flex-wrap">
+            <span className="text-[11px] text-slate2">Portals:</span>
+            {ROLE_OPTS.map(([r,l])=>rolePill((d.roles||[]).includes(r),l,()=>toggleRole(d,r),true))}
+            <label className="flex items-center gap-1.5 text-[11px] text-ink ml-1"><input type="checkbox" checked={!!d.canDelete} onChange={e=>update(d.id,{canDelete:e.target.checked})} className="accent-teal"/> can delete</label>
+            <button onClick={()=>update(d.id,{active:d.active===false})} className="text-[11px] text-slate2 ml-auto hover:text-ink">{d.active!==false?'Deactivate':'Reactivate'}</button>
+          </div>
+        </div>))}
+    </div>
+    {editing && <StaffModal staff={editing} onClose={()=>setEditing(null)} onSave={s=>update(s.id,s)}
+      onDelete={(mayDelete(user)&&editing.id!==(user&&user.id))?deleteDriver:null}/>}
+  </div>);
 }
 /* Free map — Leaflet + OpenStreetMap tiles. No API key, no billing account. */
 function RouteMap({ jobs, drivers, filterDriver, customers }) {
@@ -1384,11 +1526,12 @@ function RouteMap({ jobs, drivers, filterDriver, customers }) {
   return <div ref={elRef} style={{height:'340px'}} className="w-full rounded-2xl overflow-hidden border border-gray-100 z-0"/>;
 }
 
-function Logistics({ jobs, setJobs, drivers, onNew, deleteJob, customers }) {
+function Logistics({ jobs, setJobs, drivers, onNew, deleteJob, customers, user }) {
+  const driverStaff = drivers.filter(d=>hasRole(d,'driver'));
   const [mapDriver,setMapDriver]=useState('all');
   const [saving,setSaving]=useState(null);
   const [drag,setDrag]=useState(null);
-  const targets = mapDriver==='all' ? drivers.map(d=>d.id) : [mapDriver];
+  const targets = mapDriver==='all' ? driverStaff.map(d=>d.id) : [mapDriver];
   const roundMiles = useMemo(()=>totalMiles(jobs,targets), [jobs,mapDriver,drivers]);
   const noLoc = jobs.filter(j=>targets.includes(j.driverId) && j.status==='pending').filter(j=>{const c=custById(j.customerId); return !c||c.lat==null;}).length;
   const optimise = () => {
@@ -1414,14 +1557,14 @@ function Logistics({ jobs, setJobs, drivers, onNew, deleteJob, customers }) {
           <h4 className="font-bold text-ink text-sm">Today’s stops on the map</h4>
           <div className="flex items-center gap-2 flex-wrap">
             <div className="flex items-center gap-1 bg-gray-50 rounded-xl p-1">
-              {[['all','All drivers'],...drivers.map(d=>[d.id,d.name.split(' ')[0]])].map(([k,l])=>(
+              {[['all','All drivers'],...driverStaff.map(d=>[d.id,d.name.split(' ')[0]])].map(([k,l])=>(
                 <button key={k} onClick={()=>{setMapDriver(k);setSaving(null);}}
                   className={`px-2.5 py-1 rounded-lg text-xs font-semibold ${mapDriver===k?'bg-teal text-white':'text-slate2'}`}>{l}</button>))}
             </div>
             <Btn kind="primary" icon="pin" onClick={optimise} className="!py-1.5 !px-3 text-xs">Suggest best order</Btn>
           </div>
         </div>
-        <RouteMap jobs={jobs} drivers={drivers} filterDriver={mapDriver} customers={customers}/>
+        <RouteMap jobs={jobs} drivers={driverStaff} filterDriver={mapDriver} customers={customers}/>
         <div className="flex items-center justify-between gap-3 flex-wrap mt-2">
           <p className="text-[11px] text-slate2 flex-1 min-w-[220px]">
             <span className="text-rose-500 font-semibold">Pink = collection</span>, <span className="text-teal-dark font-semibold">blue = delivery</span>,
@@ -1435,7 +1578,7 @@ function Logistics({ jobs, setJobs, drivers, onNew, deleteJob, customers }) {
             : `Already in a good order — no shorter route found (${saving.before.toFixed(1)} miles).`}</div>}
       </div>
       <div className="grid md:grid-cols-2 gap-4">
-        {drivers.map(d=>{
+        {driverStaff.map(d=>{
           const list=jobs.filter(j=>j.driverId===d.id).sort((a,b)=>a.seq-b.seq);
           const isDropTarget = drag && drag.fromDriverId!==d.id;
           return (
@@ -1467,14 +1610,14 @@ function Logistics({ jobs, setJobs, drivers, onNew, deleteJob, customers }) {
                             <button onClick={()=>move(d.id,j.id,'up')} disabled={idx===0} className={idx===0?'text-gray-200':'hover:text-teal'}><Ic name="up" size={16}/></button>
                             <button onClick={()=>move(d.id,j.id,'down')} disabled={idx===list.length-1} className={idx===list.length-1?'text-gray-200':'hover:text-teal'}><Ic name="down" size={16}/></button>
                           </div>
-                          <button onClick={()=>{ if(window.confirm(`Cancel this ${j.type} for ${fullName(c)}?`)) deleteJob(j); }}
-                            className="text-gray-300 hover:text-rose-500 self-center" title="Cancel / delete this job"><Ic name="trash" size={16}/></button>
+                          {mayDelete(user) && <button onClick={()=>{ if(window.confirm(`Cancel this ${j.type} for ${fullName(c)}?`)) deleteJob(j); }}
+                            className="text-gray-300 hover:text-rose-500 self-center" title="Cancel / delete this job"><Ic name="trash" size={16}/></button>}
                         </div>
-                        {drivers.length>1 &&
+                        {driverStaff.length>1 &&
                           <div className="flex items-center gap-1 mt-1.5 pl-8">
                             <span className="text-[11px] text-slate2">Move to:</span>
                             <select value={d.id} onChange={e=>reassign(j.id,e.target.value)} className="text-[11px] border border-gray-200 rounded-lg px-1 py-0.5 bg-white text-ink">
-                              {drivers.map(dr=><option key={dr.id} value={dr.id}>{dr.name}</option>)}</select>
+                              {driverStaff.map(dr=><option key={dr.id} value={dr.id}>{dr.name}</option>)}</select>
                           </div>}
                       </div>);
                   })}
@@ -1507,8 +1650,10 @@ function ErrorScreen({ msg }) {
 function App() {
   const [phase,setPhase]=useState(db ? 'loading' : 'ready'); // no db -> offline demo fallback
   const [err,setErr]=useState('');
-  const [view,setView]=useState('landing');
-  const [driver,setDriver]=useState(null);
+  const [view,setView]=useState('picker');
+  const [user,setUser]=useState(null);
+  const userRef = useRef(null); userRef.current = user;
+  const actor = () => (userRef.current && userRef.current.name) || 'Someone';
   const [jobs,setJobsState]=useState(INITIAL_JOBS);
   const [orders,setOrdersState]=useState(INITIAL_ORDERS);
   const [rates,setRatesState]=useState(INITIAL_RATES);
@@ -1530,6 +1675,9 @@ function App() {
   const setJobs=useCallback(u=>setJobsState(prev=>{ const next=typeof u==='function'?u(prev):u; saveJobs(next); return next; }),[]);
   const setRates=useCallback(u=>setRatesState(prev=>{ const next=typeof u==='function'?u(prev):u; saveRates(next); return next; }),[]);
   const setDrivers=useCallback(u=>setDriversState(prev=>{ const next=typeof u==='function'?u(prev):u; DRIVERS=next; saveDrivers(next); return next; }),[]);
+  const deleteDriver=useCallback((id)=>{ setDriversState(prev=>{ const d=prev.find(x=>x.id===id); const next=prev.filter(x=>x.id!==id); DRIVERS=next;
+    if(db) db.from('drivers').delete().eq('id',id).then(r=>{ if(r&&r.error) reportErr('delete staff', r.error); });
+    if(d) addAudit(`${actor()} removed staff member ${d.name}`); return next; }); },[]);
   const addAudit=useCallback(text=>{ const e={time:now(),text}; setAudit(prev=>[e,...prev]); insertAudit(e); },[]);
   const addOrder=useCallback(o=>{ setOrdersState(prev=>[o,...prev]); saveOrder(o); },[]);
   const updateOrder=useCallback((id,patch)=>setOrdersState(prev=>{ const next=prev.map(o=>o.id===id?{...o,...patch}:o);
@@ -1544,6 +1692,7 @@ function App() {
     if(job.orderId) setOrdersState(prev=>{ const o=prev.find(x=>x.id===job.orderId);
       if(o && o.status==='Pending Collection'){ if(db) db.from('orders').delete().eq('id',job.orderId).then(logErr('cancelOrder')); return prev.filter(x=>x.id!==job.orderId); }
       return prev; });
+    addAudit(`${actor()} cancelled a ${job.type} for ${fullName(custById(job.customerId))}`);
   },[]);
   const addCustomer=useCallback((cust)=>{
     const c = { id:uuid(), lat:null, lng:null, ...cust };  // cust already carries lat/lng from the validated postcode
@@ -1556,6 +1705,19 @@ function App() {
     }});
     return c;
   },[]);
+  const updateCustomer=useCallback((cust)=>{
+    CUSTOMERS = CUSTOMERS.map(x=>x.id===cust.id?{...x,...cust}:x);
+    setCustomersState(CUSTOMERS);
+    if(db) db.from('customers').update(toCustomerRow(cust)).eq('id',cust.id).then(r=>{ if(r&&r.error) reportErr('update customer', r.error); });
+    addAudit(`${actor()} updated ${fullName(cust)}'s details`);
+  },[]);
+  const deleteCustomer=useCallback((id)=>{
+    const c = CUSTOMERS.find(x=>x.id===id);
+    CUSTOMERS = CUSTOMERS.filter(x=>x.id!==id);
+    setCustomersState(CUSTOMERS);
+    if(db) db.from('customers').delete().eq('id',id).then(r=>{ if(r&&r.error) reportErr('delete customer', r.error); });
+    if(c) addAudit(`${actor()} deleted customer ${fullName(c)}`);
+  },[]);
   const dispatchDelivery=useCallback((order, driverId, window)=>{
     const nj={ id:uuid(), driverId, type:'delivery', customerId:order.customerId, orderId:order.id, window, status:'pending',
       packaging:order.packaging, bags:order.bagsCount, weight:order.weight, amount:order.amount,
@@ -1564,10 +1726,10 @@ function App() {
       if(db) db.from('jobs').insert(toJobRow(job)).then(r=>{ if(r&&r.error) reportErr('dispatch job', r.error); });
       return [...prev, job]; });
     updateOrder(order.id, { status:'Out for delivery' });
-    addAudit(`${fullName(custById(order.customerId))}'s order sent out for delivery`);
+    addAudit(`${actor()} sent ${fullName(custById(order.customerId))}'s order out for delivery`);
   },[updateOrder,addAudit]);
   const deleteOrder=useCallback(orderId=>{
-    setOrdersState(prev=>prev.filter(o=>o.id!==orderId));
+    setOrdersState(prev=>{ const o=prev.find(x=>x.id===orderId); if(o) addAudit(`${actor()} deleted ${fullName(custById(o.customerId))}'s order`); return prev.filter(x=>x.id!==orderId); });
     if(db) db.from('orders').delete().eq('id',orderId).then(logErr('deleteOrder'));
     // also remove any still-pending collection job linked to this order
     setJobsState(prev=>{ const linked=prev.filter(j=>j.orderId===orderId && j.status==='pending');
@@ -1599,18 +1761,17 @@ function App() {
       return [...prev, nj];
     });
   },[]);
-  const go=useCallback(v=>setView(v),[]);
+  const go=useCallback(v=>{ if(v==='logout'){ setUser(null); setView('picker'); return; } setView(v); },[]);
+  const onLogin=(s)=>{ setUser(s); const allowed=PORTALS.filter(p=>hasRole(s,p.role)); setView(allowed.length===1?allowed[0].view:'picker'); };
 
   let screen=null;
   if (phase==='loading') screen=<LoadingScreen/>;
   else if (phase==='error') screen=<ErrorScreen msg={err}/>;
-  else if (view==='landing')      screen=<Landing go={go}/>;
-  else if (view==='driver-login') screen=<DriverLogin go={go} onLogin={d=>{setDriver(d);go('driver-app');}}/>;
-  else if (view==='driver-app')   screen=<DriverApp driver={driver} go={go} jobs={jobs} setJobs={setJobs} rates={rates} addAudit={addAudit} addOrder={addOrder} updateOrder={updateOrder}/>;
-  else if (view==='store-login')  screen=<StoreLogin go={go} onLogin={()=>go('store-app')}/>;
-  else if (view==='store-app')    screen=<StoreApp go={go} orders={orders} rates={rates} updateOrder={updateOrder} addAudit={addAudit} deleteOrder={deleteOrder} jobs={jobs} drivers={drivers} onDispatch={dispatchDelivery}/>;
-  else if (view==='admin-login')  screen=<AdminLogin go={go} onLogin={()=>go('admin-app')}/>;
-  else if (view==='admin-app')    screen=<AdminApp go={go} jobs={jobs} setJobs={setJobs} rates={rates} setRates={setRates} audit={audit} drivers={drivers} setDrivers={setDrivers} orders={orders} addJob={addJob} updateOrder={updateOrder} addAudit={addAudit} deleteJob={deleteJob} deleteOrder={deleteOrder} dispatchDelivery={dispatchDelivery} customers={customers} addCustomer={addCustomer}/>;
+  else if (!user)                 screen=<StaffLogin staff={drivers} onLogin={onLogin}/>;
+  else if (view==='driver-app' && hasRole(user,'driver')) screen=<DriverApp driver={user} go={go} jobs={jobs} setJobs={setJobs} rates={rates} addAudit={addAudit} addOrder={addOrder} updateOrder={updateOrder}/>;
+  else if (view==='store-app' && hasRole(user,'store'))   screen=<StoreApp go={go} orders={orders} rates={rates} updateOrder={updateOrder} addAudit={addAudit} deleteOrder={deleteOrder} jobs={jobs} drivers={drivers} onDispatch={dispatchDelivery} user={user}/>;
+  else if (view==='admin-app' && hasRole(user,'admin'))   screen=<AdminApp go={go} jobs={jobs} setJobs={setJobs} rates={rates} setRates={setRates} audit={audit} drivers={drivers} setDrivers={setDrivers} deleteDriver={deleteDriver} orders={orders} addJob={addJob} updateOrder={updateOrder} addAudit={addAudit} deleteJob={deleteJob} deleteOrder={deleteOrder} dispatchDelivery={dispatchDelivery} customers={customers} addCustomer={addCustomer} updateCustomer={updateCustomer} deleteCustomer={deleteCustomer} user={user}/>;
+  else                            screen=<PortalPicker user={user} onPick={v=>setView(v)} onLogout={()=>go('logout')}/>;
   return <>
     {saveError && <div className="fixed top-0 inset-x-0 z-[60] bg-rose-600 text-white text-sm px-4 py-2.5 flex items-center justify-between gap-3 shadow-lg">
       <span className="inline-flex items-start gap-2"><Ic name="alert" size={16} className="mt-0.5 shrink-0"/><span>{saveError}</span></span>
