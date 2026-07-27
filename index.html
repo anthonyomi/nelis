@@ -17,6 +17,9 @@
 <!-- Supabase client — real database (persists data, syncs across devices) -->
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <script>
+  // Stop the browser restoring the old scroll position on reload — the app should
+  // always open at the top so the tabs are visible without scrolling up.
+  if ('scrollRestoration' in history) history.scrollRestoration = 'manual';
   tailwind.config = { theme: { extend: {
     fontFamily: { sans:['Inter','sans-serif'], display:['"Plus Jakarta Sans"','Inter','sans-serif'] },
     colors: { teal:{ DEFAULT:'#3AAFCB', dark:'#2b93ac', light:'#eaf7fb' }, ink:'#1f2a30', slate2:'#6b7a82' }
@@ -586,6 +589,7 @@ function DriverApp({ driver, go, jobs, setJobs, rates, addAudit, addOrder, updat
   const nextPendingId = (myJobs.find(j=>j.status==='pending')||{}).id;
   const done = myJobs.filter(j=>j.status!=='pending').length;
   const openJob = openId ? myJobs.find(j=>j.id===openId) : null;
+  useEffect(()=>{ window.scrollTo(0,0); },[openId]);  // opening/closing a stop starts at the top
 
   const completeCollection = (job, data) => {
     setJobs(prev => prev.map(j => j.id===job.id ? {...j, status:'done', doneAt:now(), ...data} : j));
@@ -1207,6 +1211,7 @@ function AdminApp({ go, jobs, setJobs, rates, setRates, audit, drivers, setDrive
   const [tab,setTab]=useState('overview');
   const [intake,setIntake]=useState(false);
   const [ordersFilter,setOrdersFilter]=useState('all');
+  useEffect(()=>{ window.scrollTo(0,0); },[tab]);   // every tab opens at the top
   const goStat = which => {
     if (which==='customers') setTab('customers');
     else if (which==='jobs') setTab('logistics');
@@ -1858,6 +1863,8 @@ function App() {
   const [audit,setAudit]=useState([]);
   const [customers,setCustomersState]=useState(CUSTOMERS);
   const [saveError,setSaveError]=useState('');
+  // land at the top on first paint and on every portal change
+  useEffect(()=>{ window.scrollTo(0,0); },[view,phase]);
 
   useEffect(()=>{ if(!db) return;
     loadAll().then(d=>{ setCustomersState(d.customers); setDriversState(d.drivers); setJobsState(d.jobs); setOrdersState(d.orders); setRatesState(d.rates); setAudit(d.audit); setPhase('ready');
