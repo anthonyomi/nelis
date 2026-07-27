@@ -314,7 +314,24 @@ const num = v => v==null ? v : Number(v);
 // map between the app's shapes and the database rows
 const fromCustomerRow = r => ({ id:r.id, title:r.title, first:r.first_name, last:r.last_name, addr:r.address,
   mob:r.mobile, email:r.email, lat:num(r.lat), lng:num(r.lng) });
+const toCustomerRow = c => ({ id:c.id, title:c.title, first_name:c.first, last_name:c.last, address:c.addr,
+  mobile:c.mob, email:c.email, lat:c.lat ?? null, lng:c.lng ?? null });
 const fromDriverRow = r => ({ id:r.id, name:r.name, pin:r.pin });
+// free address -> lat/lng lookup for the map (no key). UK postcode first (very reliable), then full address.
+async function geocode(addr){
+  if(!addr) return null;
+  const pc = (addr.match(/[A-Z]{1,2}\d[A-Z\d]?\s*\d[A-Z]{2}/i)||[])[0];
+  if (pc){ try { const r=await fetch(`https://api.postcodes.io/postcodes/${encodeURIComponent(pc.replace(/\s+/g,''))}`);
+    const j=await r.json(); if (j && j.result && j.result.latitude!=null) return { lat:j.result.latitude, lng:j.result.longitude };
+  } catch(e){} }
+  try { const r=await fetch(`https://nominatim.openstreetmap.org/search?format=json&limit=1&countrycodes=gb&q=${encodeURIComponent(addr)}`);
+    const j=await r.json(); if (j && j[0]) return { lat:parseFloat(j[0].lat), lng:parseFloat(j[0].lon) };
+  } catch(e){} return null;
+}
+// fill in coordinates for any customers that don't have them yet (runs one at a time)
+async function backfillCoords(list, onUpdate){
+  for (const c of list){ if (!c.addr || c.lat!=null) continue; const pt=await geocode(c.addr); if (pt) onUpdate(c.id, pt); }
+}
 const ratesFromRows = (rows, settings) => ({
   weight: rows.filter(r=>r.kind==='weight').sort((a,b)=>a.sort-b.sort).map(r=>({key:r.key,label:r.label,unit:r.unit||'kg',price:num(r.price)})),
   items:  rows.filter(r=>r.kind==='item').sort((a,b)=>a.sort-b.sort).map(r=>({key:r.key,label:r.label,price:num(r.price),group:r.group_name})),
@@ -356,7 +373,7 @@ async function loadAll() {
   if (err) throw err;
   CUSTOMERS = (cust.data||[]).map(fromCustomerRow);
   DRIVERS   = (drv.data||[]).map(fromDriverRow);
-  return { drivers: DRIVERS, rates: ratesFromRows(rateRows.data||[], settings.data),
+  return { customers: CUSTOMERS, drivers: DRIVERS, rates: ratesFromRows(rateRows.data||[], settings.data),
     orders: (ord.data||[]).map(fromOrderRow), jobs: (jb.data||[]).map(fromJobRow),
     audit: (aud.data||[]).map(r=>({time:r.at, text:r.text})) };
 }
@@ -428,7 +445,7 @@ function LoginCard({ title, sub, go, children }) {
         <p className="text-slate2 text-sm mb-4">{sub}</p>
         {children}
         <div className="mt-5 pt-4 border-t border-gray-100 text-[11px] text-slate2 flex items-start gap-1.5">
-          <Ic name="info" size={13}/><span>Prototype for review — uses sample data and resets when you refresh. Nothing is saved or sent.</span>
+          <Ic name="info" size={13}/><span>Preview build — data saves to a live database and syncs across devices. Still using sample data, not real customers.</span>
         </div>
       </div>
     </div>
@@ -444,15 +461,15 @@ const inputCls = "w-full bg-white border border-gray-200 rounded-xl px-3 py-2 te
 /* =================================================================== */
 function Landing({ go }) {
   const cards = [
-    ['driver-login','truck','Driver','Today’s collections & deliveries in order; take collections and confirm drop-offs.'],
-    ['store-login','hanger','Store team','What’s coming in and going out, sorted by what’s due first. Price extras and print the day’s list.'],
-    ['admin-login','user','Admin (Boss)','Overview, customers, orders, pricing, drivers, job intake and route planning.'],
+    ['driver-login','truck','Driver Portal','Today’s collections & deliveries in order; take collections and confirm drop-offs.'],
+    ['store-login','hanger','Store Portal','What’s coming in and going out, sorted by what’s due first. Price extras and print the day’s list.'],
+    ['admin-login','user','Admin Portal','Overview, customers, orders, pricing, drivers, job intake and route planning.'],
   ];
   return (
     <div className="min-h-screen flex flex-col items-center justify-center px-4 py-10">
       <Logo h={62} />
       <h1 className="mt-6 text-2xl font-extrabold text-ink">Operations App</h1>
-      <p className="text-slate2 mt-1 text-sm">Proof of concept · choose how you want to sign in</p>
+      <p className="text-slate2 mt-1 text-sm">Choose how you want to sign in</p>
       <div className="mt-8 grid sm:grid-cols-3 gap-4 w-full max-w-3xl">
         {cards.map(([v,ic,t,d])=>(
           <button key={v} onClick={()=>go(v)}
@@ -462,7 +479,7 @@ function Landing({ go }) {
             <div className="text-slate2 text-sm mt-1 leading-snug">{d}</div>
           </button>))}
       </div>
-      <p className="text-[11px] text-slate2 mt-8 inline-flex items-center gap-1.5"><Ic name="info" size={13}/>Prototype for review · sample data resets on refresh · nothing leaves this page.</p>
+      <p className="text-[11px] text-slate2 mt-8 inline-flex items-center gap-1.5"><Ic name="info" size={13}/>Preview build · saves to a live database and syncs across devices · still using sample data.</p>
     </div>
   );
 }
@@ -1020,7 +1037,7 @@ function AdminLogin({ go, onLogin }) {
     </LoginCard>
   );
 }
-function AdminApp({ go, jobs, setJobs, rates, setRates, audit, drivers, setDrivers, orders, addJob, updateOrder, addAudit, deleteJob, deleteOrder, dispatchDelivery }) {
+function AdminApp({ go, jobs, setJobs, rates, setRates, audit, drivers, setDrivers, orders, addJob, updateOrder, addAudit, deleteJob, deleteOrder, dispatchDelivery, customers, addCustomer }) {
   const [tab,setTab]=useState('overview');
   const [intake,setIntake]=useState(false);
   const [ordersFilter,setOrdersFilter]=useState('all');
@@ -1043,23 +1060,23 @@ function AdminApp({ go, jobs, setJobs, rates, setRates, audit, drivers, setDrive
             className={`px-3.5 py-2 rounded-xl text-sm font-semibold whitespace-nowrap inline-flex items-center gap-1.5 ${tab===k?'bg-teal text-white':'text-slate2 hover:bg-gray-50'}`}><Ic name={ic} size={15}/>{l}</button>))}
         </div>
         {tab==='overview'  && <Overview jobs={jobs} orders={orders} audit={audit} onNew={()=>setIntake(true)} goStat={goStat}/>}
-        {tab==='customers' && <Customers/>}
+        {tab==='customers' && <Customers customers={customers} addCustomer={addCustomer}/>}
         {tab==='orders'    && <Orders orders={orders} rates={rates} updateOrder={updateOrder} addAudit={addAudit} filter={ordersFilter} onClearFilter={()=>setOrdersFilter('all')} deleteOrder={deleteOrder} jobs={jobs} drivers={drivers} onDispatch={dispatchDelivery}/>}
         {tab==='pricing'   && <Pricing rates={rates} setRates={setRates}/>}
         {tab==='drivers'   && <DriversAdmin drivers={drivers} setDrivers={setDrivers}/>}
-        {tab==='logistics' && <Logistics jobs={jobs} setJobs={setJobs} drivers={drivers} onNew={()=>setIntake(true)} deleteJob={deleteJob}/>}
+        {tab==='logistics' && <Logistics jobs={jobs} setJobs={setJobs} drivers={drivers} onNew={()=>setIntake(true)} deleteJob={deleteJob} customers={customers}/>}
       </div>
-      {intake && <IntakeModal drivers={drivers} onClose={()=>setIntake(false)} onCreate={addJob}/>}
+      {intake && <IntakeModal drivers={drivers} onClose={()=>setIntake(false)} onCreate={addJob} customers={customers} addCustomer={addCustomer}/>}
     </div>
   );
 }
 
-function IntakeModal({ drivers, onClose, onCreate }) {
-  const [q,setQ]=useState(''); const [customerId,setCustomerId]=useState(null);
+function IntakeModal({ drivers, onClose, onCreate, customers, addCustomer }) {
+  const [q,setQ]=useState(''); const [customerId,setCustomerId]=useState(null); const [addingCust,setAddingCust]=useState(false);
   const [type,setType]=useState('collection'); const [driverId,setDriverId]=useState(drivers[0].id);
   const [returnDate,setReturnDate]=useState(addDays(TODAY,2)); const [packaging,setPackaging]=useState('Hanging');
   const [instructions,setInstructions]=useState(''); const [paid,setPaid]=useState(false); const [window_,setWindow]=useState('16:00–17:00');
-  const matches = q.trim().length<1 ? [] : CUSTOMERS.filter(c=>(fullName(c)+' '+c.addr).toLowerCase().includes(q.toLowerCase())).slice(0,6);
+  const matches = q.trim().length<1 ? [] : (customers||[]).filter(c=>(fullName(c)+' '+c.addr).toLowerCase().includes(q.toLowerCase())).slice(0,6);
   const chosen = customerId ? custById(customerId) : null;
   const create=()=>{ if(!customerId)return;
     onCreate({ id:uuid(), driverId, type, customerId, window:window_, status:'pending', packaging, instructions,
@@ -1084,7 +1101,11 @@ function IntakeModal({ drivers, onClose, onCreate }) {
             <div className="font-medium text-ink">{fullName(c)}</div><div className="text-slate2 text-xs">{c.addr}</div></button>))}
         {chosen && <div className="bg-teal-light rounded-xl px-3 py-2 mt-2 text-sm">
           <div className="font-semibold text-ink">{fullName(chosen)}</div><div className="text-slate2 text-xs">{chosen.addr} · {chosen.mob}</div></div>}
-        {q.trim() && !chosen && matches.length===0 && <p className="text-xs text-amber-600 mt-1">No match — in the full build you could add a new customer here.</p>}
+        {q.trim() && !chosen && matches.length===0 &&
+          <button onClick={()=>setAddingCust(true)} className="w-full text-left mt-1 px-3 py-2 rounded-lg bg-teal-light text-teal-dark text-sm font-semibold inline-flex items-center gap-1.5"><Ic name="plus" size={15}/>Add “{q.trim()}” as a new customer</button>}
+        {!chosen && q.trim()==='' &&
+          <button onClick={()=>setAddingCust(true)} className="text-teal-dark text-xs font-semibold mt-1 inline-flex items-center gap-1"><Ic name="plus" size={13}/>New customer</button>}
+        {addingCust && <AddCustomerModal initialName={q.trim()} onClose={(c)=>{ setAddingCust(false); if(c){ setCustomerId(c.id); setQ(fullName(c)); } }} onCreate={addCustomer}/>}
         <div className="grid grid-cols-2 gap-3 mt-4">
           <Field label="Type"><select value={type} onChange={e=>setType(e.target.value)} className={inputCls+' mt-1'}>
             <option value="collection">Collection</option><option value="delivery">Delivery</option></select></Field>
@@ -1149,21 +1170,89 @@ function TableWrap({ head, children }) {
     <table className="w-full text-sm"><thead><tr className="bg-gray-50 text-left text-xs text-slate2 uppercase tracking-wide">
       {head.map(h=><th key={h} className="px-4 py-2.5 font-semibold whitespace-nowrap">{h}</th>)}</tr></thead><tbody>{children}</tbody></table></div>;
 }
-function Customers() {
+const TITLES = ['Mr','Mrs','Ms','Miss','Dr','Mx'];
+function AddCustomerModal({ onClose, onCreate, initialName }) {
+  const parts = (initialName||'').trim().split(/\s+/).filter(Boolean);
+  const [title,setTitle]=useState('Mr');
+  const [first,setFirst]=useState(parts[0]||'');
+  const [last,setLast]=useState(parts.slice(1).join(' ')||'');
+  const [line1,setLine1]=useState(''); const [town,setTown]=useState(''); const [pc,setPc]=useState('');
+  const [mob,setMob]=useState(''); const [email,setEmail]=useState('');
+  const [pcStatus,setPcStatus]=useState(null); const [pcInfo,setPcInfo]=useState(null); // {lat,lng,postcode}
+
+  // live-validate the postcode against the UK postcode database (postcodes.io)
+  useEffect(()=>{ const val=pc.trim(); if(!val){ setPcStatus(null); setPcInfo(null); return; }
+    setPcStatus('checking');
+    const t=setTimeout(async()=>{
+      try { const r=await fetch(`https://api.postcodes.io/postcodes/${encodeURIComponent(val.replace(/\s+/g,''))}`);
+        const j=await r.json();
+        if(j && j.status===200 && j.result){ setPcStatus('ok'); setPcInfo({lat:j.result.latitude,lng:j.result.longitude,postcode:j.result.postcode}); }
+        else { setPcStatus('bad'); setPcInfo(null); }
+      } catch(e){ setPcStatus('bad'); setPcInfo(null); }
+    }, 450);
+    return ()=>clearTimeout(t);
+  },[pc]);
+
+  const canSave = first.trim() && last.trim() && line1.trim() && pcStatus==='ok' && pcInfo;
+  const save=()=>{ if(!canSave) return;
+    const addr=[line1.trim(), town.trim(), pcInfo.postcode].filter(Boolean).join(', ');
+    const c = onCreate({ title, first:first.trim(), last:last.trim(), addr, mob:mob.trim(), email:email.trim(), lat:pcInfo.lat, lng:pcInfo.lng });
+    onClose(c); };
+
+  return (
+    <div className="fixed inset-0 bg-black/40 flex items-center justify-center p-4 z-[55]" onClick={()=>onClose()}>
+      <div className="bg-white rounded-2xl p-6 w-full max-w-md max-h-[92vh] overflow-y-auto" onClick={e=>e.stopPropagation()}>
+        <div className="flex items-center justify-between mb-4">
+          <h3 className="text-lg font-bold text-ink">New customer</h3>
+          <button onClick={()=>onClose()} className="text-slate2 hover:text-ink"><Ic name="close" size={20}/></button>
+        </div>
+        <div className="grid grid-cols-3 gap-3">
+          <Field label="Title"><select value={title} onChange={e=>setTitle(e.target.value)} className={inputCls+' mt-1'}>{TITLES.map(t=><option key={t}>{t}</option>)}</select></Field>
+          <div className="col-span-2"><Field label="First name"><input value={first} onChange={e=>setFirst(e.target.value)} className={inputCls+' mt-1'}/></Field></div>
+        </div>
+        <div className="mt-3"><Field label="Last name"><input value={last} onChange={e=>setLast(e.target.value)} className={inputCls+' mt-1'}/></Field></div>
+        <div className="mt-3"><Field label="Address (house &amp; street)"><input value={line1} onChange={e=>setLine1(e.target.value)} placeholder="e.g. 30 Sparrow Street" className={inputCls+' mt-1'}/></Field></div>
+        <div className="grid grid-cols-2 gap-3 mt-3">
+          <Field label="Town / city"><input value={town} onChange={e=>setTown(e.target.value)} placeholder="e.g. Rainham" className={inputCls+' mt-1'}/></Field>
+          <Field label="Postcode"><input value={pc} onChange={e=>setPc(e.target.value)} placeholder="e.g. RM13 8LY" className={inputCls+' mt-1 uppercase'}/>
+            {pc.trim() && <div className="text-[11px] mt-1">
+              {pcStatus==='checking' && <span className="text-slate2">Checking…</span>}
+              {pcStatus==='ok' && <span className="text-emerald-600 inline-flex items-center gap-1"><Ic name="check" size={12}/>Valid · {pcInfo.postcode}</span>}
+              {pcStatus==='bad' && <span className="text-rose-600 inline-flex items-center gap-1"><Ic name="alert" size={12}/>Postcode not found</span>}
+            </div>}
+          </Field>
+        </div>
+        <div className="grid grid-cols-2 gap-3 mt-3">
+          <Field label="Mobile"><input value={mob} onChange={e=>setMob(e.target.value)} className={inputCls+' mt-1'}/></Field>
+          <Field label="Email"><input value={email} onChange={e=>setEmail(e.target.value)} type="email" className={inputCls+' mt-1'}/></Field>
+        </div>
+        <p className="text-[11px] text-slate2 mt-2">A valid UK postcode is required — it's checked against the postcode database and places the customer exactly on the map.</p>
+        <div className="flex gap-2 mt-4">
+          <Btn kind="ghost" onClick={()=>onClose()} className="flex-1">Cancel</Btn>
+          <Btn kind="primary" icon="plus" onClick={save} className="flex-1" {...(!canSave?{disabled:true}:{})}>Add customer</Btn>
+        </div>
+      </div>
+    </div>
+  );
+}
+function Customers({ customers, addCustomer }) {
+  const [adding,setAdding]=useState(false);
   return (<div>
-    <div className="flex justify-between items-center mb-3"><h3 className="font-bold text-ink">Customers</h3>
-      <Btn kind="subtle" icon="plus" onClick={()=>alert('In the full build this opens an add-customer form (mock).')}>Add customer</Btn></div>
+    <div className="flex justify-between items-center mb-3"><h3 className="font-bold text-ink">Customers <span className="text-slate2 font-normal">· {customers.length}</span></h3>
+      <Btn kind="subtle" icon="plus" onClick={()=>setAdding(true)}>Add customer</Btn></div>
     <div className="space-y-2">
-      {CUSTOMERS.map(c=>(
+      {customers.map(c=>(
         <div key={c.id} className="bg-white card rounded-2xl p-3.5">
           <div className="font-semibold text-ink">{fullName(c)}</div>
           <div className="text-sm text-slate2 mt-0.5 flex items-start gap-1.5"><Ic name="pin" size={14} className="mt-0.5 shrink-0"/>{c.addr}</div>
           <div className="flex flex-wrap gap-x-4 gap-y-1 mt-1.5 text-sm text-slate2">
-            <a href={`tel:${c.mob.replace(/\s/g,'')}`} className="inline-flex items-center gap-1.5 text-teal-dark font-medium"><Ic name="phone" size={14}/>{c.mob}</a>
-            <span className="inline-flex items-center gap-1.5 truncate"><Ic name="mail" size={14} className="shrink-0"/>{c.email}</span>
+            {c.mob && <a href={`tel:${c.mob.replace(/\s/g,'')}`} className="inline-flex items-center gap-1.5 text-teal-dark font-medium"><Ic name="phone" size={14}/>{c.mob}</a>}
+            {c.email && <span className="inline-flex items-center gap-1.5 truncate"><Ic name="mail" size={14} className="shrink-0"/>{c.email}</span>}
           </div>
         </div>))}
-    </div></div>);
+    </div>
+    {adding && <AddCustomerModal onClose={()=>setAdding(false)} onCreate={addCustomer}/>}
+  </div>);
 }
 function Orders({ orders, rates, updateOrder, addAudit, filter, onClearFilter, deleteOrder, jobs, drivers, onDispatch }) {
   const [sel,setSel]=useState(null);
@@ -1238,7 +1327,7 @@ function DriversAdmin({ drivers, setDrivers }) {
     </TableWrap></div>);
 }
 /* Free map — Leaflet + OpenStreetMap tiles. No API key, no billing account. */
-function RouteMap({ jobs, drivers, filterDriver }) {
+function RouteMap({ jobs, drivers, filterDriver, customers }) {
   const elRef = useRef(null), mapRef = useRef(null), layerRef = useRef(null);
 
   useEffect(()=>{
@@ -1287,7 +1376,7 @@ function RouteMap({ jobs, drivers, filterDriver }) {
       if (pts.length>2) L.polyline(pts,{ color: di===0?'#2b93ac':'#7c3aed', weight:3, opacity:.55, dashArray:'6,7' }).addTo(group);
     });
     if (bounds.length>1) map.fitBounds(bounds,{ padding:[35,35] });
-  },[jobs,drivers,filterDriver]);
+  },[jobs,drivers,filterDriver,customers]);
 
   if (typeof L === 'undefined') return (
     <div className="h-40 rounded-2xl border border-gray-100 bg-gray-50 flex items-center justify-center text-sm text-slate2">
@@ -1295,12 +1384,13 @@ function RouteMap({ jobs, drivers, filterDriver }) {
   return <div ref={elRef} style={{height:'340px'}} className="w-full rounded-2xl overflow-hidden border border-gray-100 z-0"/>;
 }
 
-function Logistics({ jobs, setJobs, drivers, onNew, deleteJob }) {
+function Logistics({ jobs, setJobs, drivers, onNew, deleteJob, customers }) {
   const [mapDriver,setMapDriver]=useState('all');
   const [saving,setSaving]=useState(null);
   const [drag,setDrag]=useState(null);
   const targets = mapDriver==='all' ? drivers.map(d=>d.id) : [mapDriver];
   const roundMiles = useMemo(()=>totalMiles(jobs,targets), [jobs,mapDriver,drivers]);
+  const noLoc = jobs.filter(j=>targets.includes(j.driverId) && j.status==='pending').filter(j=>{const c=custById(j.customerId); return !c||c.lat==null;}).length;
   const optimise = () => {
     const before = totalMiles(jobs,targets);
     let next = jobs; targets.forEach(did=>{ next = optimiseDriver(next,did); });
@@ -1331,13 +1421,14 @@ function Logistics({ jobs, setJobs, drivers, onNew, deleteJob }) {
             <Btn kind="primary" icon="pin" onClick={optimise} className="!py-1.5 !px-3 text-xs">Suggest best order</Btn>
           </div>
         </div>
-        <RouteMap jobs={jobs} drivers={drivers} filterDriver={mapDriver}/>
+        <RouteMap jobs={jobs} drivers={drivers} filterDriver={mapDriver} customers={customers}/>
         <div className="flex items-center justify-between gap-3 flex-wrap mt-2">
           <p className="text-[11px] text-slate2 flex-1 min-w-[220px]">
             <span className="text-rose-500 font-semibold">Pink = collection</span>, <span className="text-teal-dark font-semibold">blue = delivery</span>,
             grey = already done. Each pin shows the driver’s initials and driving order (e.g. SO | 1); the house marker is the shop (start &amp; end). Tap a pin for details.</p>
           <span className="text-xs font-bold text-ink whitespace-nowrap">Round: ~{roundMiles.toFixed(1)} miles</span>
         </div>
+        {noLoc>0 && <div className="text-xs text-amber-600 mt-1 inline-flex items-center gap-1"><Ic name="info" size={13}/>{noLoc} stop{noLoc>1?'s':''} not on the map yet — finding location from the address…</div>}
         {saving && <div className={`text-xs rounded-lg px-2.5 py-1.5 mt-2 inline-flex items-center gap-1.5 ${saving.after < saving.before-0.05 ? 'bg-emerald-50 text-emerald-700':'bg-gray-50 text-slate2'}`}>
           <Ic name="check" size={14}/>{saving.after < saving.before-0.05
             ? `Reordered — about ${(saving.before-saving.after).toFixed(1)} miles shorter (${saving.before.toFixed(1)} → ${saving.after.toFixed(1)} miles).`
@@ -1423,10 +1514,14 @@ function App() {
   const [rates,setRatesState]=useState(INITIAL_RATES);
   const [drivers,setDriversState]=useState(DRIVERS);
   const [audit,setAudit]=useState([]);
+  const [customers,setCustomersState]=useState(CUSTOMERS);
   const [saveError,setSaveError]=useState('');
 
   useEffect(()=>{ if(!db) return;
-    loadAll().then(d=>{ setDriversState(d.drivers); setJobsState(d.jobs); setOrdersState(d.orders); setRatesState(d.rates); setAudit(d.audit); setPhase('ready'); })
+    loadAll().then(d=>{ setCustomersState(d.customers); setDriversState(d.drivers); setJobsState(d.jobs); setOrdersState(d.orders); setRatesState(d.rates); setAudit(d.audit); setPhase('ready');
+        const missing = d.customers.filter(c=>c.addr && c.lat==null);  // fill in map coordinates for any that lack them
+        if(missing.length) backfillCoords(missing, (id,pt)=>{ CUSTOMERS = CUSTOMERS.map(x=>x.id===id?{...x,...pt}:x); setCustomersState(CUSTOMERS);
+          if(db) db.from('customers').update({lat:pt.lat,lng:pt.lng}).eq('id',id).then(logErr('backfill coords')); }); })
       .catch(e=>{ console.error(e); setErr(e.message||String(e)); setPhase('error'); });
   },[]);
   useEffect(()=>{ onSaveError=(m)=>setSaveError(m); return ()=>{ onSaveError=null; }; },[]);
@@ -1449,6 +1544,17 @@ function App() {
     if(job.orderId) setOrdersState(prev=>{ const o=prev.find(x=>x.id===job.orderId);
       if(o && o.status==='Pending Collection'){ if(db) db.from('orders').delete().eq('id',job.orderId).then(logErr('cancelOrder')); return prev.filter(x=>x.id!==job.orderId); }
       return prev; });
+  },[]);
+  const addCustomer=useCallback((cust)=>{
+    const c = { id:uuid(), lat:null, lng:null, ...cust };  // cust already carries lat/lng from the validated postcode
+    CUSTOMERS = [...CUSTOMERS, c];              // keep module array in sync (custById reads it)
+    setCustomersState(CUSTOMERS);
+    if(db) db.from('customers').insert(toCustomerRow(c)).then(r=>{ if(r&&r.error) reportErr('save customer', r.error); });
+    if(c.addr && c.lat==null) geocode(c.addr).then(pt=>{ if(pt){ // only if coordinates weren't provided
+      CUSTOMERS = CUSTOMERS.map(x=>x.id===c.id?{...x,...pt}:x); setCustomersState(CUSTOMERS);
+      if(db) db.from('customers').update({lat:pt.lat,lng:pt.lng}).eq('id',c.id).then(logErr('geocode'));
+    }});
+    return c;
   },[]);
   const dispatchDelivery=useCallback((order, driverId, window)=>{
     const nj={ id:uuid(), driverId, type:'delivery', customerId:order.customerId, orderId:order.id, window, status:'pending',
@@ -1504,7 +1610,7 @@ function App() {
   else if (view==='store-login')  screen=<StoreLogin go={go} onLogin={()=>go('store-app')}/>;
   else if (view==='store-app')    screen=<StoreApp go={go} orders={orders} rates={rates} updateOrder={updateOrder} addAudit={addAudit} deleteOrder={deleteOrder} jobs={jobs} drivers={drivers} onDispatch={dispatchDelivery}/>;
   else if (view==='admin-login')  screen=<AdminLogin go={go} onLogin={()=>go('admin-app')}/>;
-  else if (view==='admin-app')    screen=<AdminApp go={go} jobs={jobs} setJobs={setJobs} rates={rates} setRates={setRates} audit={audit} drivers={drivers} setDrivers={setDrivers} orders={orders} addJob={addJob} updateOrder={updateOrder} addAudit={addAudit} deleteJob={deleteJob} deleteOrder={deleteOrder} dispatchDelivery={dispatchDelivery}/>;
+  else if (view==='admin-app')    screen=<AdminApp go={go} jobs={jobs} setJobs={setJobs} rates={rates} setRates={setRates} audit={audit} drivers={drivers} setDrivers={setDrivers} orders={orders} addJob={addJob} updateOrder={updateOrder} addAudit={addAudit} deleteJob={deleteJob} deleteOrder={deleteOrder} dispatchDelivery={dispatchDelivery} customers={customers} addCustomer={addCustomer}/>;
   return <>
     {saveError && <div className="fixed top-0 inset-x-0 z-[60] bg-rose-600 text-white text-sm px-4 py-2.5 flex items-center justify-between gap-3 shadow-lg">
       <span className="inline-flex items-start gap-2"><Ic name="alert" size={16} className="mt-0.5 shrink-0"/><span>{saveError}</span></span>
