@@ -239,6 +239,18 @@ function groupOrdersByDue(orders, today) {
   Object.keys(g).forEach(k=>g[k].sort(k==='done'?((a,b)=>byDue(b,a)):byDue));
   return g;
 }
+// PURE — what the shop floor should see (unit-tested).
+// Anything physically in the shop counts, and anything past its due date always
+// shows regardless of the Today/This week toggle — it can't be allowed to vanish.
+const IN_SHOP_STATUSES = ['Collected','Needs pricing','In Shop','Ready'];
+function storeList(orders, scope, today) {
+  const end = addDays(today, 6);
+  return (orders||[])
+    .filter(o => IN_SHOP_STATUSES.includes(o.status))
+    .filter(o => { const d=o.dueDate||''; if(!d || d<today) return true;      // overdue / undated: always
+                   return scope==='today' ? d===today : d<=end; })
+    .sort((a,b)=> (a.dueDate||'').localeCompare(b.dueDate||'') || (a.collectedAt||'').localeCompare(b.collectedAt||''));
+}
 // PURE reorder helpers (unit-tested)
 function reorderJobs(jobs, driverId, jobId, targetJobId) {
   const mine = jobs.filter(j=>j.driverId===driverId).sort((a,b)=>a.seq-b.seq);
@@ -613,7 +625,6 @@ function DriverApp({ driver, go, jobs, setJobs, rates, addAudit, addOrder, updat
           {PORTALS.filter(p=>hasRole(driver,p.role)).length>1 && <button onClick={()=>go('picker')} title="Back to portals" className="w-8 h-8 rounded-lg border border-gray-200 flex items-center justify-center text-slate2 hover:bg-gray-50"><Ic name="left" size={18}/></button>}
           <Logo h={26} hideTextOnMobile/></div>} right={
         <div className="flex items-center gap-2"><span className="text-sm text-ink font-semibold hidden sm:inline">{driver.name}</span>
-          {PORTALS.filter(p=>hasRole(driver,p.role)).length>1 && <Btn kind="ghost" icon="layers" onClick={()=>go('picker')} className="!py-1.5 !px-3">Portals</Btn>}
           <Btn kind="ghost" icon="logout" onClick={()=>go('logout')} className="!py-1.5 !px-3">Log out</Btn></div>} />
       <div className="max-w-2xl mx-auto p-4">
         {!openJob && <>
@@ -1096,11 +1107,8 @@ function StoreLogin({ go, onLogin }) {
 function StoreApp({ go, orders, rates, updateOrder, addAudit, deleteOrder, jobs, drivers, onDispatch, user }) {
   const [scope,setScope]=useState('today');
   const [sel,setSel]=useState(null);
-  const list = useMemo(()=>{
-    const inShop = o => ['Collected','Needs pricing','In Shop','Ready'].includes(o.status); // garments physically in the shop
-    const f = orders.filter(o => inShop(o) && (scope==='today' ? o.dueDate===TODAY : withinWeek(o.dueDate)));
-    return [...f].sort((a,b)=> a.dueDate.localeCompare(b.dueDate) || (a.collectedAt||'').localeCompare(b.collectedAt||''));
-  }, [orders,scope]);
+  const list = useMemo(()=>storeList(orders, scope, TODAY), [orders,scope]);
+  const lateCount = list.filter(o=>(o.dueDate||'')<TODAY).length;
 
   const printList = () => {
     const itemLabel = k => { const r=rates.items.find(x=>x.key===k); return r ? r.label.replace(/^Dry clean — /,'') : k; };
@@ -1129,7 +1137,6 @@ function StoreApp({ go, orders, rates, updateOrder, addAudit, deleteOrder, jobs,
           {user && PORTALS.filter(p=>hasRole(user,p.role)).length>1 && <button onClick={()=>go('picker')} title="Back to portals" className="w-8 h-8 rounded-lg border border-gray-200 flex items-center justify-center text-slate2 hover:bg-gray-50"><Ic name="left" size={18}/></button>}
           <Logo h={26} hideTextOnMobile/></div>} right={
         <div className="flex items-center gap-2"><span className="text-sm text-ink font-semibold hidden sm:inline">{user?user.name:'Store team'}</span>
-          {user && PORTALS.filter(p=>hasRole(user,p.role)).length>1 && <Btn kind="ghost" icon="layers" onClick={()=>go('picker')} className="!py-1.5 !px-3">Portals</Btn>}
           <Btn kind="ghost" icon="logout" onClick={()=>go('logout')} className="!py-1.5 !px-3">Log out</Btn></div>} />
       <div className="max-w-5xl mx-auto p-4">
         <div className="flex items-center justify-between mb-1 flex-wrap gap-2">
@@ -1142,17 +1149,21 @@ function StoreApp({ go, orders, rates, updateOrder, addAudit, deleteOrder, jobs,
             <Btn kind="ghost" icon="printer" onClick={printList}>Print / PDF</Btn>
           </div>
         </div>
-        <p className="text-slate2 text-sm mb-4">Sorted by soonest due first, so you know which bags to deal with first. Tap an order for full details and to price extras.</p>
+        <p className="text-slate2 text-sm mb-1">Sorted by soonest due first, so you know which bags to deal with first. Tap an order for full details and to price extras.</p>
+        <p className="text-slate2 text-xs mb-4">Anything still in the shop past its due date always shows here, whichever view you pick.</p>
+        {lateCount>0 && <div className="mb-3 rounded-xl border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-700 font-semibold inline-flex items-center gap-2">
+          <Ic name="alert" size={16}/>{lateCount} order{lateCount>1?'s are':' is'} past the delivery date</div>}
 
-        {list.length===0 ? <div className="bg-white card rounded-2xl p-8 text-center text-slate2">Nothing due {scope==='today'?'today':'this week'}.</div>
+        {list.length===0 ? <div className="bg-white card rounded-2xl p-8 text-center text-slate2">Nothing in the shop due {scope==='today'?'today':'this week'}.</div>
         : <div className="space-y-3">
-            {list.map(o=>{ const c=custById(o.customerId); const dueToday=o.dueDate===TODAY;
+            {list.map(o=>{ const c=custById(o.customerId); const dueToday=o.dueDate===TODAY; const late=(o.dueDate||'')<TODAY;
               return (
-                <button key={o.id} onClick={()=>setSel(o)} className={`w-full text-left bg-white card rounded-2xl p-4 border-l-4 hover:ring-2 hover:ring-teal/40 transition ${o.needsPricing?'border-rose-400':dueToday?'border-teal':'border-gray-200'}`}>
+                <button key={o.id} onClick={()=>setSel(o)} className={`w-full text-left bg-white card rounded-2xl p-4 border-l-4 hover:ring-2 hover:ring-teal/40 transition ${late?'border-rose-500':o.needsPricing?'border-rose-400':dueToday?'border-teal':'border-gray-200'}`}>
                   <div className="flex flex-wrap items-start justify-between gap-3">
                     <div className="min-w-[180px]">
                       <div className="flex items-center gap-2 flex-wrap">
-                        <Badge tone={dueToday?'teal':'grey'}>Due {fmtDate(o.dueDate)}</Badge>
+                        {late && <Badge tone="rose">Overdue</Badge>}
+                        <Badge tone={late?'rose':dueToday?'teal':'grey'}>Due {fmtDate(o.dueDate)}</Badge>
                         <Badge tone={statusTone(o.status)}>{o.status}</Badge>
                         {o.paidInAdvance && <Badge tone="green">Paid</Badge>}
                       </div>
@@ -1212,7 +1223,6 @@ function AdminApp({ go, jobs, setJobs, rates, setRates, audit, drivers, setDrive
         <div className="flex items-center gap-2">
           <span className="text-sm text-ink font-semibold hidden sm:inline">{user?user.name:'Boss'}</span>
           <Btn kind="rose" icon="plus" onClick={()=>setIntake(true)} className="!py-1.5 !px-3">New job</Btn>
-          {user && PORTALS.filter(p=>hasRole(user,p.role)).length>1 && <Btn kind="ghost" icon="layers" onClick={()=>go('picker')} className="!py-1.5 !px-3">Portals</Btn>}
           <Btn kind="ghost" icon="logout" onClick={()=>go('logout')} className="!py-1.5 !px-3">Log out</Btn></div>} />
       <div className="max-w-5xl mx-auto p-4">
         <div className="flex flex-wrap gap-1 mb-4 bg-white rounded-2xl p-1 card">
