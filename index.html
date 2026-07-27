@@ -1273,7 +1273,7 @@ function AddCustomerModal({ onClose, onCreate, onUpdate, onDelete, customer, ini
         <div className="flex gap-2 mt-4 items-center">
           {canDelete && <Btn kind="ghost" icon="trash" onClick={remove} className="!text-rose-600 !border-rose-200 hover:!bg-rose-50">Delete</Btn>}
           <Btn kind="ghost" onClick={()=>onClose()} className="flex-1">Cancel</Btn>
-          <Btn kind="primary" icon={editing?'check':'plus'} onClick={save} className="flex-1" {...(!canSave?{disabled:true}:{})}>{editing?'Save changes':'Add customer'}</Btn>
+          <Btn kind="primary" icon={editing?'check':'plus'} onClick={save} className="flex-1" {...(!canSave?{disabled:true}:{})}>{editing?'Save':'Add customer'}</Btn>
         </div>
       </div>
     </div>
@@ -1418,7 +1418,7 @@ function StaffModal({ staff, onClose, onSave, onDelete }) {
         <div className="flex gap-2 mt-4 items-center">
           {onDelete && <Btn kind="ghost" icon="trash" onClick={remove} className="!text-rose-600 !border-rose-200 hover:!bg-rose-50">Delete</Btn>}
           <Btn kind="ghost" onClick={onClose} className="flex-1">Cancel</Btn>
-          <Btn kind="primary" icon="check" onClick={save} className="flex-1" {...(!canSave?{disabled:true}:{})}>Save changes</Btn>
+          <Btn kind="primary" icon="check" onClick={save} className="flex-1" {...(!canSave?{disabled:true}:{})}>Save</Btn>
         </div>
       </div>
     </div>);
