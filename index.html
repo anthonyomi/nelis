@@ -126,9 +126,12 @@ const TIME_WINDOWS = ['09:00–10:00','10:00–11:00','11:00–12:00','12:00–1
   '14:00–15:00','15:00–16:00','16:00–17:00','17:00–18:00','18:00–19:00 (evening)'];
 
 /* ------------------------------- dates -------------------------------- */
-const TODAY = new Date().toISOString().slice(0,10); // real "today" so it matches the database dates
+// All dates are handled in LOCAL time. Using toISOString() here would shift the
+// date by a day during British Summer Time, so every date is built by hand.
+const isoDate = d => `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+const TODAY = isoDate(new Date());   // real "today" so it matches the database dates
 const fmtDate = iso => new Date(iso+'T00:00:00').toLocaleDateString('en-GB',{weekday:'short',day:'numeric',month:'short'});
-const addDays = (iso,n)=>{ const d=new Date(iso+'T00:00:00'); d.setDate(d.getDate()+n); return d.toISOString().slice(0,10); };
+const addDays = (iso,n)=>{ const [y,m,d]=String(iso).split('-').map(Number); const dt=new Date(y,(m||1)-1,d||1); dt.setDate(dt.getDate()+n); return isoDate(dt); };
 const withinWeek = iso => iso>=TODAY && iso<=addDays(TODAY,6);
 
 /* ------------------------------- mock DB ------------------------------- */
@@ -217,6 +220,24 @@ function orderTotal(rates, weightCharge, addedItems, firstOrder) {
   const belowMin = afterDisc > 0 && afterDisc < rates.minOrder;
   const charged = belowMin ? rates.minOrder : afterDisc;
   return { lines, subtotal, discount, charged, belowMin };
+}
+// PURE — split orders into priority buckets by their due date (unit-tested)
+// Finished orders drop out of the urgency buckets so they can't clutter today's list.
+const DONE_STATUSES = ['Delivered'];
+function groupOrdersByDue(orders, today) {
+  const tomorrow = addDays(today,1);
+  const g = { overdue:[], today:[], tomorrow:[], upcoming:[], done:[] };
+  (orders||[]).forEach(o=>{
+    if (DONE_STATUSES.includes(o.status)) { g.done.push(o); return; }
+    const d = o.dueDate || '';
+    if (d < today)            g.overdue.push(o);
+    else if (d === today)     g.today.push(o);
+    else if (d === tomorrow)  g.tomorrow.push(o);
+    else                      g.upcoming.push(o);
+  });
+  const byDue=(a,b)=>(a.dueDate||'').localeCompare(b.dueDate||'');
+  Object.keys(g).forEach(k=>g[k].sort(k==='done'?((a,b)=>byDue(b,a)):byDue));
+  return g;
 }
 // PURE reorder helpers (unit-tested)
 function reorderJobs(jobs, driverId, jobId, targetJobId) {
@@ -435,13 +456,13 @@ const saveRates  = r   => { if(!db) return;
 /* =================================================================== */
 /*  SHARED UI                                                          */
 /* =================================================================== */
-function Logo({ h=34 }) {
+function Logo({ h=34, hideTextOnMobile=false }) {
   return (
-    <div className="flex items-center gap-2 select-none">
+    <div className="flex items-center gap-2 select-none shrink-0">
       <div className="rounded-full border-[3px] border-teal flex items-center justify-center" style={{width:h,height:h}}>
         <div className="rounded-full bg-teal" style={{width:h*0.34,height:h*0.34}}></div>
       </div>
-      <div className="leading-none">
+      <div className={`leading-none ${hideTextOnMobile?'hidden sm:block':''}`}>
         <div className="font-display font-extrabold tracking-wide text-slate2" style={{fontSize:h*0.5}}>NEL</div>
         <div className="text-teal-dark tracking-[0.18em]" style={{fontSize:h*0.23}}>IRONING SERVICE</div>
       </div>
@@ -462,7 +483,7 @@ function Btn({ children, onClick, kind='primary', className='', icon, ...p }) {
     rose:'bg-rose-500 text-white hover:bg-rose-600',
     dark:'bg-ink text-white hover:bg-black' };
   return <button onClick={onClick} {...p}
-    className={`inline-flex items-center justify-center gap-1.5 px-4 py-2 rounded-xl text-sm font-semibold transition ${styles[kind]} ${className}`}>
+    className={`inline-flex items-center justify-center gap-1.5 px-4 py-2 rounded-xl text-sm font-semibold whitespace-nowrap shrink-0 transition ${styles[kind]} ${className}`}>
     {icon && <Ic name={icon} size={16}/>}{children}</button>;
 }
 function TopBar({ left, right }) {
@@ -590,7 +611,7 @@ function DriverApp({ driver, go, jobs, setJobs, rates, addAudit, addOrder, updat
       <TopBar left={
         <div className="flex items-center gap-2">
           {PORTALS.filter(p=>hasRole(driver,p.role)).length>1 && <button onClick={()=>go('picker')} title="Back to portals" className="w-8 h-8 rounded-lg border border-gray-200 flex items-center justify-center text-slate2 hover:bg-gray-50"><Ic name="left" size={18}/></button>}
-          <Logo h={26}/></div>} right={
+          <Logo h={26} hideTextOnMobile/></div>} right={
         <div className="flex items-center gap-2"><span className="text-sm text-ink font-semibold hidden sm:inline">{driver.name}</span>
           {PORTALS.filter(p=>hasRole(driver,p.role)).length>1 && <Btn kind="ghost" icon="layers" onClick={()=>go('picker')} className="!py-1.5 !px-3">Portals</Btn>}
           <Btn kind="ghost" icon="logout" onClick={()=>go('logout')} className="!py-1.5 !px-3">Log out</Btn></div>} />
@@ -867,6 +888,50 @@ function OrderModal({ order, rates, onClose, onSave, addAudit, onDelete, onDispa
   const groups = useMemo(()=>{ const g={}; rates.items.forEach(r=>{(g[r.group]=g[r.group]||[]).push(r)}); return g; },[rates]);
   const calc = useMemo(()=>orderTotal(rates, order.weightCharge, added, order.firstOrder), [rates,order,added]);
 
+  // ---- edit the order's own details (service, weight, due date, packaging, payment, notes) ----
+  const [editing,setEditing]=useState(false);
+  const [eSvc,setESvc]=useState(order.services[0]||'');
+  const [eWeight,setEWeight]=useState(order.weight||0);
+  const [eBags,setEBags]=useState(order.bagsCount||0);
+  const [eCharge,setECharge]=useState(order.weightCharge||0);
+  const [eExtras,setEExtras]=useState(order.extras||[]);
+  const [eDue,setEDue]=useState(order.dueDate||'');
+  const [ePack,setEPack]=useState(order.packaging||PACKAGING[0]);
+  const [ePay,setEPay]=useState(order.paymentMethod||'—');
+  const [eNotes,setENotes]=useState(order.notes||'');
+  const [chargeTouched,setChargeTouched]=useState(false);
+  const svcOpts = [...new Set([...rates.weight.map(r=>r.label), ...order.services].filter(Boolean))];
+  // when the service or weight changes, re-price the weight part automatically (unless hand-edited)
+  useEffect(()=>{ if(!editing||chargeTouched) return;
+    const r=rates.weight.find(x=>x.label===eSvc);
+    if(r) setECharge(+(r.price*(parseFloat(eWeight)||0)).toFixed(2));
+  },[eSvc,eWeight,editing,chargeTouched]);
+  const editCalc = useMemo(()=>orderTotal(rates, parseFloat(eCharge)||0, added, order.firstOrder), [rates,eCharge,added,order.firstOrder]);
+  const startEdit=()=>{ setESvc(order.services[0]||''); setEWeight(order.weight||0); setEBags(order.bagsCount||0);
+    setECharge(order.weightCharge||0); setEExtras(order.extras||[]); setEDue(order.dueDate||''); setEPack(order.packaging||PACKAGING[0]);
+    setEPay(order.paymentMethod||'—'); setENotes(order.notes||''); setChargeTouched(false); setPricing(false); setEditing(true); };
+  const toggleExtra=(x)=>setEExtras(list=>list.includes(x)?list.filter(y=>y!==x):[...list,x]);
+  const saveEdit=()=>{
+    const wc=parseFloat(eCharge)||0, wt=parseFloat(eWeight)||0, bags=parseInt(eBags)||0;
+    const patch={ services:eSvc?[eSvc]:[], weight:wt, bagsCount:bags, weightCharge:wc, extras:eExtras,
+      dueDate:eDue||order.dueDate, packaging:ePack, paymentMethod:ePay, notes:eNotes,
+      amount:editCalc.charged, needsPricing: order.needsPricing && eExtras.length>0 };
+    // describe what actually changed, for the audit trail
+    const ch=[];
+    if((order.services[0]||'')!==eSvc) ch.push(`service → ${eSvc||'none'}`);
+    if((order.weight||0)!==wt) ch.push(`weight → ${wt}kg`);
+    if((order.bagsCount||0)!==bags) ch.push(`bags → ${bags}`);
+    if((order.extras||[]).join(',')!==eExtras.join(',')) ch.push(`extras → ${eExtras.join(', ')||'none'}`);
+    if((order.dueDate||'')!==(eDue||order.dueDate)) ch.push(`deliver by → ${fmtDate(eDue)}`);
+    if((order.packaging||'')!==ePack) ch.push(`packaging → ${ePack}`);
+    if((order.paymentMethod||'')!==ePay) ch.push(`payment → ${ePay}`);
+    if((order.notes||'')!==eNotes) ch.push('notes updated');
+    if(Math.abs((order.amount||0)-editCalc.charged)>0.005) ch.push(`price ${gbp(order.amount)} → ${gbp(editCalc.charged)}`);
+    onSave(order.id, patch);
+    if(ch.length) addAudit(`${actor} amended ${fullName(c)}'s order: ${ch.join('; ')}`);
+    setEditing(false);
+  };
+
   const save = () => {
     onSave(order.id, { addedItems:added, amount:calc.charged, needsPricing:false,
       status: order.status==='Needs pricing'?'In Shop':order.status });
@@ -886,9 +951,42 @@ function OrderModal({ order, rates, onClose, onSave, addAudit, onDelete, onDispa
         </div>
         <div className="p-5 grid md:grid-cols-2 gap-5">
           <div>
-            <h4 className="font-bold text-ink text-sm mb-2">Order details</h4>
+            <div className="flex items-center justify-between mb-2">
+              <h4 className="font-bold text-ink text-sm">Order details</h4>
+              {!editing && <Btn kind="subtle" icon="edit" className="!py-1 !px-2 text-xs" onClick={startEdit}>Edit details</Btn>}
+            </div>
+            {editing ? (<div className="space-y-2.5">
+              <Field label="Service"><select value={eSvc} onChange={e=>setESvc(e.target.value)} className={inputCls+' mt-1'}>
+                <option value="">— none / priced by item —</option>
+                {svcOpts.map(s=><option key={s}>{s}</option>)}</select></Field>
+              <div className="grid grid-cols-3 gap-2">
+                <Field label="Bags"><input type="number" min="0" value={eBags} onChange={e=>setEBags(e.target.value)} className={inputCls+' mt-1'}/></Field>
+                <Field label="Weight (kg)"><input type="number" min="0" step="0.1" value={eWeight} onChange={e=>setEWeight(e.target.value)} className={inputCls+' mt-1'}/></Field>
+                <Field label="Weight charge £"><input type="number" min="0" step="0.5" value={eCharge}
+                  onChange={e=>{setECharge(e.target.value);setChargeTouched(true);}} className={inputCls+' mt-1'}/></Field>
+              </div>
+              <p className="text-[11px] text-slate2 -mt-1">Charge updates automatically from the service rate × weight. Type over it to set your own figure.</p>
+              <div><div className="text-xs font-semibold text-slate2 mb-1">Extras flagged</div>
+                <div className="flex flex-wrap gap-2">{EXTRA_TYPES.map(x=>(
+                  <button key={x} onClick={()=>toggleExtra(x)} className={`px-2.5 py-1 text-[11px] rounded-full font-semibold border ${eExtras.includes(x)?'bg-amber-100 text-amber-800 border-amber-300':'bg-white text-slate2 border-gray-200'}`}>{x}</button>))}</div></div>
+              <div className="grid grid-cols-2 gap-2">
+                <Field label="Deliver by"><input type="date" value={eDue} onChange={e=>setEDue(e.target.value)} className={inputCls+' mt-1'}/></Field>
+                <Field label="Packaging"><select value={ePack} onChange={e=>setEPack(e.target.value)} className={inputCls+' mt-1'}>
+                  {PACKAGING.map(p=><option key={p}>{p}</option>)}</select></Field>
+              </div>
+              <Field label="Payment"><select value={ePay} onChange={e=>setEPay(e.target.value)} className={inputCls+' mt-1'}>
+                {['—','On delivery','Cash','Card','Online','Bank transfer'].map(p=><option key={p}>{p}</option>)}</select></Field>
+              <Field label="Notes"><textarea value={eNotes} onChange={e=>setENotes(e.target.value)} rows={2} className={inputCls+' mt-1'}/></Field>
+              <div className="bg-teal-light rounded-xl p-2.5 flex justify-between items-center">
+                <span className="font-semibold text-ink text-sm">New total</span>
+                <span className="text-lg font-extrabold text-teal-dark">{gbp(editCalc.charged)}</span></div>
+              <div className="flex gap-2">
+                <Btn kind="ghost" onClick={()=>setEditing(false)} className="flex-1">Cancel</Btn>
+                <Btn kind="primary" icon="check" onClick={saveEdit} className="flex-1">Save</Btn>
+              </div>
+            </div>) : (<>
             <div className="text-sm space-y-1.5">
-              <Row k="Services" v={order.services.join(', ')}/>
+              <Row k="Services" v={order.services.join(', ')||'—'}/>
               {order.extras.length>0 && <Row k="Extras" v={<span className="text-amber-700">{order.extras.join(', ')}</span>}/>}
               <Row k="Bags" v={order.bagsCount>0?`${order.bagsCount} · ${order.bagWeights.join('+')}kg = ${order.weight}kg`:'—'}/>
               <Row k="Packaging" v={order.packaging}/>
@@ -923,6 +1021,7 @@ function OrderModal({ order, rates, onClose, onSave, addAudit, onDelete, onDispa
               </div>
               <Btn kind="primary" icon="truck" className="w-full mt-2" onClick={dispatch}>Add to driver’s run</Btn>
             </div>}
+            </>)}
           </div>
 
           <div>
@@ -940,12 +1039,13 @@ function OrderModal({ order, rates, onClose, onSave, addAudit, onDelete, onDispa
                     {order.weightCharge===0 && calc.lines.length===0 && <div className="text-slate2">Nothing priced yet.</div>}
                     <div className="flex justify-between items-center pt-1.5 border-t border-gray-200"><span className="font-bold text-ink">Total</span><span className="font-extrabold text-ink">{gbp(order.amount)}</span></div>
                   </div>
-                  <p className="text-xs text-slate2 mt-2">{calc.lines.length>0?'Extras added at the shop are listed above. ':''}Tap <b>Amend price</b> to add or change dry cleaning, bedding or repairs.</p>
+                  <p className="text-xs text-slate2 mt-2">{calc.lines.length>0?'Extras added at the shop are listed above. ':''}Tap <b>Amend price</b> to add, change or remove dry cleaning, bedding or repairs.</p>
                 </div>
               : <>
                   <div className="bg-gray-50 rounded-xl p-3 text-sm mb-3">
                     <div className="flex justify-between text-slate2"><span>Weight-based ({order.services[0]})</span><span>{gbp(order.weightCharge)}</span></div>
                   </div>
+                  <p className="text-[11px] text-slate2 -mt-2 mb-2">Set a quantity to <b>0</b> (or clear it) to remove something added by mistake.</p>
                   <div className="max-h-56 overflow-y-auto pr-1">
                     {Object.entries(groups).map(([g,list])=>(
                       <div key={g} className="mb-2">
@@ -1027,7 +1127,7 @@ function StoreApp({ go, orders, rates, updateOrder, addAudit, deleteOrder, jobs,
       <TopBar left={
         <div className="flex items-center gap-2">
           {user && PORTALS.filter(p=>hasRole(user,p.role)).length>1 && <button onClick={()=>go('picker')} title="Back to portals" className="w-8 h-8 rounded-lg border border-gray-200 flex items-center justify-center text-slate2 hover:bg-gray-50"><Ic name="left" size={18}/></button>}
-          <Logo h={26}/></div>} right={
+          <Logo h={26} hideTextOnMobile/></div>} right={
         <div className="flex items-center gap-2"><span className="text-sm text-ink font-semibold hidden sm:inline">{user?user.name:'Store team'}</span>
           {user && PORTALS.filter(p=>hasRole(user,p.role)).length>1 && <Btn kind="ghost" icon="layers" onClick={()=>go('picker')} className="!py-1.5 !px-3">Portals</Btn>}
           <Btn kind="ghost" icon="logout" onClick={()=>go('logout')} className="!py-1.5 !px-3">Log out</Btn></div>} />
@@ -1108,7 +1208,7 @@ function AdminApp({ go, jobs, setJobs, rates, setRates, audit, drivers, setDrive
       <TopBar left={
         <div className="flex items-center gap-2">
           {user && PORTALS.filter(p=>hasRole(user,p.role)).length>1 && <button onClick={()=>go('picker')} title="Back to portals" className="w-8 h-8 rounded-lg border border-gray-200 flex items-center justify-center text-slate2 hover:bg-gray-50"><Ic name="left" size={18}/></button>}
-          <Logo h={26}/></div>} right={
+          <Logo h={26} hideTextOnMobile/></div>} right={
         <div className="flex items-center gap-2">
           <span className="text-sm text-ink font-semibold hidden sm:inline">{user?user.name:'Boss'}</span>
           <Btn kind="rose" icon="plus" onClick={()=>setIntake(true)} className="!py-1.5 !px-3">New job</Btn>
@@ -1357,35 +1457,68 @@ function Customers({ customers, addCustomer, updateCustomer, deleteCustomer, use
     {editing && <AddCustomerModal customer={editing} onClose={()=>setEditing(null)} onUpdate={updateCustomer} onDelete={mayDelete(user)?deleteCustomer:null} user={user} customers={customers}/>}
   </div>);
 }
+// how each due-date section looks
+const ORDER_SECTIONS = [
+  { key:'overdue',  title:'Overdue',        note:'Past their delivery date — deal with these first.', accent:'border-rose-300',   dot:'bg-rose-500',    pill:'bg-rose-100 text-rose-700' },
+  { key:'today',    title:'Due today',      note:'Must go out today.',                                accent:'border-teal',       dot:'bg-teal',        pill:'bg-teal-light text-teal-dark' },
+  { key:'tomorrow', title:'Due tomorrow',   note:'Get these ready today if you can.',                 accent:'border-amber-300',  dot:'bg-amber-400',   pill:'bg-amber-100 text-amber-800' },
+  { key:'upcoming', title:'Upcoming',       note:'Later this week and beyond.',                       accent:'border-gray-200',   dot:'bg-gray-300',    pill:'bg-gray-100 text-gray-600' },
+  { key:'done',     title:'Delivered',      note:'Completed — kept for your records.',                accent:'border-gray-200',   dot:'bg-emerald-400', pill:'bg-emerald-50 text-emerald-700' },
+];
 function Orders({ orders, rates, updateOrder, addAudit, filter, onClearFilter, deleteOrder, jobs, drivers, onDispatch, user }) {
   const [sel,setSel]=useState(null);
+  const [showDone,setShowDone]=useState(false);
   const base = filter==='needsPricing' ? orders.filter(o=>o.needsPricing) : orders;
-  const sorted=[...base].sort((a,b)=>a.dueDate.localeCompare(b.dueDate));
+  const groups = useMemo(()=>groupOrdersByDue(base, TODAY), [base]);
+  const total = base.length;
+
+  const card = (o) => { const c=custById(o.customerId); const late=o.dueDate<TODAY && !DONE_STATUSES.includes(o.status); return (
+    <button key={o.id} onClick={()=>setSel(o)} className="w-full text-left bg-white card rounded-2xl p-3.5 hover:ring-2 hover:ring-teal/40 transition">
+      <div className="flex items-center justify-between gap-2">
+        <span className="font-semibold text-ink truncate">{fullName(c)}</span>
+        <Badge tone={statusTone(o.status)}>{o.status}</Badge>
+      </div>
+      <div className="flex items-center justify-between gap-2 mt-1 text-sm">
+        <span className="text-slate2 truncate">{o.services.join(', ')||'—'}{o.extras.length?<span className="text-amber-600"> +{o.extras.length}</span>:''}</span>
+        <span className="text-slate2 shrink-0">{o.bagsCount} · {o.weight}kg</span>
+      </div>
+      <div className="flex items-center justify-between gap-2 mt-1.5 text-sm">
+        <span className="font-bold text-ink inline-flex items-center gap-2">{gbp(o.amount)}{o.needsPricing&&<span className="text-rose-500 font-normal text-xs">prov.</span>}{o.paidInAdvance&&<Badge tone="green">Paid</Badge>}</span>
+        <span className={`text-xs inline-flex items-center gap-1 ${late?'text-rose-600 font-semibold':'text-slate2'}`}><Ic name="clock" size={13}/>Due {fmtDate(o.dueDate)}</span>
+      </div>
+    </button>);};
+
   return (<div>
     <div className="flex items-center justify-between mb-3">
       <h3 className="font-bold text-ink">{filter==='needsPricing'?'Orders awaiting pricing':'All orders'}</h3>
       {filter==='needsPricing' && <button onClick={onClearFilter} className="text-sm text-teal-dark font-semibold inline-flex items-center gap-1"><Ic name="left" size={14}/>Show all</button>}
     </div>
-    {filter!=='needsPricing' && <p className="text-xs text-slate2 -mt-2 mb-3">Every order and its stage — booked, collected, in the shop, ready and delivered.</p>}
-    <div className="space-y-2">
-      {sorted.length===0 && <div className="bg-white card rounded-2xl p-8 text-center text-slate2">No orders awaiting pricing right now.</div>}
-      {sorted.map(o=>{ const c=custById(o.customerId); return (
-        <button key={o.id} onClick={()=>setSel(o)} className="w-full text-left bg-white card rounded-2xl p-3.5 hover:ring-2 hover:ring-teal/40 transition">
-          <div className="flex items-center justify-between gap-2">
-            <span className="font-semibold text-ink truncate">{fullName(c)}</span>
-            <Badge tone={statusTone(o.status)}>{o.status}</Badge>
-          </div>
-          <div className="flex items-center justify-between gap-2 mt-1 text-sm">
-            <span className="text-slate2 truncate">{o.services.join(', ')}{o.extras.length?<span className="text-amber-600"> +{o.extras.length}</span>:''}</span>
-            <span className="text-slate2 shrink-0">{o.bagsCount} · {o.weight}kg</span>
-          </div>
-          <div className="flex items-center justify-between gap-2 mt-1.5 text-sm">
-            <span className="font-bold text-ink inline-flex items-center gap-2">{gbp(o.amount)}{o.needsPricing&&<span className="text-rose-500 font-normal text-xs">prov.</span>}{o.paidInAdvance&&<Badge tone="green">Paid</Badge>}</span>
-            <span className="text-slate2 text-xs inline-flex items-center gap-1"><Ic name="clock" size={13}/>Due {fmtDate(o.dueDate)}</span>
-          </div>
-        </button>);})}
+    {filter!=='needsPricing' && <p className="text-xs text-slate2 -mt-2 mb-3">Grouped by when they're due, most urgent first.</p>}
+
+    {total===0 && <div className="bg-white card rounded-2xl p-8 text-center text-slate2">{filter==='needsPricing'?'No orders awaiting pricing right now.':'No orders yet.'}</div>}
+
+    <div className="space-y-5">
+      {ORDER_SECTIONS.map(s=>{
+        const list = groups[s.key]; if(!list.length) return null;
+        const collapsible = s.key==='done';
+        const open = !collapsible || showDone;
+        return (
+          <div key={s.key}>
+            <div className={`flex items-center gap-2 pb-1.5 mb-2 border-b-2 ${s.accent}`}>
+              <span className={`w-2 h-2 rounded-full ${s.dot}`}></span>
+              <h4 className="font-extrabold text-ink text-sm">{s.title}</h4>
+              <span className={`text-[11px] font-bold px-1.5 py-0.5 rounded-full ${s.pill}`}>{list.length}</span>
+              {collapsible && <button onClick={()=>setShowDone(v=>!v)} className="ml-auto text-xs text-teal-dark font-semibold inline-flex items-center gap-1">
+                {open?'Hide':'Show'}<Ic name={open?'up':'down'} size={13}/></button>}
+            </div>
+            {open && <>
+              <p className="text-[11px] text-slate2 -mt-1 mb-2">{s.note}</p>
+              <div className="space-y-2">{list.map(card)}</div>
+            </>}
+          </div>);
+      })}
     </div>
-    <p className="text-xs text-slate2 mt-2">Tap an order to view details or amend the price. “prov.” = provisional, extras still to be added at the shop.</p>
+    <p className="text-xs text-slate2 mt-4">Tap an order to view details, edit it or amend the price. “prov.” = provisional, extras still to be added at the shop.</p>
     {sel && <OrderModal order={orders.find(o=>o.id===sel.id)||sel} rates={rates} onClose={()=>setSel(null)} onSave={updateOrder} addAudit={addAudit} onDelete={deleteOrder} onDispatch={onDispatch} jobs={jobs} drivers={drivers} user={user}/>}
   </div>);
 }
