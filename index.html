@@ -125,8 +125,21 @@ const INITIAL_RATES = {
 };
 const PACKAGING = ['Hanging', 'Hanging in box', 'Box only'];
 const EXTRA_TYPES = ['Dry cleaning', 'Bedding / duvet', 'Repairs & alterations'];
-const TIME_WINDOWS = ['09:00–10:00','10:00–11:00','11:00–12:00','12:00–13:00','13:00–14:00',
-  '14:00–15:00','15:00–16:00','16:00–17:00','17:00–18:00','18:00–19:00 (evening)'];
+// The round starts at 5pm and the driver works the stops in the quickest order,
+// so the standard booking has no fixed hour — only the exceptions need one.
+const EVENING_RUN = 'Evening run — from 5pm';
+const TIME_WINDOWS = [EVENING_RUN,
+  '17:00–18:00','18:00–19:00','19:00–20:00','20:00–21:00','21:00–22:00 (late)',
+  '09:00–10:00','10:00–11:00','11:00–12:00','12:00–13:00','13:00–14:00',
+  '14:00–15:00','15:00–16:00','16:00–17:00'];
+// grouped for the dropdown so the evening options come first
+const WINDOW_GROUPS = [
+  { label:'Standard',        opts:[EVENING_RUN] },
+  { label:'Evening — specific time', opts:['17:00–18:00','18:00–19:00','19:00–20:00','20:00–21:00','21:00–22:00 (late)'] },
+  { label:'Daytime — one-offs',      opts:['09:00–10:00','10:00–11:00','11:00–12:00','12:00–13:00','13:00–14:00','14:00–15:00','15:00–16:00','16:00–17:00'] },
+];
+const WindowOptions = () => WINDOW_GROUPS.map(g=>(
+  <optgroup key={g.label} label={g.label}>{g.opts.map(t=><option key={t}>{t}</option>)}</optgroup>));
 
 /* ------------------------------- dates -------------------------------- */
 // All dates are handled in LOCAL time. Using toISOString() here would shift the
@@ -254,31 +267,35 @@ function storeList(orders, scope, today) {
                    return scope==='today' ? d===today : d<=end; })
     .sort((a,b)=> (a.dueDate||'').localeCompare(b.dueDate||'') || (a.collectedAt||'').localeCompare(b.collectedAt||''));
 }
-// PURE reorder helpers (unit-tested)
-function reorderJobs(jobs, driverId, jobId, targetJobId) {
-  const mine = jobs.filter(j=>j.driverId===driverId).sort((a,b)=>a.seq-b.seq);
-  const others = jobs.filter(j=>j.driverId!==driverId);
+// PURE reorder helpers (unit-tested).
+// Every helper is scoped to one driver on ONE DAY — stops are numbered 1..n per
+// day, so a booking for tomorrow must never renumber today's run.
+const onRun = (j, driverId, day) => j.driverId===driverId && (!day || (j.runDate||TODAY)===day);
+function reorderJobs(jobs, driverId, jobId, targetJobId, day) {
+  const mine = jobs.filter(j=>onRun(j,driverId,day)).sort((a,b)=>a.seq-b.seq);
+  const others = jobs.filter(j=>!onRun(j,driverId,day));
   const from = mine.findIndex(j=>j.id===jobId);
   const to = mine.findIndex(j=>j.id===targetJobId);
   if (from<0 || to<0) return jobs;
   const arr = mine.slice(); const [moved] = arr.splice(from,1); arr.splice(to,0,moved);
   return [...others, ...arr.map((j,i)=>({...j, seq:i+1}))];
 }
-function moveJob(jobs, driverId, jobId, dir) {
-  const mine = jobs.filter(j=>j.driverId===driverId).sort((a,b)=>a.seq-b.seq);
+function moveJob(jobs, driverId, jobId, dir, day) {
+  const mine = jobs.filter(j=>onRun(j,driverId,day)).sort((a,b)=>a.seq-b.seq);
   const i = mine.findIndex(j=>j.id===jobId); const j = dir==='up'?i-1:i+1;
   if (i<0 || j<0 || j>=mine.length) return jobs;
-  return reorderJobs(jobs, driverId, jobId, mine[j].id);
+  return reorderJobs(jobs, driverId, jobId, mine[j].id, day);
 }
-function moveJobTo(jobs, jobId, toDriverId, targetJobId) {
+function moveJobTo(jobs, jobId, toDriverId, targetJobId, day) {
   const job = jobs.find(j=>j.id===jobId); if (!job) return jobs;
-  if (job.driverId===toDriverId) return targetJobId ? reorderJobs(jobs, toDriverId, jobId, targetJobId) : jobs;
+  const d = day || job.runDate || TODAY;
+  if (job.driverId===toDriverId) return targetJobId ? reorderJobs(jobs, toDriverId, jobId, targetJobId, d) : jobs;
   const fromDriverId = job.driverId;
-  const others = jobs.filter(j=>j.driverId!==fromDriverId && j.driverId!==toDriverId);
-  const source = jobs.filter(j=>j.driverId===fromDriverId && j.id!==jobId).sort((a,b)=>a.seq-b.seq).map((j,i)=>({...j, seq:i+1}));
-  const target = jobs.filter(j=>j.driverId===toDriverId).sort((a,b)=>a.seq-b.seq);
+  const others = jobs.filter(j=>!onRun(j,fromDriverId,d) && !onRun(j,toDriverId,d));
+  const source = jobs.filter(j=>onRun(j,fromDriverId,d) && j.id!==jobId).sort((a,b)=>a.seq-b.seq).map((j,i)=>({...j, seq:i+1}));
+  const target = jobs.filter(j=>onRun(j,toDriverId,d)).sort((a,b)=>a.seq-b.seq);
   let idx = targetJobId ? target.findIndex(j=>j.id===targetJobId) : target.length; if (idx<0) idx = target.length;
-  const nt = target.slice(); nt.splice(idx,0,{...job, driverId:toDriverId});
+  const nt = target.slice(); nt.splice(idx,0,{...job, driverId:toDriverId, runDate:d});
   return [...others, ...source, ...nt.map((j,i)=>({...j, seq:i+1}))];
 }
 
@@ -313,8 +330,8 @@ function optimiseStops(stops, depot){
   return order;
 }
 // reorder one driver's PENDING stops; already-done stops keep their place at the front
-function optimiseDriver(jobs, driverId){
-  const mine = jobs.filter(j=>j.driverId===driverId).sort((a,b)=>a.seq-b.seq);
+function optimiseDriver(jobs, driverId, day){
+  const mine = jobs.filter(j=>onRun(j,driverId,day)).sort((a,b)=>a.seq-b.seq);
   const doneJobs = mine.filter(j=>j.status!=='pending');
   const pending  = mine.filter(j=>j.status==='pending');
   const stops = pending.map(j=>{ const c=custById(j.customerId);
@@ -324,13 +341,13 @@ function optimiseDriver(jobs, driverId){
   const start = (lastDone&&lastDone.lat!=null) ? {lat:lastDone.lat,lng:lastDone.lng} : SHOP;
   const rank={}; optimiseStops(stops,start).forEach((s,i)=>rank[s.id]=i+1);
   const newPending=[...pending].sort((a,b)=>(rank[a.id]||99)-(rank[b.id]||99));
-  return [...jobs.filter(j=>j.driverId!==driverId),
+  return [...jobs.filter(j=>!onRun(j,driverId,day)),
           ...[...doneJobs,...newPending].map((j,i)=>({...j,seq:i+1}))];
 }
-function totalMiles(jobs, driverIds){
+function totalMiles(jobs, driverIds, day){
   let km=0;
   driverIds.forEach(did=>{
-    const pts=jobs.filter(j=>j.driverId===did).sort((a,b)=>a.seq-b.seq)
+    const pts=jobs.filter(j=>onRun(j,did,day)).sort((a,b)=>a.seq-b.seq)
       .map(j=>custById(j.customerId)).filter(c=>c&&c.lat!=null);
     if(pts.length) km+=routeLengthKm([SHOP,...pts,SHOP]);
   });
@@ -411,11 +428,11 @@ const ratesFromRows = (rows, settings) => ({
   items:  rows.filter(r=>r.kind==='item').sort((a,b)=>a.sort-b.sort).map(r=>({key:r.key,label:r.label,price:num(r.price),group:r.group_name})),
   minOrder: num(settings?.min_order ?? 25), firstOrderDiscount: num(settings?.first_order_discount ?? 0.10) });
 
-const fromJobRow = r => ({ id:r.id, driverId:r.driver_id, seq:num(r.seq), type:r.type, customerId:r.customer_id,
+const fromJobRow = r => ({ id:r.id, runDate:r.run_date||TODAY, driverId:r.driver_id, seq:num(r.seq), type:r.type, customerId:r.customer_id,
   orderId:r.order_id||undefined, window:r.time_window, status:r.status, packaging:r.packaging, instructions:r.instructions,
   returnDate:r.return_date||undefined, paidInAdvance:r.paid_in_advance, bags:num(r.bags), weight:num(r.weight),
   amount:num(r.amount), service:r.service, paymentMethod:r.payment_method, doneAt:r.done_at||undefined });
-const toJobRow = j => ({ id:j.id, run_date:TODAY, driver_id:j.driverId, seq:j.seq, type:j.type, customer_id:j.customerId,
+const toJobRow = j => ({ id:j.id, run_date:j.runDate||TODAY, driver_id:j.driverId, seq:j.seq, type:j.type, customer_id:j.customerId,
   order_id:j.orderId ?? null, time_window:j.window ?? null, status:j.status, packaging:j.packaging ?? null,
   instructions:j.instructions ?? null, return_date:j.returnDate ?? null, paid_in_advance:!!j.paidInAdvance,
   bags:j.bags ?? null, weight:j.weight ?? null, amount:j.amount ?? null, service:j.service ?? null,
@@ -583,13 +600,37 @@ function PortalPicker({ user, onPick, onLogout }) {
   );
 }
 
+// friendly label for a run date — "Today", "Tomorrow", else the date
+const dayLabel = iso => iso===TODAY ? 'Today' : iso===addDays(TODAY,1) ? 'Tomorrow'
+  : iso===addDays(TODAY,-1) ? 'Yesterday' : fmtDate(iso);
+function DayPicker({ day, setDay, count }) {
+  return (
+    <div className="bg-white card rounded-2xl p-2 flex items-center gap-2">
+      <button onClick={()=>setDay(addDays(day,-1))} title="Previous day"
+        className="w-9 h-9 rounded-lg border border-gray-200 flex items-center justify-center text-slate2 hover:bg-gray-50 shrink-0"><Ic name="left" size={18}/></button>
+      <div className="flex-1 text-center min-w-0">
+        <div className="font-extrabold text-ink leading-tight truncate">{dayLabel(day)}</div>
+        <div className="text-[11px] text-slate2 truncate">{fmtDate(day)}{count!=null?` · ${count} stop${count===1?'':'s'}`:''}</div>
+      </div>
+      <button onClick={()=>setDay(addDays(day,1))} title="Next day"
+        className="w-9 h-9 rounded-lg border border-gray-200 flex items-center justify-center text-slate2 hover:bg-gray-50 shrink-0"><Ic name="right" size={18}/></button>
+      {day!==TODAY && <button onClick={()=>setDay(TODAY)} className="text-xs font-semibold text-teal-dark px-2 shrink-0">Today</button>}
+    </div>);
+}
 function DriverApp({ driver, go, jobs, setJobs, rates, addAudit, addOrder, updateOrder }) {
   const [openId,setOpenId]=useState(null);
-  const myJobs = jobs.filter(j=>j.driverId===driver.id).sort((a,b)=>a.seq-b.seq);
+  const [day,setDay]=useState(TODAY);
+  const myJobs = jobs.filter(j=>j.driverId===driver.id && (j.runDate||TODAY)===day).sort((a,b)=>a.seq-b.seq);
   const nextPendingId = (myJobs.find(j=>j.status==='pending')||{}).id;
   const done = myJobs.filter(j=>j.status!=='pending').length;
-  const openJob = openId ? myJobs.find(j=>j.id===openId) : null;
-  useEffect(()=>{ window.scrollTo(0,0); },[openId]);  // opening/closing a stop starts at the top
+  const openJob = openId ? jobs.find(j=>j.id===openId) : null;
+  useEffect(()=>{ window.scrollTo(0,0); },[openId,day]);  // opening/closing a stop starts at the top
+  // how many stops are waiting on other days, so nothing gets silently missed
+  const otherDays = useMemo(()=>{
+    const m={}; jobs.forEach(j=>{ if(j.driverId!==driver.id||j.status!=='pending') return;
+      const d=j.runDate||TODAY; if(d!==day) m[d]=(m[d]||0)+1; });
+    return Object.entries(m).sort((a,b)=>a[0].localeCompare(b[0]));
+  },[jobs,driver.id,day]);
 
   const completeCollection = (job, data) => {
     setJobs(prev => prev.map(j => j.id===job.id ? {...j, status:'done', doneAt:now(), ...data} : j));
@@ -633,10 +674,17 @@ function DriverApp({ driver, go, jobs, setJobs, rates, addAudit, addOrder, updat
       <div className="max-w-2xl mx-auto p-4">
         {!openJob && <>
           <div className="flex items-center justify-between mb-1">
-            <h2 className="text-xl font-extrabold text-ink">Today’s run</h2>
+            <h2 className="text-xl font-extrabold text-ink">{day===TODAY?'Today’s run':`${dayLabel(day)}’s run`}</h2>
             <Badge tone="grey">{done}/{myJobs.length} done</Badge>
           </div>
           <p className="text-slate2 text-sm mb-3">In driving order. <span className="text-rose-500 font-semibold">Pink = collection</span>, white = delivery. Next job highlighted; done jobs greyed out.</p>
+          <div className="mb-3"><DayPicker day={day} setDay={setDay} count={myJobs.length}/></div>
+          {otherDays.length>0 && <div className="mb-3 flex flex-wrap gap-1.5">
+            {otherDays.map(([d,n])=>(
+              <button key={d} onClick={()=>setDay(d)} className="px-2.5 py-1 rounded-full text-[11px] font-semibold bg-teal-light text-teal-dark">
+                {dayLabel(d)} · {n} stop{n===1?'':'s'}</button>))}
+          </div>}
+          {myJobs.length===0 && <div className="bg-white card rounded-2xl p-8 text-center text-slate2">No stops on {dayLabel(day).toLowerCase()}’s run.</div>}
           <div className="space-y-3">
             {myJobs.map(job => {
               const c = custById(job.customerId);
@@ -899,7 +947,8 @@ function OrderModal({ order, rates, onClose, onSave, addAudit, onDelete, onDispa
   const [pricing,setPricing]=useState(order.needsPricing);
   const [added,setAdded]=useState(order.addedItems||{});
   const [dispDriver,setDispDriver]=useState((driverStaff[0]&&driverStaff[0].id)||'');
-  const [dispWindow,setDispWindow]=useState('18:00–19:00 (evening)');
+  const [dispWindow,setDispWindow]=useState(EVENING_RUN);
+  const [dispDay,setDispDay]=useState(TODAY);
   const groups = useMemo(()=>{ const g={}; rates.items.forEach(r=>{(g[r.group]=g[r.group]||[]).push(r)}); return g; },[rates]);
   const calc = useMemo(()=>orderTotal(rates, order.weightCharge, added, order.firstOrder), [rates,order,added]);
 
@@ -955,7 +1004,7 @@ function OrderModal({ order, rates, onClose, onSave, addAudit, onDelete, onDispa
   };
   const advance = () => { const ns=NEXT_STATUS[order.status]; if(!ns) return;
     onSave(order.id, { status:ns }); addAudit(`${actor} marked ${fullName(c)}'s order ${ns}`); };
-  const dispatch = () => { if(!dispDriver) return; onDispatch(order, dispDriver, dispWindow); onClose(); };
+  const dispatch = () => { if(!dispDriver) return; onDispatch(order, dispDriver, dispWindow, dispDay); onClose(); };
 
   return (
     <div className="fixed inset-0 bg-black/40 flex items-center justify-center p-4 z-50" onClick={onClose}>
@@ -1032,9 +1081,10 @@ function OrderModal({ order, rates, onClose, onSave, addAudit, onDelete, onDispa
                 <select value={dispDriver} onChange={e=>setDispDriver(e.target.value)} className={inputCls+' !py-1.5'}>
                   {driverStaff.map(d=><option key={d.id} value={d.id}>{d.name}</option>)}</select>
                 <select value={dispWindow} onChange={e=>setDispWindow(e.target.value)} className={inputCls+' !py-1.5'}>
-                  {TIME_WINDOWS.map(t=><option key={t}>{t}</option>)}</select>
+                  <WindowOptions/></select>
+                <div className="col-span-2"><input type="date" value={dispDay} min={TODAY} onChange={e=>setDispDay(e.target.value)} className={inputCls+' !py-1.5'}/></div>
               </div>
-              <Btn kind="primary" icon="truck" className="w-full mt-2" onClick={dispatch}>Add to driver’s run</Btn>
+              <Btn kind="primary" icon="truck" className="w-full mt-2" onClick={dispatch}>Add to {dayLabel(dispDay).toLowerCase()}’s run</Btn>
             </div>}
             </>)}
           </div>
@@ -1250,12 +1300,15 @@ function IntakeModal({ drivers, onClose, onCreate, customers, addCustomer }) {
   const driverStaff = (drivers||[]).filter(d=>hasRole(d,'driver'));
   const [q,setQ]=useState(''); const [customerId,setCustomerId]=useState(null); const [addingCust,setAddingCust]=useState(false);
   const [type,setType]=useState('collection'); const [driverId,setDriverId]=useState((driverStaff[0]||{}).id);
+  const [runDate,setRunDate]=useState(TODAY);   // which day's run this booking goes on
   const [returnDate,setReturnDate]=useState(addDays(TODAY,2)); const [packaging,setPackaging]=useState('Hanging');
-  const [instructions,setInstructions]=useState(''); const [paid,setPaid]=useState(false); const [window_,setWindow]=useState('16:00–17:00');
+  const [instructions,setInstructions]=useState(''); const [paid,setPaid]=useState(false); const [window_,setWindow]=useState(EVENING_RUN);
+  // keep the return-by date sensible when the collection is pushed to a later day
+  useEffect(()=>{ setReturnDate(rd => rd < addDays(runDate,1) ? addDays(runDate,2) : rd); },[runDate]);
   const matches = q.trim().length<1 ? [] : (customers||[]).filter(c=>(fullName(c)+' '+c.addr).toLowerCase().includes(q.toLowerCase())).slice(0,6);
   const chosen = customerId ? custById(customerId) : null;
   const create=()=>{ if(!customerId)return;
-    onCreate({ id:uuid(), driverId, type, customerId, window:window_, status:'pending', packaging, instructions,
+    onCreate({ id:uuid(), driverId, type, customerId, window:window_, status:'pending', packaging, instructions, runDate,
       returnDate: type==='collection'?returnDate:undefined, paidInAdvance:paid,
       ...(type==='delivery'?{bags:1,weight:0,amount:0,service:'—',paymentMethod:'Cash'}:{}) }); onClose(); };
   return (
@@ -1287,12 +1340,19 @@ function IntakeModal({ drivers, onClose, onCreate, customers, addCustomer }) {
             <option value="collection">Collection</option><option value="delivery">Delivery</option></select></Field>
           <Field label="Assign driver"><select value={driverId} onChange={e=>setDriverId(e.target.value)} className={inputCls+' mt-1'}>
             {driverStaff.map(d=><option key={d.id} value={d.id}>{d.name}</option>)}</select></Field>
-          {type==='collection' && <Field label="Return by"><input type="date" value={returnDate} onChange={e=>setReturnDate(e.target.value)} className={inputCls+' mt-1'}/></Field>}
+          <div className="col-span-2"><Field label={type==='collection'?'Collection date':'Delivery date'}>
+            <input type="date" value={runDate} min={TODAY} onChange={e=>setRunDate(e.target.value)} className={inputCls+' mt-1'}/>
+            <div className="flex gap-1.5 mt-1.5">
+              {[['Today',TODAY],['Tomorrow',addDays(TODAY,1)],[fmtDate(addDays(TODAY,2)).split(' ')[0],addDays(TODAY,2)]].map(([l,d])=>(
+                <button key={d} onClick={()=>setRunDate(d)} className={`px-2.5 py-1 rounded-full text-[11px] font-semibold border ${runDate===d?'bg-teal text-white border-teal':'bg-white text-slate2 border-gray-200'}`}>{l}</button>))}
+            </div></Field></div>
           <Field label="Time window"><select value={window_} onChange={e=>setWindow(e.target.value)} className={inputCls+' mt-1'}>
-            {TIME_WINDOWS.map(t=><option key={t}>{t}</option>)}</select></Field>
+            <WindowOptions/></select></Field>
+          {type==='collection' && <Field label="Return by"><input type="date" value={returnDate} min={runDate} onChange={e=>setReturnDate(e.target.value)} className={inputCls+' mt-1'}/></Field>}
           <div className="col-span-2"><Field label="Packaging"><select value={packaging} onChange={e=>setPackaging(e.target.value)} className={inputCls+' mt-1'}>
             {PACKAGING.map(p=><option key={p}>{p}</option>)}</select></Field></div>
         </div>
+        {runDate!==TODAY && <p className="text-[11px] text-teal-dark font-semibold mt-2 inline-flex items-center gap-1"><Ic name="clock" size={13}/>Booked for {fmtDate(runDate)} — it'll appear on that day's run, not today's.</p>}
         <div className="mt-3"><Field label="Delivery / collection instructions (shown to driver)">
           <textarea value={instructions} onChange={e=>setInstructions(e.target.value)} rows="2" placeholder="e.g. doesn't mind doorstep collection" className={inputCls+' mt-1'}></textarea></Field></div>
         <label className="flex items-center gap-2 mt-3 text-sm text-ink"><input type="checkbox" checked={paid} onChange={e=>setPaid(e.target.checked)} className="accent-teal"/> Paid in advance</label>
@@ -1733,30 +1793,45 @@ function Logistics({ jobs, setJobs, drivers, onNew, deleteJob, customers, user }
   const [mapDriver,setMapDriver]=useState('all');
   const [saving,setSaving]=useState(null);
   const [drag,setDrag]=useState(null);
+  const [day,setDay]=useState(TODAY);
+  useEffect(()=>{ setSaving(null); },[day]);
+  const dayJobs = useMemo(()=>jobs.filter(j=>(j.runDate||TODAY)===day), [jobs,day]);
   const targets = mapDriver==='all' ? driverStaff.map(d=>d.id) : [mapDriver];
-  const roundMiles = useMemo(()=>totalMiles(jobs,targets), [jobs,mapDriver,drivers]);
-  const noLoc = jobs.filter(j=>targets.includes(j.driverId) && j.status==='pending').filter(j=>{const c=custById(j.customerId); return !c||c.lat==null;}).length;
+  const roundMiles = useMemo(()=>totalMiles(jobs,targets,day), [jobs,mapDriver,drivers,day]);
+  const noLoc = dayJobs.filter(j=>targets.includes(j.driverId) && j.status==='pending').filter(j=>{const c=custById(j.customerId); return !c||c.lat==null;}).length;
+  // stops booked on other days, so Mark can see what's coming without hunting
+  const otherDays = useMemo(()=>{
+    const m={}; jobs.forEach(j=>{ if(j.status!=='pending') return; const d=j.runDate||TODAY; if(d!==day) m[d]=(m[d]||0)+1; });
+    return Object.entries(m).sort((a,b)=>a[0].localeCompare(b[0])).slice(0,6);
+  },[jobs,day]);
   const optimise = () => {
-    const before = totalMiles(jobs,targets);
-    let next = jobs; targets.forEach(did=>{ next = optimiseDriver(next,did); });
-    const after = totalMiles(next,targets);
+    const before = totalMiles(jobs,targets,day);
+    let next = jobs; targets.forEach(did=>{ next = optimiseDriver(next,did,day); });
+    const after = totalMiles(next,targets,day);
     setJobs(next); setSaving({before,after});
   };
-  const move=(driverId,jobId,dir)=>setJobs(prev=>moveJob(prev,driverId,jobId,dir));
-  const dropOnJob=(toDriverId,targetId)=>{ if(drag) setJobs(prev=>moveJobTo(prev,drag.jobId,toDriverId,targetId)); setDrag(null); };
-  const dropOnColumn=(toDriverId)=>{ if(drag) setJobs(prev=>moveJobTo(prev,drag.jobId,toDriverId,null)); setDrag(null); };
-  const reassign=(jobId,toDriverId)=>setJobs(prev=>moveJobTo(prev,jobId,toDriverId,null));
+  const move=(driverId,jobId,dir)=>setJobs(prev=>moveJob(prev,driverId,jobId,dir,day));
+  const dropOnJob=(toDriverId,targetId)=>{ if(drag) setJobs(prev=>moveJobTo(prev,drag.jobId,toDriverId,targetId,day)); setDrag(null); };
+  const dropOnColumn=(toDriverId)=>{ if(drag) setJobs(prev=>moveJobTo(prev,drag.jobId,toDriverId,null,day)); setDrag(null); };
+  const reassign=(jobId,toDriverId)=>setJobs(prev=>moveJobTo(prev,jobId,toDriverId,null,day));
   return (
     <div>
       <div className="flex items-center justify-between mb-1 flex-wrap gap-2">
         <h3 className="font-bold text-ink">Logistics &amp; route planning</h3>
         <Btn kind="rose" icon="plus" onClick={onNew} className="!py-1.5 !px-3">New job</Btn>
       </div>
-      <p className="text-xs text-slate2 mb-3">Each driver's collections + deliveries for today. Drag a card to reorder <b>or drop it on the other driver</b> to reassign — or use the <b>Move to</b> menu. Chevrons nudge within a driver. <span className="text-rose-500 font-semibold">Pink = collection</span>, white = delivery.</p>
+      <p className="text-xs text-slate2 mb-3">Each driver's collections + deliveries for the chosen day. Drag a card to reorder <b>or drop it on the other driver</b> to reassign — or use the <b>Move to</b> menu. Chevrons nudge within a driver. <span className="text-rose-500 font-semibold">Pink = collection</span>, white = delivery.</p>
+      <div className="mb-3"><DayPicker day={day} setDay={setDay} count={dayJobs.length}/></div>
+      {otherDays.length>0 && <div className="mb-3 flex flex-wrap gap-1.5">
+        <span className="text-[11px] text-slate2 self-center">Also booked:</span>
+        {otherDays.map(([d,n])=>(
+          <button key={d} onClick={()=>setDay(d)} className="px-2.5 py-1 rounded-full text-[11px] font-semibold bg-teal-light text-teal-dark">
+            {dayLabel(d)} · {n}</button>))}
+      </div>}
 
       <div className="bg-white card rounded-2xl p-3 mb-4">
         <div className="flex items-center justify-between mb-2 flex-wrap gap-2">
-          <h4 className="font-bold text-ink text-sm">Today’s stops on the map</h4>
+          <h4 className="font-bold text-ink text-sm">{dayLabel(day)}’s stops on the map</h4>
           <div className="flex items-center gap-2 flex-wrap">
             <div className="flex items-center gap-1 bg-gray-50 rounded-xl p-1">
               {[['all','All drivers'],...driverStaff.map(d=>[d.id,d.name.split(' ')[0]])].map(([k,l])=>(
@@ -1766,7 +1841,7 @@ function Logistics({ jobs, setJobs, drivers, onNew, deleteJob, customers, user }
             <Btn kind="primary" icon="pin" onClick={optimise} className="!py-1.5 !px-3 text-xs">Suggest best order</Btn>
           </div>
         </div>
-        <RouteMap jobs={jobs} drivers={driverStaff} filterDriver={mapDriver} customers={customers}/>
+        <RouteMap jobs={dayJobs} drivers={driverStaff} filterDriver={mapDriver} customers={customers}/>
         <div className="flex items-center justify-between gap-3 flex-wrap mt-2">
           <p className="text-[11px] text-slate2 flex-1 min-w-[220px]">
             <span className="text-rose-500 font-semibold">Pink = collection</span>, <span className="text-teal-dark font-semibold">blue = delivery</span>,
@@ -1781,7 +1856,7 @@ function Logistics({ jobs, setJobs, drivers, onNew, deleteJob, customers, user }
       </div>
       <div className="grid md:grid-cols-2 gap-4">
         {driverStaff.map(d=>{
-          const list=jobs.filter(j=>j.driverId===d.id).sort((a,b)=>a.seq-b.seq);
+          const list=dayJobs.filter(j=>j.driverId===d.id).sort((a,b)=>a.seq-b.seq);
           const isDropTarget = drag && drag.fromDriverId!==d.id;
           return (
             <div key={d.id}
@@ -1886,12 +1961,14 @@ function App() {
   const addOrder=useCallback(o=>{ setOrdersState(prev=>[o,...prev]); saveOrder(o); },[]);
   const updateOrder=useCallback((id,patch)=>setOrdersState(prev=>{ const next=prev.map(o=>o.id===id?{...o,...patch}:o);
     const upd=next.find(o=>o.id===id); if(upd) saveOrder(upd); return next; }),[]);
-  const reseqDriver=(arr,did)=>{ const mine=arr.filter(j=>j.driverId===did).sort((a,b)=>a.seq-b.seq).map((j,i)=>({...j,seq:i+1}));
-    if(db) mine.forEach(j=>db.from('jobs').upsert(toJobRow(j)).then(logErr('reseq'))); return [...arr.filter(j=>j.driverId!==did),...mine]; };
+  // stops are numbered per driver PER DAY, so a booking for tomorrow starts at 1 again
+  const reseqDriver=(arr,did,day)=>{ const on=j=>j.driverId===did && (!day || (j.runDate||TODAY)===day);
+    const mine=arr.filter(on).sort((a,b)=>a.seq-b.seq).map((j,i)=>({...j,seq:i+1}));
+    if(db) mine.forEach(j=>db.from('jobs').upsert(toJobRow(j)).then(logErr('reseq'))); return [...arr.filter(j=>!on(j)),...mine]; };
   const deleteJob=useCallback(job=>{
     setJobsState(prev=>{ const rest=prev.filter(j=>j.id!==job.id);
       if(db) db.from('jobs').delete().eq('id',job.id).then(logErr('deleteJob'));
-      return reseqDriver(rest, job.driverId); });
+      return reseqDriver(rest, job.driverId, job.runDate||TODAY); });
     // cancelling a booking that was never collected removes its pending order too
     if(job.orderId) setOrdersState(prev=>{ const o=prev.find(x=>x.id===job.orderId);
       if(o && o.status==='Pending Collection'){ if(db) db.from('orders').delete().eq('id',job.orderId).then(logErr('cancelOrder')); return prev.filter(x=>x.id!==job.orderId); }
@@ -1922,11 +1999,12 @@ function App() {
     if(db) db.from('customers').delete().eq('id',id).then(r=>{ if(r&&r.error) reportErr('delete customer', r.error); });
     if(c) addAudit(`${actor()} deleted customer ${fullName(c)}`);
   },[]);
-  const dispatchDelivery=useCallback((order, driverId, window)=>{
-    const nj={ id:uuid(), driverId, type:'delivery', customerId:order.customerId, orderId:order.id, window, status:'pending',
+  const dispatchDelivery=useCallback((order, driverId, window, day)=>{
+    const runDate = day || TODAY;
+    const nj={ id:uuid(), driverId, type:'delivery', customerId:order.customerId, orderId:order.id, window, status:'pending', runDate,
       packaging:order.packaging, bags:order.bagsCount, weight:order.weight, amount:order.amount,
       service:(order.services||[]).join(', ')||'—', paymentMethod:order.paymentMethod, paidInAdvance:order.paidInAdvance };
-    setJobsState(prev=>{ const n=prev.filter(x=>x.driverId===driverId).length; const job={...nj,seq:n+1};
+    setJobsState(prev=>{ const n=prev.filter(x=>x.driverId===driverId && (x.runDate||TODAY)===runDate).length; const job={...nj,seq:n+1};
       if(db) db.from('jobs').insert(toJobRow(job)).then(r=>{ if(r&&r.error) reportErr('dispatch job', r.error); });
       return [...prev, job]; });
     updateOrder(order.id, { status:'Out for delivery' });
@@ -1940,7 +2018,7 @@ function App() {
       if(!linked.length) return prev; const ids=new Set(linked.map(j=>j.id));
       if(db) linked.forEach(j=>db.from('jobs').delete().eq('id',j.id).then(logErr('deleteLinkedJob')));
       let next=prev.filter(j=>!ids.has(j.id));
-      [...new Set(linked.map(j=>j.driverId))].forEach(did=>{ next=reseqDriver(next,did); });
+      [...new Set(linked.map(j=>j.driverId+'|'+(j.runDate||TODAY)))].forEach(k=>{ const [did,day]=k.split('|'); next=reseqDriver(next,did,day); });
       return next; });
   },[]);
   const addJob=useCallback(j=>{
@@ -1949,11 +2027,12 @@ function App() {
     const order = isCol ? { id:orderId, customerId:j.customerId, services:[], extras:[], needsPricing:false, addedItems:{}, firstOrder:false,
       bagsCount:0, bagWeights:[], weight:0, weightCharge:0, amount:0, initialAmount:0,
       packaging:j.packaging, paymentMethod:'—', paidInAdvance:j.paidInAdvance, collectedDate:null, collectedAt:null,
-      dueDate:j.returnDate||addDays(TODAY,2), status:'Pending Collection', notes:j.instructions } : null;
+      dueDate:j.returnDate||addDays(j.runDate||TODAY,2), status:'Pending Collection', notes:j.instructions } : null;
     if (order) setOrdersState(prev=>[order,...prev]);
     setJobsState(prev=>{
-      const n=prev.filter(x=>x.driverId===j.driverId).length;
-      const nj={...j, ...(orderId?{orderId}:null), seq:n+1};
+      const day=j.runDate||TODAY;
+      const n=prev.filter(x=>x.driverId===j.driverId && (x.runDate||TODAY)===day).length;
+      const nj={...j, runDate:day, ...(orderId?{orderId}:null), seq:n+1};
       // persist: order first (if any), THEN the job — awaited so the order exists before the job's FK
       (async()=>{
         if(!db) return;
