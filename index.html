@@ -366,9 +366,9 @@ const num = v => v==null ? v : Number(v);
 
 // map between the app's shapes and the database rows
 const fromCustomerRow = r => ({ id:r.id, title:r.title, first:r.first_name, last:r.last_name, addr:r.address,
-  mob:r.mobile, email:r.email, lat:num(r.lat), lng:num(r.lng) });
+  mob:r.mobile, mob2:r.mobile2||'', email:r.email, lat:num(r.lat), lng:num(r.lng) });
 const toCustomerRow = c => ({ id:c.id, title:c.title, first_name:c.first, last_name:c.last, address:c.addr,
-  mobile:c.mob, email:c.email, lat:c.lat ?? null, lng:c.lng ?? null });
+  mobile:c.mob, mobile2:c.mob2 || null, email:c.email, lat:c.lat ?? null, lng:c.lng ?? null });
 const fromDriverRow = r => ({ id:r.id, name:r.name, pin:r.pin, roles:(r.roles&&r.roles.length?r.roles:['driver']), canDelete:!!r.can_delete, active:r.active!==false });
 const hasRole = (u,role) => !!(u && u.roles && u.roles.includes(role));
 const mayDelete = u => hasRole(u,'admin') || !!(u && u.canDelete);
@@ -400,13 +400,16 @@ const normTxt = s => (s||'').toLowerCase().replace(/[^a-z0-9]/g,'');
 const normName= c => normTxt(((c.first||'')+' '+(c.last||'')));
 // house number + postcode is the reliable part of an address ("4 Grove Rd" vs "4 Grove Road")
 const addrKey = (line1,pcode) => { const num=((line1||'').match(/\d+[a-z]?/i)||[''])[0].toLowerCase(); return normTxt(pcode)+'|'+num; };
+// every number we hold for someone, normalised and de-duped
+const allNums = c => [...new Set([normMob(c.mob), normMob(c.mob2)].filter(Boolean))];
 // returns the matching customer plus why it matched, or null
 function findDuplicate(list, cand){
-  const mob=normMob(cand.mob), nm=normName(cand), ak=addrKey(cand.line1,cand.pc);
+  const nums=allNums(cand), nm=normName(cand), ak=addrKey(cand.line1,cand.pc);
   for(const c of list){
     if(cand.id && c.id===cand.id) continue;
-    const cMob=normMob(c.mob), cParts=splitAddr(c.addr||''), cAk=addrKey(cParts.line1,cParts.pc);
-    if(mob && cMob && mob===cMob) return { c, why:'the same mobile number' };
+    const cNums=allNums(c), cParts=splitAddr(c.addr||''), cAk=addrKey(cParts.line1,cParts.pc);
+    // any number in common counts — primary or secondary, either way round
+    if(nums.some(n=>cNums.includes(n))) return { c, why:'the same contact number' };
     if(nm && normName(c)===nm && ak===cAk && normTxt(cand.pc)) return { c, why:'the same name and address' };
   }
   return null;
@@ -733,10 +736,14 @@ function DirectionsBtn({ addr }) {
     className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl text-sm font-semibold bg-white border border-gray-200 text-ink hover:bg-gray-50">
     <Ic name="pin" size={16}/>Directions</a>;
 }
-function CallBtn({ mob }) {
-  return <a href={`tel:${mob.replace(/\s/g,'')}`}
-    className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl text-sm font-semibold bg-white border border-gray-200 text-ink hover:bg-gray-50">
-    <Ic name="phone" size={16}/>Call</a>;
+function CallBtn({ mob, mob2 }) {
+  const nums=[mob,mob2].filter(Boolean);
+  if(!nums.length) return null;
+  const btn="inline-flex items-center justify-center gap-1.5 px-4 py-2 rounded-xl text-sm font-semibold bg-white border border-gray-200 text-ink hover:bg-gray-50";
+  return (<div className="flex flex-col gap-1.5">
+    <a href={`tel:${nums[0].replace(/\s/g,'')}`} className={btn}><Ic name="phone" size={16}/>Call</a>
+    {nums[1] && <a href={`tel:${nums[1].replace(/\s/g,'')}`} className={btn+" !py-1 !text-xs"} title={nums[1]}><Ic name="phone" size={13}/>2nd no.</a>}
+  </div>);
 }
 
 function CollectionForm({ job, rates, onBack, onConfirm, onNoAnswer }) {
@@ -787,7 +794,7 @@ function CollectionForm({ job, rates, onBack, onConfirm, onNoAnswer }) {
             <p className="text-sm text-slate2">{c.addr}</p>
             {job.returnDate && <p className="text-xs text-slate2 mt-0.5">Return {fmtDate(job.returnDate)}</p>}
           </div>
-          <div className="flex flex-col gap-2 shrink-0"><DirectionsBtn addr={c.addr}/><CallBtn mob={c.mob}/></div>
+          <div className="flex flex-col gap-2 shrink-0"><DirectionsBtn addr={c.addr}/><CallBtn mob={c.mob} mob2={c.mob2}/></div>
         </div>
         {job.instructions && <div className="text-xs text-rose-700 mt-3 bg-rose-50 rounded-lg px-2 py-1.5 inline-flex items-start gap-1"><Ic name="note" size={14}/><span>Boss note: {job.instructions}</span></div>}
 
@@ -875,7 +882,9 @@ function CollectionForm({ job, rates, onBack, onConfirm, onNoAnswer }) {
 
 function DeliveryView({ job, onBack, onConfirm, onNoAnswer }) {
   const c = custById(job.customerId);
-  const [payment,setPayment]=useState('Cash');
+  // start on whatever the booking said, so the driver just confirms
+  const booked = job.paymentMethod==='Online' ? 'Online' : 'Cash';
+  const [payment,setPayment]=useState(booked);
   const paid = job.paidInAdvance;
   return (
     <div>
@@ -885,7 +894,7 @@ function DeliveryView({ job, onBack, onConfirm, onNoAnswer }) {
           <div><TypeBadge type="delivery"/>
             <h3 className="text-lg font-bold text-ink mt-1">{fullName(c)}</h3>
             <p className="text-sm text-slate2">{c.addr}</p></div>
-          <div className="flex flex-col gap-2 shrink-0"><DirectionsBtn addr={c.addr}/><CallBtn mob={c.mob}/></div>
+          <div className="flex flex-col gap-2 shrink-0"><DirectionsBtn addr={c.addr}/><CallBtn mob={c.mob} mob2={c.mob2}/></div>
         </div>
         <div className="bg-gray-50 rounded-xl p-4 mt-4 text-sm text-ink space-y-1">
           <div className="flex justify-between"><span className="text-slate2">Service</span><span>{job.service}</span></div>
@@ -1303,6 +1312,10 @@ function IntakeModal({ drivers, onClose, onCreate, customers, addCustomer }) {
   const [runDate,setRunDate]=useState(TODAY);   // which day's run this booking goes on
   const [returnDate,setReturnDate]=useState(addDays(TODAY,2)); const [packaging,setPackaging]=useState('Hanging');
   const [instructions,setInstructions]=useState(''); const [paid,setPaid]=useState(false); const [window_,setWindow]=useState(EVENING_RUN);
+  // delivery-only bookings: what's owed and how it's being settled
+  const [amount,setAmount]=useState(''); const [payMethod,setPayMethod]=useState('Cash');
+  const [service,setService]=useState(''); const [bags,setBags]=useState('1');
+  const isDelivery = type==='delivery';
   // keep the return-by date sensible when the collection is pushed to a later day
   useEffect(()=>{ setReturnDate(rd => rd < addDays(runDate,1) ? addDays(runDate,2) : rd); },[runDate]);
   const matches = q.trim().length<1 ? [] : (customers||[]).filter(c=>(fullName(c)+' '+c.addr).toLowerCase().includes(q.toLowerCase())).slice(0,6);
@@ -1310,7 +1323,9 @@ function IntakeModal({ drivers, onClose, onCreate, customers, addCustomer }) {
   const create=()=>{ if(!customerId)return;
     onCreate({ id:uuid(), driverId, type, customerId, window:window_, status:'pending', packaging, instructions, runDate,
       returnDate: type==='collection'?returnDate:undefined, paidInAdvance:paid,
-      ...(type==='delivery'?{bags:1,weight:0,amount:0,service:'—',paymentMethod:'Cash'}:{}) }); onClose(); };
+      ...(isDelivery?{ bags:parseInt(bags)||1, weight:0, amount:parseFloat(amount)||0,
+                       service:service.trim()||'—', paymentMethod: paid?'Paid in advance':payMethod }:{}) });
+    onClose(); };
   return (
     <div className="fixed inset-0 bg-black/40 flex items-center justify-center p-4 z-50" onClick={onClose}>
       <div className="bg-white rounded-2xl p-6 w-full max-w-md max-h-[92vh] overflow-y-auto" onClick={e=>e.stopPropagation()}>
@@ -1318,7 +1333,16 @@ function IntakeModal({ drivers, onClose, onCreate, customers, addCustomer }) {
           <h3 className="text-lg font-bold text-ink">New job from WhatsApp / SMS</h3>
           <button onClick={onClose} className="text-slate2 hover:text-ink"><Ic name="close" size={20}/></button>
         </div>
-        <p className="text-xs text-slate2 mb-4">Log a booking so it appears in the driver's run. Price is captured on collection — no need to enter it here.</p>
+        <p className="text-xs text-slate2 mb-3">Log a booking so it appears in the driver's run.</p>
+        <div className="bg-gray-100 rounded-xl p-1 flex mb-3">
+          {[['collection','Collection','truck'],['delivery','Delivery','box']].map(([k,l,ic])=>(
+            <button key={k} onClick={()=>setType(k)}
+              className={`flex-1 px-3 py-2 rounded-lg text-sm font-semibold inline-flex items-center justify-center gap-1.5 transition ${type===k?(k==='collection'?'bg-rose-500 text-white':'bg-teal text-white'):'text-slate2 hover:bg-white/60'}`}>
+              <Ic name={ic} size={15}/>{l}</button>))}
+        </div>
+        <p className="text-[11px] text-slate2 mb-3">{isDelivery
+          ? 'Dropping finished laundry back to a customer. Enter what’s owed and how they’re paying.'
+          : 'Picking laundry up. Price is captured at the door — no need to enter it here.'}</p>
         <Field label="Find customer by name or address">
           <div className="relative mt-1">
             <span className="absolute left-3 top-1/2 -translate-y-1/2 text-slate2"><Ic name="search" size={16}/></span>
@@ -1329,17 +1353,15 @@ function IntakeModal({ drivers, onClose, onCreate, customers, addCustomer }) {
           <button key={c.id} onClick={()=>{setCustomerId(c.id);setQ(fullName(c));}} className="w-full text-left px-3 py-2 hover:bg-gray-50 border-b border-gray-100 text-sm">
             <div className="font-medium text-ink">{fullName(c)}</div><div className="text-slate2 text-xs">{c.addr}</div></button>))}
         {chosen && <div className="bg-teal-light rounded-xl px-3 py-2 mt-2 text-sm">
-          <div className="font-semibold text-ink">{fullName(chosen)}</div><div className="text-slate2 text-xs">{chosen.addr} · {chosen.mob}</div></div>}
+          <div className="font-semibold text-ink">{fullName(chosen)}</div><div className="text-slate2 text-xs">{chosen.addr}{[chosen.mob,chosen.mob2].filter(Boolean).map(n=>' · '+n).join('')}</div></div>}
         {q.trim() && !chosen && matches.length===0 &&
           <button onClick={()=>setAddingCust(true)} className="w-full text-left mt-1 px-3 py-2 rounded-lg bg-teal-light text-teal-dark text-sm font-semibold inline-flex items-center gap-1.5"><Ic name="plus" size={15}/>Add “{q.trim()}” as a new customer</button>}
         {!chosen && q.trim()==='' &&
           <button onClick={()=>setAddingCust(true)} className="text-teal-dark text-xs font-semibold mt-1 inline-flex items-center gap-1"><Ic name="plus" size={13}/>New customer</button>}
         {addingCust && <AddCustomerModal initialName={q.trim()} onClose={(c)=>{ setAddingCust(false); if(c){ setCustomerId(c.id); setQ(fullName(c)); } }} onCreate={addCustomer} customers={customers}/>}
         <div className="grid grid-cols-2 gap-3 mt-4">
-          <Field label="Type"><select value={type} onChange={e=>setType(e.target.value)} className={inputCls+' mt-1'}>
-            <option value="collection">Collection</option><option value="delivery">Delivery</option></select></Field>
-          <Field label="Assign driver"><select value={driverId} onChange={e=>setDriverId(e.target.value)} className={inputCls+' mt-1'}>
-            {driverStaff.map(d=><option key={d.id} value={d.id}>{d.name}</option>)}</select></Field>
+          <div className="col-span-2"><Field label="Assign driver"><select value={driverId} onChange={e=>setDriverId(e.target.value)} className={inputCls+' mt-1'}>
+            {driverStaff.map(d=><option key={d.id} value={d.id}>{d.name}</option>)}</select></Field></div>
           <div className="col-span-2"><Field label={type==='collection'?'Collection date':'Delivery date'}>
             <input type="date" value={runDate} min={TODAY} onChange={e=>setRunDate(e.target.value)} className={inputCls+' mt-1'}/>
             <div className="flex gap-1.5 mt-1.5">
@@ -1353,12 +1375,35 @@ function IntakeModal({ drivers, onClose, onCreate, customers, addCustomer }) {
             {PACKAGING.map(p=><option key={p}>{p}</option>)}</select></Field></div>
         </div>
         {runDate!==TODAY && <p className="text-[11px] text-teal-dark font-semibold mt-2 inline-flex items-center gap-1"><Ic name="clock" size={13}/>Booked for {fmtDate(runDate)} — it'll appear on that day's run, not today's.</p>}
+
+        {isDelivery && <div className="mt-4 rounded-xl border border-teal/30 bg-teal-light/50 p-3">
+          <div className="text-xs font-bold text-teal-dark mb-2 inline-flex items-center gap-1"><Ic name="tag" size={14}/>What's being delivered &amp; payment</div>
+          <div className="grid grid-cols-2 gap-3">
+            <Field label="Service"><input value={service} onChange={e=>setService(e.target.value)} placeholder="e.g. Ironing" className={inputCls+' mt-1'}/></Field>
+            <Field label="Bags"><input type="number" min="1" value={bags} onChange={e=>setBags(e.target.value)} className={inputCls+' mt-1'}/></Field>
+          </div>
+          <div className="mt-3"><Field label="Amount to collect (£)">
+            <input type="number" min="0" step="0.5" value={amount} onChange={e=>setAmount(e.target.value)} placeholder="0.00"
+              className={inputCls+' mt-1'} {...(paid?{disabled:true}:{})}/></Field></div>
+          <div className="mt-3"><div className="text-xs font-semibold text-slate2 mb-1">Payment</div>
+            <div className="flex flex-wrap gap-2">
+              <button onClick={()=>setPaid(true)} className={`px-3 py-1.5 rounded-full text-xs font-semibold border ${paid?'bg-emerald-600 text-white border-emerald-600':'bg-white text-slate2 border-gray-200'}`}>Already paid online</button>
+              {['Cash','Card','Bank transfer'].map(m=>(
+                <button key={m} onClick={()=>{setPaid(false);setPayMethod(m);}}
+                  className={`px-3 py-1.5 rounded-full text-xs font-semibold border ${!paid&&payMethod===m?'bg-teal text-white border-teal':'bg-white text-slate2 border-gray-200'}`}>{m} on delivery</button>))}
+            </div></div>
+          <p className="text-[11px] text-slate2 mt-2">{paid
+            ? 'Driver will see it as paid — nothing to collect at the door.'
+            : `Driver will be asked to confirm ${payMethod.toLowerCase()} on delivery.`}</p>
+        </div>}
+
         <div className="mt-3"><Field label="Delivery / collection instructions (shown to driver)">
-          <textarea value={instructions} onChange={e=>setInstructions(e.target.value)} rows="2" placeholder="e.g. doesn't mind doorstep collection" className={inputCls+' mt-1'}></textarea></Field></div>
-        <label className="flex items-center gap-2 mt-3 text-sm text-ink"><input type="checkbox" checked={paid} onChange={e=>setPaid(e.target.checked)} className="accent-teal"/> Paid in advance</label>
+          <textarea value={instructions} onChange={e=>setInstructions(e.target.value)} rows="2" placeholder={isDelivery?'e.g. leave with neighbour at no. 12':"e.g. doesn't mind doorstep collection"} className={inputCls+' mt-1'}></textarea></Field></div>
+        {!isDelivery && <label className="flex items-center gap-2 mt-3 text-sm text-ink"><input type="checkbox" checked={paid} onChange={e=>setPaid(e.target.checked)} className="accent-teal"/> Paid in advance</label>}
         <div className="flex gap-2 mt-5">
           <Btn kind="ghost" onClick={onClose} className="flex-1">Cancel</Btn>
-          <Btn kind="rose" icon="plus" onClick={create} className="flex-1" {...(!customerId?{disabled:true}:{})}>Add to run</Btn>
+          <Btn kind={isDelivery?'primary':'rose'} icon="plus" onClick={create} className="flex-1" {...(!customerId?{disabled:true}:{})}>
+            Add {isDelivery?'delivery':'collection'} to run</Btn>
         </div>
       </div>
     </div>
@@ -1415,7 +1460,8 @@ function AddCustomerModal({ onClose, onCreate, onUpdate, onDelete, customer, ini
   const [first,setFirst]=useState(editing?customer.first:(nParts[0]||''));
   const [last,setLast]=useState(editing?customer.last:(nParts.slice(1).join(' ')||''));
   const [line1,setLine1]=useState(parsed.line1); const [town,setTown]=useState(parsed.town); const [pc,setPc]=useState(parsed.pc);
-  const [mob,setMob]=useState(editing?(customer.mob||''):''); const [email,setEmail]=useState(editing?(customer.email||''):'');
+  const [mob,setMob]=useState(editing?(customer.mob||''):''); const [mob2,setMob2]=useState(editing?(customer.mob2||''):'');
+  const [email,setEmail]=useState(editing?(customer.email||''):'');
   const [pcStatus,setPcStatus]=useState(null); const [pcInfo,setPcInfo]=useState(null); // {lat,lng,postcode}
 
   // live-validate the postcode against the UK postcode database (postcodes.io)
@@ -1432,7 +1478,7 @@ function AddCustomerModal({ onClose, onCreate, onUpdate, onDelete, customer, ini
   },[pc]);
 
   // check against everyone else on the books as they type
-  const cand={ id:editing?customer.id:null, first, last, mob, line1, pc:(pcInfo&&pcInfo.postcode)||pc };
+  const cand={ id:editing?customer.id:null, first, last, mob, mob2, line1, pc:(pcInfo&&pcInfo.postcode)||pc };
   const list=customers||[];
   const dup=findDuplicate(list,cand);          // strong match — blocks unless overridden
   const sameName=!dup?findSameName(list,cand):null;  // soft heads-up only
@@ -1443,7 +1489,7 @@ function AddCustomerModal({ onClose, onCreate, onUpdate, onDelete, customer, ini
   const canSave = detailsOk && (!dup || override);
   const save=()=>{ if(!canSave) return;
     const addr=[line1.trim(), town.trim(), pcInfo.postcode].filter(Boolean).join(', ');
-    const data={ title, first:first.trim(), last:last.trim(), addr, mob:mob.trim(), email:email.trim(), lat:pcInfo.lat, lng:pcInfo.lng };
+    const data={ title, first:first.trim(), last:last.trim(), addr, mob:mob.trim(), mob2:mob2.trim(), email:email.trim(), lat:pcInfo.lat, lng:pcInfo.lng };
     if(editing){ onUpdate({ ...customer, ...data }); onClose(); }
     else { const c = onCreate(data); onClose(c); } };
   const canDelete = editing && onDelete;
@@ -1473,16 +1519,17 @@ function AddCustomerModal({ onClose, onCreate, onUpdate, onDelete, customer, ini
           </Field>
         </div>
         <div className="grid grid-cols-2 gap-3 mt-3">
-          <Field label="Mobile"><input value={mob} onChange={e=>setMob(e.target.value)} className={inputCls+' mt-1'}/></Field>
-          <Field label="Email"><input value={email} onChange={e=>setEmail(e.target.value)} type="email" className={inputCls+' mt-1'}/></Field>
+          <Field label="Primary contact no."><input value={mob} onChange={e=>setMob(e.target.value)} type="tel" placeholder="e.g. 07700 900233" className={inputCls+' mt-1'}/></Field>
+          <Field label="Secondary contact no."><input value={mob2} onChange={e=>setMob2(e.target.value)} type="tel" placeholder="landline or 2nd mobile" className={inputCls+' mt-1'}/></Field>
         </div>
+        <div className="mt-3"><Field label="Email"><input value={email} onChange={e=>setEmail(e.target.value)} type="email" className={inputCls+' mt-1'}/></Field></div>
         {dup && <div className="mt-3 rounded-xl border border-rose-200 bg-rose-50 p-3">
           <div className="flex items-start gap-2">
             <span className="text-rose-600 mt-0.5"><Ic name="alert" size={16}/></span>
             <div className="text-[13px] leading-snug">
               <div className="font-bold text-rose-700">This customer already exists</div>
               <div className="text-rose-700/90 mt-0.5"><span className="font-semibold">{fullName(dup.c)}</span> is already on the books with {dup.why}.</div>
-              <div className="text-rose-700/70 text-[11px] mt-1">{dup.c.addr}{dup.c.mob?' · '+dup.c.mob:''}</div>
+              <div className="text-rose-700/70 text-[11px] mt-1">{dup.c.addr}{[dup.c.mob,dup.c.mob2].filter(Boolean).map(n=>' · '+n).join('')}</div>
             </div>
           </div>
           <label className="flex items-center gap-2 mt-2 text-[12px] text-rose-700 font-semibold">
@@ -1494,8 +1541,8 @@ function AddCustomerModal({ onClose, onCreate, onUpdate, onDelete, customer, ini
           <div className="flex items-start gap-2">
             <span className="text-amber-600 mt-0.5"><Ic name="info" size={16}/></span>
             <div><span className="font-semibold text-amber-800">There's already a {fullName(sameName)}</span>
-              <div className="text-amber-800/80 text-[11px] mt-0.5">{sameName.addr}{sameName.mob?' · '+sameName.mob:''}</div>
-              <div className="text-amber-800/70 text-[11px] mt-1">Different address and mobile, so this looks like a different person — check before saving.</div></div>
+              <div className="text-amber-800/80 text-[11px] mt-0.5">{sameName.addr}{[sameName.mob,sameName.mob2].filter(Boolean).map(n=>' · '+n).join('')}</div>
+              <div className="text-amber-800/70 text-[11px] mt-1">Different address and contact numbers, so this looks like a different person — check before saving.</div></div>
           </div>
         </div>}
         <p className="text-[11px] text-slate2 mt-2">A valid UK postcode is required — it's checked against the postcode database and places the customer exactly on the map.</p>
@@ -1521,7 +1568,8 @@ function Customers({ customers, addCustomer, updateCustomer, deleteCustomer, use
             <div className="font-semibold text-ink">{fullName(c)}</div>
             <div className="text-sm text-slate2 mt-0.5 flex items-start gap-1.5"><Ic name="pin" size={14} className="mt-0.5 shrink-0"/>{c.addr}</div>
             <div className="flex flex-wrap gap-x-4 gap-y-1 mt-1.5 text-sm text-slate2">
-              {c.mob && <a href={`tel:${c.mob.replace(/\s/g,'')}`} className="inline-flex items-center gap-1.5 text-teal-dark font-medium"><Ic name="phone" size={14}/>{c.mob}</a>}
+              {[c.mob,c.mob2].filter(Boolean).map((n,i)=>(
+              <a key={n} href={`tel:${n.replace(/\s/g,'')}`} className="inline-flex items-center gap-1.5 text-teal-dark font-medium"><Ic name="phone" size={14}/>{n}{i===1&&<span className="text-slate2 font-normal text-xs">(2nd)</span>}</a>))}
               {c.email && <span className="inline-flex items-center gap-1.5 truncate"><Ic name="mail" size={14} className="shrink-0"/>{c.email}</span>}
             </div>
           </div>
@@ -2023,27 +2071,37 @@ function App() {
   },[]);
   const addJob=useCallback(j=>{
     const isCol = j.type==='collection';
-    const orderId = isCol ? uuid() : null;
-    const order = isCol ? { id:orderId, customerId:j.customerId, services:[], extras:[], needsPricing:false, addedItems:{}, firstOrder:false,
-      bagsCount:0, bagWeights:[], weight:0, weightCharge:0, amount:0, initialAmount:0,
-      packaging:j.packaging, paymentMethod:'—', paidInAdvance:j.paidInAdvance, collectedDate:null, collectedAt:null,
-      dueDate:j.returnDate||addDays(j.runDate||TODAY,2), status:'Pending Collection', notes:j.instructions } : null;
-    if (order) setOrdersState(prev=>[order,...prev]);
+    const orderId = uuid();
+    const day = j.runDate||TODAY;
+    const base = { id:orderId, customerId:j.customerId, extras:[], needsPricing:false, addedItems:{}, firstOrder:false,
+      bagWeights:[], weight:0, packaging:j.packaging, paidInAdvance:!!j.paidInAdvance, notes:j.instructions };
+    // A collection starts empty and gets priced at the door.
+    // A delivery-only booking is already finished goods going back out, so it
+    // enters the list as "Out for delivery" and completes to Delivered.
+    const order = isCol
+      ? { ...base, services:[], bagsCount:0, weightCharge:0, amount:0, initialAmount:0,
+          paymentMethod:'—', collectedDate:null, collectedAt:null,
+          dueDate:j.returnDate||addDays(day,2), status:'Pending Collection' }
+      : { ...base, services:j.service&&j.service!=='—'?[j.service]:[], bagsCount:j.bags||1,
+          weightCharge:j.amount||0, amount:j.amount||0, initialAmount:j.amount||0,
+          paymentMethod:j.paymentMethod||'Cash', collectedDate:null, collectedAt:null,
+          dueDate:day, status:'Out for delivery' };
+    setOrdersState(prev=>[order,...prev]);
     setJobsState(prev=>{
-      const day=j.runDate||TODAY;
       const n=prev.filter(x=>x.driverId===j.driverId && (x.runDate||TODAY)===day).length;
-      const nj={...j, runDate:day, ...(orderId?{orderId}:null), seq:n+1};
-      // persist: order first (if any), THEN the job — awaited so the order exists before the job's FK
+      const nj={...j, runDate:day, orderId, seq:n+1};
+      // persist: order first, THEN the job — awaited so the order exists before the job's FK
       (async()=>{
         if(!db) return;
         try {
-          if (order){ const o=await db.from('orders').insert(toOrderRow(order)); if(o.error){ reportErr('save booking', o.error); return; } }
+          const o=await db.from('orders').insert(toOrderRow(order)); if(o.error){ reportErr('save booking', o.error); return; }
           const r=await db.from('jobs').insert(toJobRow(nj)); if(r.error) reportErr('save job', r.error);
         } catch(e){ reportErr('save job', e); }
       })();
       return [...prev, nj];
     });
-  },[]);
+    addAudit(`${actor()} booked a ${isCol?'collection':'delivery'} for ${fullName(custById(j.customerId))} on ${fmtDate(day)}`);
+  },[addAudit]);
   const go=useCallback(v=>{ if(v==='logout'){ setUser(null); setView('picker'); return; } setView(v); },[]);
   const onLogin=(s)=>{ setUser(s); const allowed=PORTALS.filter(p=>hasRole(s,p.role)); setView(allowed.length===1?allowed[0].view:'picker'); };
 
