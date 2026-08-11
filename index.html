@@ -267,6 +267,20 @@ function storeList(orders, scope, today) {
                    return scope==='today' ? d===today : d<=end; })
     .sort((a,b)=> (a.dueDate||'').localeCompare(b.dueDate||'') || (a.collectedAt||'').localeCompare(b.collectedAt||''));
 }
+// PURE — can the driver reopen a finished stop? (unit-tested)
+// Safe while the shop hasn't started on it. Once the bags are in the shop or
+// have been priced, reopening would throw that work away, so it's blocked.
+const SHOP_HAS_STARTED = ['In Shop','Ready','Out for delivery'];
+function canReopen(job, order) {
+  if (!job || (job.status!=='done' && job.status!=='no-answer'))
+    return { ok:false, reason:'This stop is still on the run.' };
+  if (job.type==='collection' && order) {
+    if (order.status==='Delivered')        return { ok:false, reason:'This order has already been delivered.' };
+    if (SHOP_HAS_STARTED.includes(order.status))
+      return { ok:false, reason:`The shop has already taken this in (${order.status}) — ask the shop to change it.` };
+  }
+  return { ok:true, reason:'' };
+}
 // PURE reorder helpers (unit-tested).
 // Every helper is scoped to one driver on ONE DAY — stops are numbered 1..n per
 // day, so a booking for tomorrow must never renumber today's run.
@@ -528,7 +542,8 @@ function TopBar({ left, right }) {
 function TypeBadge({ type }) {
   return type==='collection' ? <Badge tone="rose">Collection</Badge> : <Badge tone="slate">Delivery</Badge>;
 }
-const rowTint = (type, done) => done ? 'bg-gray-50 opacity-60 border-gray-100'
+// finished stops are dimmed with colour, not opacity, so the Reopen button stays legible
+const rowTint = (type, done) => done ? 'bg-gray-50 border-gray-100'
   : type==='collection' ? 'bg-rose-50/60 border-rose-100' : 'bg-white border-gray-100';
 
 function LoginCard({ title, sub, go, children }) {
@@ -620,7 +635,7 @@ function DayPicker({ day, setDay, count }) {
       {day!==TODAY && <button onClick={()=>setDay(TODAY)} className="text-xs font-semibold text-teal-dark px-2 shrink-0">Today</button>}
     </div>);
 }
-function DriverApp({ driver, go, jobs, setJobs, rates, addAudit, addOrder, updateOrder }) {
+function DriverApp({ driver, go, jobs, setJobs, orders, rates, addAudit, addOrder, updateOrder }) {
   const [openId,setOpenId]=useState(null);
   const [day,setDay]=useState(TODAY);
   const myJobs = jobs.filter(j=>j.driverId===driver.id && (j.runDate||TODAY)===day).sort((a,b)=>a.seq-b.seq);
@@ -665,6 +680,28 @@ function DriverApp({ driver, go, jobs, setJobs, rates, addAudit, addOrder, updat
     addAudit(`No answer at ${fullName(custById(job.customerId))} (${job.type}) — needs rescheduling`);
     setOpenId(null);
   };
+  // Put a finished stop back on the run — for "they've just pulled up" or
+  // "I forgot to add two bags". Undoes whatever completing it did.
+  const reopenJob = (job) => {
+    const order = job.orderId ? orders.find(o=>o.id===job.orderId) : null;
+    const check = canReopen(job, order);
+    if (!check.ok) { window.alert(check.reason); return; }
+    const c = custById(job.customerId);
+    const wasNoAnswer = job.status==='no-answer';
+    if (!window.confirm(`Put ${fullName(c)} back on your run?`)) return;
+    // Everything the driver already entered is kept — the form reopens pre-filled
+    // so he can add the extra bag rather than start again.
+    setJobs(prev => prev.map(j => j.id===job.id
+      ? { ...j, status:'pending', doneAt:undefined, reopened:true }
+      : j));
+    // The order goes back a step so the shop doesn't act on it, but its figures
+    // stay put; re-confirming the stop overwrites them with the updated ones.
+    if (order) updateOrder(order.id, job.type==='collection'
+      ? { status:'Pending Collection' }
+      : { status:'Out for delivery' });
+    addAudit(`${driver.name} reopened ${fullName(c)}'s ${job.type}${wasNoAnswer?' (was no answer)':''} — back on the run`);
+    setOpenId(job.id);
+  };
 
   return (
     <div className="min-h-screen">
@@ -707,15 +744,19 @@ function DriverApp({ driver, go, jobs, setJobs, rates, addAudit, addOrder, updat
                           {isDone && <span className="text-xs text-emerald-600 font-semibold inline-flex items-center gap-1"><Ic name="check" size={13}/>{job.doneAt}</span>}
                           {isNoAnswer && <Badge tone="rose">No answer</Badge>}
                         </div>
-                        <div className="font-semibold text-ink mt-1">{fullName(c)}</div>
-                        <div className="text-sm text-slate2">{c.addr}</div>
+                        <div className={`font-semibold mt-1 ${resolved?'text-slate2':'text-ink'}`}>{fullName(c)}</div>
+                        <div className={`text-sm ${resolved?'text-gray-400':'text-slate2'}`}>{c.addr}</div>
                         {job.type==='delivery'
                           ? <div className="text-xs text-slate2 mt-0.5 inline-flex items-center gap-1"><Ic name="box" size={13}/>{job.packaging}</div>
                           : job.returnDate && <div className="text-xs text-slate2 mt-0.5">Return {fmtDate(job.returnDate)}</div>}
                         {job.instructions && <div className="text-xs text-rose-700 mt-1 bg-rose-50 rounded-lg px-2 py-1 inline-flex items-start gap-1"><Ic name="note" size={13}/><span>{job.instructions}</span></div>}
                       </div>
                     </div>
-                    {!resolved && <Btn kind={isNext?(job.type==='collection'?'rose':'primary'):'subtle'} onClick={()=>setOpenId(job.id)} className="!py-1.5 !px-3 shrink-0">Open</Btn>}
+                    {resolved
+                      ? <button onClick={()=>reopenJob(job)} title="Put this stop back on the run"
+                          className="shrink-0 inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-semibold bg-gray-100 text-slate2 border border-gray-200 hover:bg-gray-200 hover:text-ink transition">
+                          <Ic name="left" size={13}/>Reopen</button>
+                      : <Btn kind={isNext?(job.type==='collection'?'rose':'primary'):'subtle'} onClick={()=>setOpenId(job.id)} className="!py-1.5 !px-3 shrink-0">Open</Btn>}
                   </div>
                 </div>
               );
@@ -724,7 +765,8 @@ function DriverApp({ driver, go, jobs, setJobs, rates, addAudit, addOrder, updat
         </>}
 
         {openJob && (openJob.type==='collection'
-          ? <CollectionForm job={openJob} rates={rates} onBack={()=>setOpenId(null)} onConfirm={completeCollection} onNoAnswer={markNoAnswer} />
+          ? <CollectionForm job={openJob} order={openJob.orderId?orders.find(o=>o.id===openJob.orderId):null} rates={rates}
+              onBack={()=>setOpenId(null)} onConfirm={completeCollection} onNoAnswer={markNoAnswer} />
           : <DeliveryView job={openJob} onBack={()=>setOpenId(null)} onConfirm={completeDelivery} onNoAnswer={markNoAnswer} />)}
       </div>
     </div>
@@ -746,15 +788,44 @@ function CallBtn({ mob, mob2 }) {
   </div>);
 }
 
-function CollectionForm({ job, rates, onBack, onConfirm, onNoAnswer }) {
+// PURE — rebuild the collection form from an order that was already filled in,
+// so reopening a stop doesn't throw the driver's work away (unit-tested).
+function prefillFromOrder(order, job, rates) {
+  const blank = { bags:[{id:1,weight:''}], serviceKey:'iron', shirtType:'io', shirtCount:'',
+                  extras:[], firstOrder:false, notes:'', hasPrev:false };
+  // nothing was entered before unless the order carries collected details
+  if (!order || (!(order.bagWeights||[]).length && !(order.services||[]).length)) return blank;
+  const svc = (order.services||[])[0] || '';
+  const isShirts = /^Shirt service/.test(svc);
+  const match = (rates.weight||[]).find(r=>r.label.replace(/ \(.*\)/,'')===svc);
+  // order.notes is "instructions · driver note · shirt note" — recover the driver's part
+  let notes = order.notes || '';
+  if (job && job.instructions && notes.startsWith(job.instructions)) notes = notes.slice(job.instructions.length);
+  notes = notes.split(' · ').filter(p=>p.trim() && !/^Customer said ~/.test(p.trim())).join(' · ').trim();
+  const shirtNote = (order.notes||'').match(/Customer said ~(\d+) shirts/);
+  return {
+    bags: (order.bagWeights||[]).length ? order.bagWeights.map((w,i)=>({id:i+1,weight:String(w)})) : [{id:1,weight:''}],
+    serviceKey: isShirts ? 'shirts' : (match ? match.key : 'iron'),
+    shirtType: /wash & iron/i.test(svc) ? 'wi' : 'io',
+    shirtCount: shirtNote ? shirtNote[1] : '',
+    extras: order.extras || [],
+    firstOrder: !!order.firstOrder,
+    notes,
+    hasPrev: true,
+  };
+}
+function CollectionForm({ job, order, rates, onBack, onConfirm, onNoAnswer }) {
   const c = custById(job.customerId);
-  const [bags,setBags]=useState([{id:1,weight:''}]);
-  const [serviceKey,setServiceKey]=useState('iron');
-  const [shirtType,setShirtType]=useState('io');
-  const [shirtCount,setShirtCount]=useState('');
-  const [extras,setExtras]=useState([]);
-  const [firstOrder,setFirstOrder]=useState(false);
-  const [notes,setNotes]=useState('');
+  // If this stop was filled in before and reopened, start from what the driver
+  // already entered rather than a blank form — he's usually just adding a bag.
+  const pre = useMemo(()=>prefillFromOrder(order, job, rates), []);
+  const [bags,setBags]=useState(pre.bags);
+  const [serviceKey,setServiceKey]=useState(pre.serviceKey);
+  const [shirtType,setShirtType]=useState(pre.shirtType);
+  const [shirtCount,setShirtCount]=useState(pre.shirtCount);
+  const [extras,setExtras]=useState(pre.extras);
+  const [firstOrder,setFirstOrder]=useState(pre.firstOrder);
+  const [notes,setNotes]=useState(pre.notes);
   const [confirmed,setConfirmed]=useState(false);
 
   const isShirts = serviceKey==='shirts';
@@ -787,6 +858,9 @@ function CollectionForm({ job, rates, onBack, onConfirm, onNoAnswer }) {
   return (
     <div>
       <button onClick={onBack} className="text-slate2 text-sm mb-3 inline-flex items-center gap-1"><Ic name="left" size={15}/>Back to run</button>
+      {pre.hasPrev && <div className="mb-3 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-[13px] text-amber-800 flex items-start gap-2">
+        <Ic name="info" size={16} className="mt-0.5 shrink-0"/>
+        <span><b>Reopened</b> — everything you entered before is still here. Add or change what you need, then confirm again.</span></div>}
       <div className="bg-white card rounded-2xl p-5">
         <div className="flex items-start justify-between gap-2">
           <div><TypeBadge type="collection"/>
@@ -2109,7 +2183,7 @@ function App() {
   if (phase==='loading') screen=<LoadingScreen/>;
   else if (phase==='error') screen=<ErrorScreen msg={err}/>;
   else if (!user)                 screen=<StaffLogin staff={drivers} onLogin={onLogin}/>;
-  else if (view==='driver-app' && hasRole(user,'driver')) screen=<DriverApp driver={user} go={go} jobs={jobs} setJobs={setJobs} rates={rates} addAudit={addAudit} addOrder={addOrder} updateOrder={updateOrder}/>;
+  else if (view==='driver-app' && hasRole(user,'driver')) screen=<DriverApp driver={user} go={go} jobs={jobs} setJobs={setJobs} orders={orders} rates={rates} addAudit={addAudit} addOrder={addOrder} updateOrder={updateOrder}/>;
   else if (view==='store-app' && hasRole(user,'store'))   screen=<StoreApp go={go} orders={orders} rates={rates} updateOrder={updateOrder} addAudit={addAudit} deleteOrder={deleteOrder} jobs={jobs} drivers={drivers} onDispatch={dispatchDelivery} user={user}/>;
   else if (view==='admin-app' && hasRole(user,'admin'))   screen=<AdminApp go={go} jobs={jobs} setJobs={setJobs} rates={rates} setRates={setRates} audit={audit} drivers={drivers} setDrivers={setDrivers} deleteDriver={deleteDriver} orders={orders} addJob={addJob} updateOrder={updateOrder} addAudit={addAudit} deleteJob={deleteJob} deleteOrder={deleteOrder} dispatchDelivery={dispatchDelivery} customers={customers} addCustomer={addCustomer} updateCustomer={updateCustomer} deleteCustomer={deleteCustomer} user={user}/>;
   else                            screen=<PortalPicker user={user} onPick={v=>setView(v)} onLogout={()=>go('logout')}/>;
