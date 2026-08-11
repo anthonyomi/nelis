@@ -300,6 +300,18 @@ function moveJob(jobs, driverId, jobId, dir, day) {
   if (i<0 || j<0 || j>=mine.length) return jobs;
   return reorderJobs(jobs, driverId, jobId, mine[j].id, day);
 }
+// PURE — the driver shuffling his own run (unit-tested).
+// Only stops still to do can move, and they only swap with the next stop still
+// to do, so anything already completed keeps its place in the history.
+function movePendingStop(jobs, driverId, jobId, dir, day) {
+  const mine = jobs.filter(j=>onRun(j,driverId,day)).sort((a,b)=>a.seq-b.seq);
+  const pending = mine.filter(j=>j.status==='pending');
+  const i = pending.findIndex(j=>j.id===jobId);
+  if (i<0) return jobs;                                   // done stops don't move
+  const k = dir==='up' ? i-1 : i+1;
+  if (k<0 || k>=pending.length) return jobs;              // already at the end
+  return reorderJobs(jobs, driverId, jobId, pending[k].id, day);
+}
 function moveJobTo(jobs, jobId, toDriverId, targetJobId, day) {
   const job = jobs.find(j=>j.id===jobId); if (!job) return jobs;
   const d = day || job.runDate || TODAY;
@@ -448,12 +460,14 @@ const ratesFromRows = (rows, settings) => ({
 const fromJobRow = r => ({ id:r.id, runDate:r.run_date||TODAY, driverId:r.driver_id, seq:num(r.seq), type:r.type, customerId:r.customer_id,
   orderId:r.order_id||undefined, window:r.time_window, status:r.status, packaging:r.packaging, instructions:r.instructions,
   returnDate:r.return_date||undefined, paidInAdvance:r.paid_in_advance, bags:num(r.bags), weight:num(r.weight),
-  amount:num(r.amount), service:r.service, paymentMethod:r.payment_method, doneAt:r.done_at||undefined });
+  amount:num(r.amount), service:r.service, paymentMethod:r.payment_method, doneAt:r.done_at||undefined,
+  reorderedBy:r.reordered_by||undefined, reorderedAt:r.reordered_at||undefined });
 const toJobRow = j => ({ id:j.id, run_date:j.runDate||TODAY, driver_id:j.driverId, seq:j.seq, type:j.type, customer_id:j.customerId,
   order_id:j.orderId ?? null, time_window:j.window ?? null, status:j.status, packaging:j.packaging ?? null,
   instructions:j.instructions ?? null, return_date:j.returnDate ?? null, paid_in_advance:!!j.paidInAdvance,
   bags:j.bags ?? null, weight:j.weight ?? null, amount:j.amount ?? null, service:j.service ?? null,
-  payment_method:j.paymentMethod ?? null, done_at:j.doneAt ?? null });
+  payment_method:j.paymentMethod ?? null, done_at:j.doneAt ?? null,
+  reordered_by:j.reorderedBy ?? null, reordered_at:j.reorderedAt ?? null });
 
 const fromOrderRow = r => ({ id:r.id, customerId:r.customer_id, status:r.status, services:r.services||[], extras:r.extras||[],
   needsPricing:r.needs_pricing, bagsCount:num(r.bags_count), bagWeights:(r.bag_weights||[]).map(num), weight:num(r.weight),
@@ -639,7 +653,8 @@ function DriverApp({ driver, go, jobs, setJobs, orders, rates, addAudit, addOrde
   const [openId,setOpenId]=useState(null);
   const [day,setDay]=useState(TODAY);
   const myJobs = jobs.filter(j=>j.driverId===driver.id && (j.runDate||TODAY)===day).sort((a,b)=>a.seq-b.seq);
-  const nextPendingId = (myJobs.find(j=>j.status==='pending')||{}).id;
+  const myPending = myJobs.filter(j=>j.status==='pending');   // only these can be shuffled
+  const nextPendingId = (myPending[0]||{}).id;
   const done = myJobs.filter(j=>j.status!=='pending').length;
   const openJob = openId ? jobs.find(j=>j.id===openId) : null;
   useEffect(()=>{ window.scrollTo(0,0); },[openId,day]);  // opening/closing a stop starts at the top
@@ -680,6 +695,18 @@ function DriverApp({ driver, go, jobs, setJobs, orders, rates, addAudit, addOrde
     addAudit(`No answer at ${fullName(custById(job.customerId))} (${job.type}) — needs rescheduling`);
     setOpenId(null);
   };
+  // The driver reshuffling his own run — what he'd otherwise scribble as arrows
+  // on the paper job sheet. Stamped so Mark can see it changed in Logistics.
+  const moveStop = (job, dir) => {
+    setJobs(prev => {
+      const next = movePendingStop(prev, driver.id, job.id, dir, day);
+      if (next===prev) return prev;                       // already top/bottom
+      const moved = next.find(j=>j.id===job.id);
+      const from = (prev.find(j=>j.id===job.id)||{}).seq, to = moved && moved.seq;
+      if (from!==to) addAudit(`${driver.name} moved ${fullName(custById(job.customerId))} from stop ${from} to stop ${to} on ${fmtDate(day)}`);
+      return next.map(j => j.id===job.id ? {...j, reorderedBy:driver.name, reorderedAt:now()} : j);
+    });
+  };
   // Put a finished stop back on the run — for "they've just pulled up" or
   // "I forgot to add two bags". Undoes whatever completing it did.
   const reopenJob = (job) => {
@@ -717,7 +744,8 @@ function DriverApp({ driver, go, jobs, setJobs, orders, rates, addAudit, addOrde
             <h2 className="text-xl font-extrabold text-ink">{day===TODAY?'Today’s run':`${dayLabel(day)}’s run`}</h2>
             <Badge tone="grey">{done}/{myJobs.length} done</Badge>
           </div>
-          <p className="text-slate2 text-sm mb-3">In driving order. <span className="text-rose-500 font-semibold">Pink = collection</span>, white = delivery. Next job highlighted; done jobs greyed out.</p>
+          <p className="text-slate2 text-sm mb-1">In driving order. <span className="text-rose-500 font-semibold">Pink = collection</span>, white = delivery. Next job highlighted; done jobs greyed out.</p>
+          {myPending.length>1 && <p className="text-slate2 text-xs mb-3 inline-flex items-center gap-1"><Ic name="up" size={13}/>Use the arrows to change the order if you'd rather do a stop earlier — the office sees the change.</p>}
           <div className="mb-3"><DayPicker day={day} setDay={setDay} count={myJobs.length}/></div>
           {otherDays.length>0 && <div className="mb-3 flex flex-wrap gap-1.5">
             {otherDays.map(([d,n])=>(
@@ -731,6 +759,7 @@ function DriverApp({ driver, go, jobs, setJobs, orders, rates, addAudit, addOrde
               const isDone = job.status==='done', isNoAnswer = job.status==='no-answer';
               const resolved = isDone || isNoAnswer;
               const isNext = job.id===nextPendingId;
+              const pendingPos = myPending.findIndex(j=>j.id===job.id);
               return (
                 <div key={job.id} className={`rounded-2xl p-4 border transition card ${rowTint(job.type,resolved)} ${isNext?'ring-2 ring-teal':''}`}>
                   <div className="flex items-start justify-between gap-3">
@@ -752,11 +781,20 @@ function DriverApp({ driver, go, jobs, setJobs, orders, rates, addAudit, addOrde
                         {job.instructions && <div className="text-xs text-rose-700 mt-1 bg-rose-50 rounded-lg px-2 py-1 inline-flex items-start gap-1"><Ic name="note" size={13}/><span>{job.instructions}</span></div>}
                       </div>
                     </div>
-                    {resolved
-                      ? <button onClick={()=>reopenJob(job)} title="Put this stop back on the run"
-                          className="shrink-0 inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-semibold bg-gray-100 text-slate2 border border-gray-200 hover:bg-gray-200 hover:text-ink transition">
-                          <Ic name="left" size={13}/>Reopen</button>
-                      : <Btn kind={isNext?(job.type==='collection'?'rose':'primary'):'subtle'} onClick={()=>setOpenId(job.id)} className="!py-1.5 !px-3 shrink-0">Open</Btn>}
+                    <div className="flex items-center gap-2 shrink-0">
+                      {!resolved && myPending.length>1 && (
+                        <div className="flex flex-col gap-1">
+                          <button onClick={()=>moveStop(job,'up')} title="Move earlier in the run" {...(pendingPos===0?{disabled:true}:{})}
+                            className={`w-7 h-6 rounded-md border flex items-center justify-center ${pendingPos===0?'border-gray-100 text-gray-200':'border-gray-200 text-slate2 hover:bg-gray-50 active:bg-gray-100'}`}><Ic name="up" size={15}/></button>
+                          <button onClick={()=>moveStop(job,'down')} title="Move later in the run" {...(pendingPos===myPending.length-1?{disabled:true}:{})}
+                            className={`w-7 h-6 rounded-md border flex items-center justify-center ${pendingPos===myPending.length-1?'border-gray-100 text-gray-200':'border-gray-200 text-slate2 hover:bg-gray-50 active:bg-gray-100'}`}><Ic name="down" size={15}/></button>
+                        </div>)}
+                      {resolved
+                        ? <button onClick={()=>reopenJob(job)} title="Put this stop back on the run"
+                            className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-semibold bg-gray-100 text-slate2 border border-gray-200 hover:bg-gray-200 hover:text-ink transition">
+                            <Ic name="left" size={13}/>Reopen</button>
+                        : <Btn kind={isNext?(job.type==='collection'?'rose':'primary'):'subtle'} onClick={()=>setOpenId(job.id)} className="!py-1.5 !px-3">Open</Btn>}
+                    </div>
                   </div>
                 </div>
               );
@@ -1988,6 +2026,11 @@ function Logistics({ jobs, setJobs, drivers, onNew, deleteJob, customers, user }
               className="bg-white card rounded-2xl p-4">
               <h4 className="font-bold text-ink text-sm mb-2 inline-flex items-center gap-1.5"><Ic name="truck" size={16}/>{d.name} <span className="text-slate2 font-normal">· {list.length} stops{list.filter(x=>x.status!=='pending').length?` · ${list.filter(x=>x.status!=='pending').length} done`:''}</span>
                 {isDropTarget && <span className="text-teal-dark text-xs font-normal ml-1">— drop to reassign</span>}</h4>
+              {(()=>{ const moved=list.filter(x=>x.reorderedBy);
+                if(!moved.length) return null;
+                const last=moved.reduce((a,b)=>(a.reorderedAt||'')>(b.reorderedAt||'')?a:b);
+                return <div className="text-[11px] text-amber-700 bg-amber-50 border border-amber-100 rounded-lg px-2 py-1 mb-2 inline-flex items-center gap-1.5">
+                  <Ic name="info" size={13}/>{last.reorderedBy} changed this run — {moved.length} stop{moved.length>1?'s':''} moved, last at {last.reorderedAt}</div>; })()}
               {list.length===0 ? <p className="text-sm text-slate2 border-2 border-dashed border-gray-200 rounded-xl p-4 text-center">No route assigned{isDropTarget?' — drop a job here':''}.</p> :
                 <div className="space-y-2">
                   {list.map((j,idx)=>{ const c=custById(j.customerId); const done=j.status==='done', na=j.status==='no-answer', resolved=done||na;
@@ -2001,7 +2044,8 @@ function Logistics({ jobs, setJobs, drivers, onNew, deleteJob, customers, user }
                           <span className="text-gray-300"><Ic name="grip" size={16}/></span>
                           <span className={`w-6 h-6 rounded-full flex items-center justify-center text-xs font-bold text-white shrink-0 ${resolved?'bg-gray-300':j.type==='collection'?'bg-rose-500':'bg-teal'}`}>{j.seq}</span>
                           <div className="flex-1 min-w-0">
-                            <div className="flex items-center gap-1.5 flex-wrap"><TypeBadge type={j.type}/><span className="text-xs text-slate2">{j.window}</span>{done && <Badge tone="green">Done</Badge>}{na && <Badge tone="rose">No answer</Badge>}</div>
+                            <div className="flex items-center gap-1.5 flex-wrap"><TypeBadge type={j.type}/><span className="text-xs text-slate2">{j.window}</span>{done && <Badge tone="green">Done</Badge>}{na && <Badge tone="rose">No answer</Badge>}
+                              {j.reorderedBy && <span title={`Moved by ${j.reorderedBy} at ${j.reorderedAt}`}><Badge tone="amber">Moved by driver</Badge></span>}</div>
                             <div className="text-sm text-ink truncate">{fullName(c)}</div>
                             <div className="text-xs text-slate2 truncate">{c.addr}</div>
                           </div>
