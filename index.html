@@ -392,9 +392,9 @@ const num = v => v==null ? v : Number(v);
 
 // map between the app's shapes and the database rows
 const fromCustomerRow = r => ({ id:r.id, title:r.title, first:r.first_name, last:r.last_name, addr:r.address,
-  mob:r.mobile, mob2:r.mobile2||'', email:r.email, lat:num(r.lat), lng:num(r.lng) });
+  mob:r.mobile, mob2:r.mobile2||'', email:r.email, standingNotes:r.notes||'', lat:num(r.lat), lng:num(r.lng) });
 const toCustomerRow = c => ({ id:c.id, title:c.title, first_name:c.first, last_name:c.last, address:c.addr,
-  mobile:c.mob, mobile2:c.mob2 || null, email:c.email, lat:c.lat ?? null, lng:c.lng ?? null });
+  mobile:c.mob, mobile2:c.mob2 || null, email:c.email, notes:c.standingNotes || null, lat:c.lat ?? null, lng:c.lng ?? null });
 const fromDriverRow = r => ({ id:r.id, name:r.name, pin:r.pin, roles:(r.roles&&r.roles.length?r.roles:['driver']), canDelete:!!r.can_delete, active:r.active!==false });
 const hasRole = (u,role) => !!(u && u.roles && u.roles.includes(role));
 const mayDelete = u => hasRole(u,'admin') || !!(u && u.canDelete);
@@ -552,6 +552,17 @@ function Btn({ children, onClick, kind='primary', className='', icon, ...p }) {
 function TopBar({ left, right }) {
   return <div className="bg-white/90 backdrop-blur border-b border-gray-100 sticky top-0 z-30">
     <div className="max-w-5xl mx-auto px-4 py-3 flex items-center justify-between">{left}{right}</div></div>;
+}
+// Standing instructions live on the customer and show on EVERY job for them.
+// Deliberately a different colour from the pink one-off note on a booking.
+function StandingNote({ customer, size='sm' }) {
+  const n = customer && customer.standingNotes;
+  if (!n) return null;
+  return (
+    <div className={`bg-violet-50 border border-violet-100 text-violet-800 rounded-lg px-2 py-1 flex items-start gap-1.5 ${size==='xs'?'text-[11px]':'text-xs'}`}>
+      <Ic name="info" size={13} className="mt-0.5 shrink-0"/>
+      <span><b>Always:</b> {n}</span>
+    </div>);
 }
 function TypeBadge({ type }) {
   return type==='collection' ? <Badge tone="rose">Collection</Badge> : <Badge tone="slate">Delivery</Badge>;
@@ -778,6 +789,7 @@ function DriverApp({ driver, go, jobs, setJobs, orders, rates, addAudit, addOrde
                         {job.type==='delivery'
                           ? <div className="text-xs text-slate2 mt-0.5 inline-flex items-center gap-1"><Ic name="box" size={13}/>{job.packaging}</div>
                           : job.returnDate && <div className="text-xs text-slate2 mt-0.5">Return {fmtDate(job.returnDate)}</div>}
+                        {c && c.standingNotes && <div className="mt-1"><StandingNote customer={c} size="xs"/></div>}
                         {job.instructions && <div className="text-xs text-rose-700 mt-1 bg-rose-50 rounded-lg px-2 py-1 inline-flex items-start gap-1"><Ic name="note" size={13}/><span>{job.instructions}</span></div>}
                       </div>
                     </div>
@@ -908,7 +920,8 @@ function CollectionForm({ job, order, rates, onBack, onConfirm, onNoAnswer }) {
           </div>
           <div className="flex flex-col gap-2 shrink-0"><DirectionsBtn addr={c.addr}/><CallBtn mob={c.mob} mob2={c.mob2}/></div>
         </div>
-        {job.instructions && <div className="text-xs text-rose-700 mt-3 bg-rose-50 rounded-lg px-2 py-1.5 inline-flex items-start gap-1"><Ic name="note" size={14}/><span>Boss note: {job.instructions}</span></div>}
+        {c && c.standingNotes && <div className="mt-3"><StandingNote customer={c}/></div>}
+        {job.instructions && <div className="text-xs text-rose-700 mt-2 bg-rose-50 rounded-lg px-2 py-1.5 inline-flex items-start gap-1"><Ic name="note" size={14}/><span>Boss note: {job.instructions}</span></div>}
 
         <hr className="my-4 border-gray-100"/>
         <h4 className="font-bold text-ink text-sm mb-1">Service</h4>
@@ -1014,6 +1027,8 @@ function DeliveryView({ job, onBack, onConfirm, onNoAnswer }) {
           <div className="flex justify-between"><span className="text-slate2">Packaging</span><span>{job.packaging}</span></div>
           <div className="flex justify-between"><span className="text-slate2">Amount</span><span>{gbp(job.amount)}</span></div>
         </div>
+        {c && c.standingNotes && <div className="mt-3"><StandingNote customer={c}/></div>}
+        {job.instructions && <div className="text-xs text-rose-700 mt-2 bg-rose-50 rounded-lg px-2 py-1.5 inline-flex items-start gap-1"><Ic name="note" size={14}/><span>Boss note: {job.instructions}</span></div>}
         {paid
           ? <div className="mt-4 bg-emerald-50 text-emerald-700 rounded-xl p-3 text-sm flex items-center gap-2"><Ic name="check" size={16}/>Paid in advance — nothing to collect.</div>
           : <>
@@ -1181,7 +1196,8 @@ function OrderModal({ order, rates, onClose, onSave, addAudit, onDelete, onDispa
               <Row k="Payment" v={order.paidInAdvance?'Paid in advance':(order.paymentMethod==='—'?'—':order.paymentMethod)}/>
               <Row k="Price" v={order.status==='Pending Collection'?'—':<span className="font-bold text-ink">{gbp(order.amount)}{order.needsPricing&&<span className="text-rose-500 font-normal"> (provisional)</span>}</span>}/>
             </div>
-            {order.notes && <div className="text-xs text-ink mt-3 bg-amber-50 border border-amber-100 rounded-lg px-2 py-1.5 flex items-start gap-1"><Ic name="note" size={14}/><span>{order.notes}</span></div>}
+            {c && c.standingNotes && <div className="mt-3"><StandingNote customer={c}/></div>}
+            {order.notes && <div className="text-xs text-ink mt-2 bg-amber-50 border border-amber-100 rounded-lg px-2 py-1.5 flex items-start gap-1"><Ic name="note" size={14}/><span>{order.notes}</span></div>}
             <h4 className="font-bold text-ink text-sm mt-5 mb-1">Progress</h4>
             <Timeline status={order.status}/>
             {order.status==='Pending Collection' &&
@@ -1293,11 +1309,11 @@ function StoreApp({ go, orders, rates, updateOrder, addAudit, deleteOrder, jobs,
         <td>${o.services.join(', ')}${extra?`<br><span class="r">+ ${extra}</span>`:''}</td>
         <td>${o.bagsCount} (${o.bagWeights.join('+')}kg) · ${o.weight}kg</td>
         <td>${gbp(o.amount)}${o.needsPricing?' <span class="r">(prov.)</span>':''}<br><span class="a">${o.paidInAdvance?'PAID':o.paymentMethod}</span></td>
-        <td>${o.packaging}</td><td>${fmtDate(o.collectedDate)} ${o.collectedAt}</td><td>${o.status==='Needs pricing'?`<span class="r">${o.status}</span>`:o.status}</td><td>${o.notes||''}</td></tr>`; }).join('');
+        <td>${o.packaging}</td><td>${fmtDate(o.collectedDate)} ${o.collectedAt}</td><td>${o.status==='Needs pricing'?`<span class="r">${o.status}</span>`:o.status}</td><td>${c&&c.standingNotes?`<b class="v">Always: ${c.standingNotes}</b><br>`:''}${o.notes||''}</td></tr>`; }).join('');
     const html = `<html><head><title>NELIS — ${scope==='today'?'Today':'This week'}</title>
       <style>body{font-family:Arial;padding:18px;color:#1f2a30}h1{font-size:16px;margin:0}.sub{color:#777;font-size:12px;margin:2px 0 12px}
       table{width:100%;border-collapse:collapse;font-size:11px}th{background:#3AAFCB;color:#fff;text-align:left;padding:5px 6px}
-      td{border-bottom:1px solid #ddd;padding:5px 6px;vertical-align:top}.a{color:#888;font-size:10px}.r{color:#dc2626;font-weight:bold}@media print{@page{size:landscape;margin:10mm}}</style></head>
+      td{border-bottom:1px solid #ddd;padding:5px 6px;vertical-align:top}.a{color:#888;font-size:10px}.r{color:#dc2626;font-weight:bold}.v{color:#6d28d9}@media print{@page{size:landscape;margin:10mm}}</style></head>
       <body><h1>NEL Ironing Service — Production list</h1><div class="sub">${scope==='today'?'Due today':'Due this week'} · printed ${fmtDate(TODAY)} · ${list.length} order(s)</div>
       <table><thead><tr><th>Due</th><th>Customer</th><th>Services</th><th>Bags / weight</th><th>Price</th><th>Pack</th><th>Collected</th><th>Status</th><th>Notes</th></tr></thead>
       <tbody>${rows}</tbody></table></body></html>`;
@@ -1353,6 +1369,7 @@ function StoreApp({ go, orders, rates, updateOrder, addAudit, deleteOrder, jobs,
                       <span className="text-slate2">Collected</span><span className="text-ink text-right">{fmtDate(o.collectedDate)} · {o.collectedAt}</span>
                     </div>
                   </div>
+                  {c && c.standingNotes && <div className="mt-2"><StandingNote customer={c} size="xs"/></div>}
                   {o.notes && <div className="text-xs text-ink mt-2 bg-amber-50 border border-amber-100 rounded-lg px-2 py-1 inline-flex items-start gap-1"><Ic name="note" size={13}/><span>{o.notes}</span></div>}
                 </button>);
             })}
@@ -1574,6 +1591,7 @@ function AddCustomerModal({ onClose, onCreate, onUpdate, onDelete, customer, ini
   const [line1,setLine1]=useState(parsed.line1); const [town,setTown]=useState(parsed.town); const [pc,setPc]=useState(parsed.pc);
   const [mob,setMob]=useState(editing?(customer.mob||''):''); const [mob2,setMob2]=useState(editing?(customer.mob2||''):'');
   const [email,setEmail]=useState(editing?(customer.email||''):'');
+  const [standing,setStanding]=useState(editing?(customer.standingNotes||''):'');
   const [pcStatus,setPcStatus]=useState(null); const [pcInfo,setPcInfo]=useState(null); // {lat,lng,postcode}
 
   // live-validate the postcode against the UK postcode database (postcodes.io)
@@ -1601,7 +1619,8 @@ function AddCustomerModal({ onClose, onCreate, onUpdate, onDelete, customer, ini
   const canSave = detailsOk && (!dup || override);
   const save=()=>{ if(!canSave) return;
     const addr=[line1.trim(), town.trim(), pcInfo.postcode].filter(Boolean).join(', ');
-    const data={ title, first:first.trim(), last:last.trim(), addr, mob:mob.trim(), mob2:mob2.trim(), email:email.trim(), lat:pcInfo.lat, lng:pcInfo.lng };
+    const data={ title, first:first.trim(), last:last.trim(), addr, mob:mob.trim(), mob2:mob2.trim(), email:email.trim(),
+      standingNotes:standing.trim(), lat:pcInfo.lat, lng:pcInfo.lng };
     if(editing){ onUpdate({ ...customer, ...data }); onClose(); }
     else { const c = onCreate(data); onClose(c); } };
   const canDelete = editing && onDelete;
@@ -1635,6 +1654,12 @@ function AddCustomerModal({ onClose, onCreate, onUpdate, onDelete, customer, ini
           <Field label="Secondary contact no."><input value={mob2} onChange={e=>setMob2(e.target.value)} type="tel" placeholder="landline or 2nd mobile" className={inputCls+' mt-1'}/></Field>
         </div>
         <div className="mt-3"><Field label="Email"><input value={email} onChange={e=>setEmail(e.target.value)} type="email" className={inputCls+' mt-1'}/></Field></div>
+        <div className="mt-3"><Field label="Standing instructions for staff">
+          <textarea value={standing} onChange={e=>setStanding(e.target.value)} rows="2"
+            placeholder="e.g. Always fold the clothes · OK to leave in the porch · If out, leave in car boot on the drive"
+            className={inputCls+' mt-1'}></textarea>
+          <p className="text-[11px] text-slate2 mt-1">Shown to the driver and the shop <b>every time</b> this customer has a job. For one-off notes about a single order, use the instructions box on the booking instead.</p>
+        </Field></div>
         {dup && <div className="mt-3 rounded-xl border border-rose-200 bg-rose-50 p-3">
           <div className="flex items-start gap-2">
             <span className="text-rose-600 mt-0.5"><Ic name="alert" size={16}/></span>
@@ -1667,14 +1692,41 @@ function AddCustomerModal({ onClose, onCreate, onUpdate, onDelete, customer, ini
     </div>
   );
 }
+// PURE — customer search across name, address, postcode, phone and email (unit-tested).
+// Spaces in the query are ignored for numbers/postcodes so "e17 9nl" and "07700900112" both hit.
+function searchCustomers(list, q) {
+  const raw = (q||'').trim().toLowerCase();
+  if (!raw) return list||[];
+  const terms = raw.split(/\s+/).filter(Boolean);
+  const squashed = raw.replace(/\s/g,'');
+  return (list||[]).filter(c=>{
+    const hay = [c.title,c.first,c.last,c.addr,c.email,c.mob,c.mob2,c.standingNotes].filter(Boolean).join(' ').toLowerCase();
+    const haySquashed = hay.replace(/\s/g,'');
+    if (haySquashed.includes(squashed)) return true;      // postcodes & phone numbers
+    return terms.every(t=>hay.includes(t));               // "grace myrtle" in any order
+  });
+}
 function Customers({ customers, addCustomer, updateCustomer, deleteCustomer, user }) {
   const [adding,setAdding]=useState(false);
   const [editing,setEditing]=useState(null);
+  const [q,setQ]=useState('');
+  const shown = useMemo(()=>searchCustomers(customers,q), [customers,q]);
   return (<div>
-    <div className="flex justify-between items-center mb-3"><h3 className="font-bold text-ink">Customers <span className="text-slate2 font-normal">· {customers.length}</span></h3>
+    <div className="flex justify-between items-center mb-3"><h3 className="font-bold text-ink">Customers <span className="text-slate2 font-normal">· {q.trim()?`${shown.length} of ${customers.length}`:customers.length}</span></h3>
       <Btn kind="subtle" icon="plus" onClick={()=>setAdding(true)}>Add customer</Btn></div>
+    <div className="relative mb-3">
+      <span className="absolute left-3 top-1/2 -translate-y-1/2 text-slate2"><Ic name="search" size={16}/></span>
+      <input value={q} onChange={e=>setQ(e.target.value)} placeholder="Search name, address, postcode, phone or email…"
+        className={inputCls+' pl-9 pr-9'}/>
+      {q && <button onClick={()=>setQ('')} title="Clear search"
+        className="absolute right-3 top-1/2 -translate-y-1/2 text-slate2 hover:text-ink"><Ic name="close" size={16}/></button>}
+    </div>
     <div className="space-y-2">
-      {customers.map(c=>(
+      {shown.length===0 && <div className="bg-white card rounded-2xl p-8 text-center text-slate2">
+        No customers match “{q.trim()}”.
+        <button onClick={()=>setAdding(true)} className="block mx-auto mt-2 text-teal-dark font-semibold text-sm inline-flex items-center gap-1"><Ic name="plus" size={14}/>Add them as a new customer</button>
+      </div>}
+      {shown.map(c=>(
         <div key={c.id} className="bg-white card rounded-2xl p-3.5 flex items-start justify-between gap-3">
           <div className="min-w-0">
             <div className="font-semibold text-ink">{fullName(c)}</div>
@@ -1684,6 +1736,7 @@ function Customers({ customers, addCustomer, updateCustomer, deleteCustomer, use
               <a key={n} href={`tel:${n.replace(/\s/g,'')}`} className="inline-flex items-center gap-1.5 text-teal-dark font-medium"><Ic name="phone" size={14}/>{n}{i===1&&<span className="text-slate2 font-normal text-xs">(2nd)</span>}</a>))}
               {c.email && <span className="inline-flex items-center gap-1.5 truncate"><Ic name="mail" size={14} className="shrink-0"/>{c.email}</span>}
             </div>
+            {c.standingNotes && <div className="mt-2"><StandingNote customer={c} size="xs"/></div>}
           </div>
           <button onClick={()=>setEditing(c)} title="Edit customer" className="shrink-0 w-8 h-8 rounded-lg border border-gray-200 flex items-center justify-center text-slate2 hover:bg-gray-50"><Ic name="edit" size={15}/></button>
         </div>))}
