@@ -207,7 +207,12 @@ const INITIAL_ORDERS = [
 
 /* ------------------------------- helpers ------------------------------- */
 const gbp = n => '£' + Number(n).toFixed(2);
-const custById = id => CUSTOMERS.find(c => c.id === id);
+// Never return undefined. An order can outlive its customer (deleted by mistake,
+// or removed while jobs were still open) and every screen reads c.addr / c.mob —
+// one missing record used to blank the whole portal.
+const MISSING_CUSTOMER = { title:'', first:'Deleted', last:'customer', addr:'Customer record no longer exists',
+                           mob:'', mob2:'', email:'', standingNotes:'', lat:null, lng:null, missing:true };
+const custById = id => CUSTOMERS.find(c => c.id === id) || { ...MISSING_CUSTOMER, id };
 const fullName = c => c ? `${c.title} ${c.first} ${c.last}` : '—';
 const now = () => new Date().toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit'});
 const mapsUrl = addr => `https://www.google.com/maps/dir/?api=1&destination=${encodeURIComponent(addr)}`;
@@ -626,7 +631,14 @@ function StaffLogin({ staff, onLogin }) {
         return;
       }
       const { data, error } = await db.rpc('verify_staff_pin', { p_id:id, p_pin:pin.trim() });
-      if(error){ setErr('Could not reach the login service — check your connection.'); console.error(error); return; }
+      if(error){
+        console.error('verify_staff_pin failed:', error);
+        // Show what actually went wrong — a generic message makes this impossible to diagnose.
+        const msg=(error.message||'')+' '+(error.details||'')+' '+(error.hint||'');
+        setErr(/schema cache|does not exist|not find the function|PGRST202/i.test(msg)
+          ? 'Login service not ready yet — run: notify pgrst, \'reload schema\'; in Supabase, wait a few seconds and try again.'
+          : `Login failed: ${error.message||'unknown error'}`);
+        return; }
       const r = Array.isArray(data) ? data[0] : data;
       if(r && r.ok){
         setPin('');
@@ -1226,9 +1238,9 @@ function OrderModal({ order, rates, onClose, onSave, addAudit, onDelete, onDispa
               </div>
             </div>) : (<>
             <div className="text-sm space-y-1.5">
-              <Row k="Services" v={order.services.join(', ')||'—'}/>
-              {order.extras.length>0 && <Row k="Extras" v={<span className="text-amber-700">{order.extras.join(', ')}</span>}/>}
-              <Row k="Bags" v={order.bagsCount>0?`${order.bagsCount} · ${order.bagWeights.join('+')}kg = ${order.weight}kg`:'—'}/>
+              <Row k="Services" v={(order.services||[]).join(', ')||'—'}/>
+              {(order.extras||[]).length>0 && <Row k="Extras" v={<span className="text-amber-700">{(order.extras||[]).join(', ')}</span>}/>}
+              <Row k="Bags" v={order.bagsCount>0?`${order.bagsCount} · ${(order.bagWeights||[]).join('+')}kg = ${order.weight}kg`:'—'}/>
               <Row k="Packaging" v={order.packaging}/>
               {assignedDriver && <Row k="Driver" v={<span className="inline-flex items-center gap-1"><Ic name="truck" size={13}/>{assignedDriver.name}</span>}/>}
               <Row k="Collected" v={order.collectedDate?`${fmtDate(order.collectedDate)} · ${order.collectedAt}`:'Not yet collected'}/>
@@ -1344,10 +1356,10 @@ function StoreApp({ go, orders, rates, updateOrder, addAudit, deleteOrder, jobs,
   const printList = () => {
     const itemLabel = k => { const r=rates.items.find(x=>x.key===k); return r ? r.label.replace(/^Dry clean — /,'') : k; };
     const addedStr = o => Object.entries(o.addedItems||{}).filter(([k,q])=>parseInt(q)>0).map(([k,q])=>`${itemLabel(k)} ×${q}`).join(', ');
-    const rows = list.map(o=>{ const c=custById(o.customerId); const extra = addedStr(o) || (o.extras.length ? o.extras.join(', ') : '');
+    const rows = list.map(o=>{ const c=custById(o.customerId); const extra = addedStr(o) || ((o.extras||[]).length ? (o.extras||[]).join(', ') : '');
       return `<tr><td><b>${fmtDate(o.dueDate)}</b></td><td>${fullName(c)}<br><span class="a">${c.addr}</span></td>
-        <td>${o.services.join(', ')}${extra?`<br><span class="r">+ ${extra}</span>`:''}</td>
-        <td>${o.bagsCount} (${o.bagWeights.join('+')}kg) · ${o.weight}kg</td>
+        <td>${(o.services||[]).join(', ')}${extra?`<br><span class="r">+ ${extra}</span>`:''}</td>
+        <td>${o.bagsCount} (${(o.bagWeights||[]).join('+')}kg) · ${o.weight}kg</td>
         <td>${gbp(o.amount)}${o.needsPricing?' <span class="r">(prov.)</span>':''}<br><span class="a">${o.paidInAdvance?'PAID':o.paymentMethod}</span></td>
         <td>${o.packaging}</td><td>${fmtDate(o.collectedDate)} ${o.collectedAt}</td><td>${o.status==='Needs pricing'?`<span class="r">${o.status}</span>`:o.status}</td><td>${c&&c.standingNotes?`<b class="v">Always: ${c.standingNotes}</b><br>`:''}${o.notes||''}</td></tr>`; }).join('');
     const html = `<html><head><title>NELIS — ${scope==='today'?'Today':'This week'}</title>
@@ -1400,10 +1412,10 @@ function StoreApp({ go, orders, rates, updateOrder, addAudit, deleteOrder, jobs,
                       </div>
                       <div className="font-semibold text-ink mt-1.5">{fullName(c)}</div>
                       <div className="text-sm text-slate2">{c.addr}</div>
-                      {o.extras.length>0 && <div className="text-xs text-amber-700 mt-1 inline-flex items-center gap-1"><Ic name="alert" size={13}/>To price: {o.extras.join(', ')}</div>}
+                      {(o.extras||[]).length>0 && <div className="text-xs text-amber-700 mt-1 inline-flex items-center gap-1"><Ic name="alert" size={13}/>To price: {(o.extras||[]).join(', ')}</div>}
                     </div>
                     <div className="text-sm grid grid-cols-2 gap-x-6 gap-y-0.5">
-                      <span className="text-slate2">Services</span><span className="text-ink text-right">{o.services.join(', ')}</span>
+                      <span className="text-slate2">Services</span><span className="text-ink text-right">{(o.services||[]).join(', ')}</span>
                       <span className="text-slate2">Bags</span><span className="text-ink text-right">{o.bagsCount} · {o.weight}kg</span>
                       <span className="text-slate2">Price</span><span className="text-ink text-right">{gbp(o.amount)}{o.needsPricing?' (prov.)':''}</span>
                       <span className="text-slate2">Collected</span><span className="text-ink text-right">{fmtDate(o.collectedDate)} · {o.collectedAt}</span>
@@ -1807,7 +1819,7 @@ function Orders({ orders, rates, updateOrder, addAudit, filter, onClearFilter, d
         <Badge tone={statusTone(o.status)}>{o.status}</Badge>
       </div>
       <div className="flex items-center justify-between gap-2 mt-1 text-sm">
-        <span className="text-slate2 truncate">{o.services.join(', ')||'—'}{o.extras.length?<span className="text-amber-600"> +{o.extras.length}</span>:''}</span>
+        <span className="text-slate2 truncate">{(o.services||[]).join(', ')||'—'}{(o.extras||[]).length?<span className="text-amber-600"> +{(o.extras||[]).length}</span>:''}</span>
         <span className="text-slate2 shrink-0">{o.bagsCount} · {o.weight}kg</span>
       </div>
       <div className="flex items-center justify-between gap-2 mt-1.5 text-sm">
@@ -2268,11 +2280,24 @@ function App() {
   },[]);
   const deleteCustomer=useCallback((id)=>{
     const c = CUSTOMERS.find(x=>x.id===id);
+    // Deleting someone who still has orders or stops leaves those records
+    // pointing at nothing, so make the consequence explicit first.
+    const theirOrders = orders.filter(o=>o.customerId===id);
+    const live = theirOrders.filter(o=>o.status!=='Delivered').length;
+    const stops = jobs.filter(j=>j.customerId===id && j.status==='pending').length;
+    if(live || stops){
+      const bits=[]; if(live) bits.push(`${live} order${live>1?'s':''} still in progress`);
+      if(stops) bits.push(`${stops} stop${stops>1?'s':''} on a driver's run`);
+      if(!window.confirm(
+        `${fullName(c)} has ${bits.join(' and ')}.\n\n`+
+        `Deleting them will leave those showing as "Deleted customer" — the orders and stops are NOT removed.\n\n`+
+        `Delete anyway?`)) return;
+    }
     CUSTOMERS = CUSTOMERS.filter(x=>x.id!==id);
     setCustomersState(CUSTOMERS);
     if(db) db.from('customers').delete().eq('id',id).then(r=>{ if(r&&r.error) reportErr('delete customer', r.error); });
-    if(c) addAudit(`${actor()} deleted customer ${fullName(c)}`);
-  },[]);
+    if(c) addAudit(`${actor()} deleted customer ${fullName(c)}${live||stops?` (had ${live} order(s), ${stops} stop(s))`:''}`);
+  },[orders,jobs]);
   const dispatchDelivery=useCallback((order, driverId, window, day)=>{
     const runDate = day || TODAY;
     const nj={ id:uuid(), driverId, type:'delivery', customerId:order.customerId, orderId:order.id, window, status:'pending', runDate,
