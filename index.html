@@ -390,7 +390,14 @@ function totalMiles(jobs, driverIds, day){
 /* =================================================================== */
 const SUPABASE_URL = 'https://natbffwqalxxqeacehsk.supabase.co';
 const SUPABASE_KEY = 'sb_publishable_zgc-wGOojSP-KGEr6eLs-g_oL2y8Gne';
-const db = (window.supabase && SUPABASE_URL) ? window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY) : null;
+// The client is rebuilt after sign-in so that every request carries the staff
+// session token. The database uses that token to decide what it will hand back,
+// which is why the publishable key on its own is not enough to read anything.
+const makeDb = (token) => (window.supabase && SUPABASE_URL)
+  ? window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY,
+      token ? { global: { headers: { 'x-staff-token': token } } } : undefined)
+  : null;
+let db = makeDb(null);
 const uuid = () => (crypto.randomUUID ? crypto.randomUUID() :
   'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g,c=>{const r=Math.random()*16|0;return (c==='x'?r:(r&0x3|0x8)).toString(16);}));
 const num = v => v==null ? v : Number(v);
@@ -518,11 +525,13 @@ const saveDrivers= arr => db && db.from('drivers').upsert(arr.map(d=>({id:d.id,n
 // Proof that this browser passed the PIN check. Held in memory only, so it is
 // gone when the tab closes and never written to disk.
 let SESSION_TOKEN = null;
+// swap the client so subsequent queries are made as the signed-in staff member
+const setDbToken = (token) => { SESSION_TOKEN = token || null; db = makeDb(SESSION_TOKEN); };
 const setStaffPin= (id,pin) => db
   ? db.rpc('set_staff_pin',{p_token:SESSION_TOKEN,p_target_id:id,p_pin:String(pin).trim()})
       .then(r=>{ if(r&&r.error){ reportErr('set PIN', r.error); return false; } return true; })
   : Promise.resolve(true);
-const endStaffSession = () => { if(db && SESSION_TOKEN) db.rpc('end_staff_session',{p_token:SESSION_TOKEN}); SESSION_TOKEN=null; };
+const endStaffSession = () => { if(db && SESSION_TOKEN) db.rpc('end_staff_session',{p_token:SESSION_TOKEN}); setDbToken(null); };
 const insertAudit= e   => db && db.from('audit_log').insert({at:e.time, text:e.text, is_alert:/^No answer/.test(e.text)}).then(logErr('insertAudit'));
 const saveRates  = r   => { if(!db) return;
   const rows=[ ...r.weight.map((x,i)=>({key:x.key,kind:'weight',label:x.label,price:x.price,unit:x.unit||'kg',sort:i+1})),
@@ -642,7 +651,7 @@ function StaffLogin({ staff, onLogin }) {
       const r = Array.isArray(data) ? data[0] : data;
       if(r && r.ok){
         setPin('');
-        SESSION_TOKEN = r.session_token || null;
+        setDbToken(r.session_token || null);
         onLogin({ id:r.staff_id, name:r.staff_name, roles:(r.staff_roles&&r.staff_roles.length?r.staff_roles:['driver']),
                   canDelete:!!r.staff_can_delete, active:true });
       } else {
@@ -2227,13 +2236,20 @@ function App() {
   // land at the top on first paint and on every portal change
   useEffect(()=>{ window.scrollTo(0,0); },[view,phase]);
 
-  useEffect(()=>{ if(!db) return;
-    loadAll().then(d=>{ setCustomersState(d.customers); setDriversState(d.drivers); setJobsState(d.jobs); setOrdersState(d.orders); setRatesState(d.rates); setAudit(d.audit); setPhase('ready');
+  // Pull everything the signed-in person is allowed to see. Runs once on start
+  // (when only the staff list is readable) and again after sign-in, once the
+  // session token lets the database release the rest.
+  const reloadAll = useCallback(()=>{
+    if(!db) return Promise.resolve();
+    return loadAll().then(d=>{
+        setCustomersState(d.customers); setDriversState(d.drivers); setJobsState(d.jobs);
+        setOrdersState(d.orders); setRatesState(d.rates); setAudit(d.audit); setPhase('ready');
         const missing = d.customers.filter(c=>c.addr && c.lat==null);  // fill in map coordinates for any that lack them
         if(missing.length) backfillCoords(missing, (id,pt)=>{ CUSTOMERS = CUSTOMERS.map(x=>x.id===id?{...x,...pt}:x); setCustomersState(CUSTOMERS);
           if(db) db.from('customers').update({lat:pt.lat,lng:pt.lng}).eq('id',id).then(logErr('backfill coords')); }); })
       .catch(e=>{ console.error(e); setErr(e.message||String(e)); setPhase('error'); });
   },[]);
+  useEffect(()=>{ reloadAll(); },[]);
   useEffect(()=>{ onSaveError=(m)=>setSaveError(m); return ()=>{ onSaveError=null; }; },[]);
 
   // write-through setters: update the screen AND save to the database
@@ -2354,7 +2370,12 @@ function App() {
     addAudit(`${actor()} booked a ${isCol?'collection':'delivery'} for ${fullName(custById(j.customerId))} on ${fmtDate(day)}`);
   },[addAudit]);
   const go=useCallback(v=>{ if(v==='logout'){ endStaffSession(); setUser(null); setView('picker'); return; } setView(v); },[]);
-  const onLogin=(s)=>{ setUser(s); const allowed=PORTALS.filter(p=>hasRole(s,p.role)); setView(allowed.length===1?allowed[0].view:'picker'); };
+  const onLogin=(s)=>{
+    setUser(s);
+    const allowed=PORTALS.filter(p=>hasRole(s,p.role));
+    setView(allowed.length===1?allowed[0].view:'picker');
+    reloadAll();   // the token is set now, so fetch what they're allowed to see
+  };
 
   let screen=null;
   if (phase==='loading') screen=<LoadingScreen/>;
