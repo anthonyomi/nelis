@@ -146,7 +146,9 @@ const WindowOptions = () => WINDOW_GROUPS.map(g=>(
 // date by a day during British Summer Time, so every date is built by hand.
 const isoDate = d => `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
 const TODAY = isoDate(new Date());   // real "today" so it matches the database dates
-const fmtDate = iso => new Date(iso+'T00:00:00').toLocaleDateString('en-GB',{weekday:'short',day:'numeric',month:'short'});
+const fmtDate = iso => { if(!iso) return '—';
+  const d = new Date(iso+'T00:00:00');
+  return isNaN(d) ? '—' : d.toLocaleDateString('en-GB',{weekday:'short',day:'numeric',month:'short'}); };
 const addDays = (iso,n)=>{ const [y,m,d]=String(iso).split('-').map(Number); const dt=new Date(y,(m||1)-1,d||1); dt.setDate(dt.getDate()+n); return isoDate(dt); };
 const withinWeek = iso => iso>=TODAY && iso<=addDays(TODAY,6);
 
@@ -525,8 +527,14 @@ const saveDrivers= arr => db && db.from('drivers').upsert(arr.map(d=>({id:d.id,n
 // Proof that this browser passed the PIN check. Held in memory only, so it is
 // gone when the tab closes and never written to disk.
 let SESSION_TOKEN = null;
+// Remembered for THIS BROWSER TAB only, so a refresh doesn't sign you out.
+// Closing the tab clears it, and the database still expires the session after
+// 12 hours regardless. Only the token is kept — never a PIN, name or role.
+const TOKEN_KEY = 'nelis.session';
+const rememberToken = (t) => { try{ t ? sessionStorage.setItem(TOKEN_KEY,t) : sessionStorage.removeItem(TOKEN_KEY); }catch(e){} };
+const recallToken   = ()  => { try{ return sessionStorage.getItem(TOKEN_KEY); }catch(e){ return null; } };
 // swap the client so subsequent queries are made as the signed-in staff member
-const setDbToken = (token) => { SESSION_TOKEN = token || null; db = makeDb(SESSION_TOKEN); };
+const setDbToken = (token) => { SESSION_TOKEN = token || null; db = makeDb(SESSION_TOKEN); rememberToken(SESSION_TOKEN); };
 const setStaffPin= (id,pin) => db
   ? db.rpc('set_staff_pin',{p_token:SESSION_TOKEN,p_target_id:id,p_pin:String(pin).trim()})
       .then(r=>{ if(r&&r.error){ reportErr('set PIN', r.error); return false; } return true; })
@@ -1370,7 +1378,7 @@ function StoreApp({ go, orders, rates, updateOrder, addAudit, deleteOrder, jobs,
         <td>${(o.services||[]).join(', ')}${extra?`<br><span class="r">+ ${extra}</span>`:''}</td>
         <td>${o.bagsCount} (${(o.bagWeights||[]).join('+')}kg) · ${o.weight}kg</td>
         <td>${gbp(o.amount)}${o.needsPricing?' <span class="r">(prov.)</span>':''}<br><span class="a">${o.paidInAdvance?'PAID':o.paymentMethod}</span></td>
-        <td>${o.packaging}</td><td>${fmtDate(o.collectedDate)} ${o.collectedAt}</td><td>${o.status==='Needs pricing'?`<span class="r">${o.status}</span>`:o.status}</td><td>${c&&c.standingNotes?`<b class="v">Always: ${c.standingNotes}</b><br>`:''}${o.notes||''}</td></tr>`; }).join('');
+        <td>${o.packaging}</td><td>${o.collectedDate?`${fmtDate(o.collectedDate)} ${o.collectedAt||''}`:'—'}</td><td>${o.status==='Needs pricing'?`<span class="r">${o.status}</span>`:o.status}</td><td>${c&&c.standingNotes?`<b class="v">Always: ${c.standingNotes}</b><br>`:''}${o.notes||''}</td></tr>`; }).join('');
     const html = `<html><head><title>NELIS — ${scope==='today'?'Today':'This week'}</title>
       <style>body{font-family:Arial;padding:18px;color:#1f2a30}h1{font-size:16px;margin:0}.sub{color:#777;font-size:12px;margin:2px 0 12px}
       table{width:100%;border-collapse:collapse;font-size:11px}th{background:#3AAFCB;color:#fff;text-align:left;padding:5px 6px}
@@ -1427,7 +1435,7 @@ function StoreApp({ go, orders, rates, updateOrder, addAudit, deleteOrder, jobs,
                       <span className="text-slate2">Services</span><span className="text-ink text-right">{(o.services||[]).join(', ')}</span>
                       <span className="text-slate2">Bags</span><span className="text-ink text-right">{o.bagsCount} · {o.weight}kg</span>
                       <span className="text-slate2">Price</span><span className="text-ink text-right">{gbp(o.amount)}{o.needsPricing?' (prov.)':''}</span>
-                      <span className="text-slate2">Collected</span><span className="text-ink text-right">{fmtDate(o.collectedDate)} · {o.collectedAt}</span>
+                      <span className="text-slate2">Collected</span><span className="text-ink text-right">{o.collectedDate?`${fmtDate(o.collectedDate)} · ${o.collectedAt||''}`:'Not collected — delivery only'}</span>
                     </div>
                   </div>
                   {c && c.standingNotes && <div className="mt-2"><StandingNote customer={c} size="xs"/></div>}
@@ -2249,7 +2257,29 @@ function App() {
           if(db) db.from('customers').update({lat:pt.lat,lng:pt.lng}).eq('id',id).then(logErr('backfill coords')); }); })
       .catch(e=>{ console.error(e); setErr(e.message||String(e)); setPhase('error'); });
   },[]);
-  useEffect(()=>{ reloadAll(); },[]);
+  // On start, if this tab still has a token, ask the DATABASE who it belongs to.
+  // The identity and permissions come back from the server, so nothing stored in
+  // the browser can be edited to gain access.
+  useEffect(()=>{
+    const saved = recallToken();
+    if(!saved || !db){ reloadAll(); return; }
+    setDbToken(saved);
+    db.rpc('staff_from_token',{ p_token:saved }).then(({data,error})=>{
+      const r = Array.isArray(data)?data[0]:data;
+      if(error || !r || !r.staff_id){        // expired, signed out elsewhere, or unknown
+        setDbToken(null); try{ sessionStorage.removeItem('nelis.view'); }catch(e){}
+        reloadAll(); return;
+      }
+      const u={ id:r.staff_id, name:r.staff_name,
+                roles:(r.staff_roles&&r.staff_roles.length?r.staff_roles:['driver']),
+                canDelete:!!r.staff_can_delete, active:true };
+      setUser(u);
+      let v=null; try{ v=sessionStorage.getItem('nelis.view'); }catch(e){}
+      const allowed=PORTALS.filter(p=>hasRole(u,p.role));
+      setView(v && allowed.some(p=>p.view===v) ? v : (allowed.length===1?allowed[0].view:'picker'));
+      reloadAll();
+    }).catch(()=>{ setDbToken(null); reloadAll(); });
+  },[]);
   useEffect(()=>{ onSaveError=(m)=>setSaveError(m); return ()=>{ onSaveError=null; }; },[]);
 
   // write-through setters: update the screen AND save to the database
@@ -2386,11 +2416,16 @@ function App() {
     });
     addAudit(`${actor()} booked a ${isCol?'collection':'delivery'} for ${fullName(custById(j.customerId))} on ${fmtDate(day)}`);
   },[addAudit]);
-  const go=useCallback(v=>{ if(v==='logout'){ endStaffSession(); setUser(null); setView('picker'); return; } setView(v); },[]);
+  const go=useCallback(v=>{
+    if(v==='logout'){ endStaffSession(); try{ sessionStorage.removeItem('nelis.view'); }catch(e){} setUser(null); setView('picker'); return; }
+    try{ sessionStorage.setItem('nelis.view', v); }catch(e){}
+    setView(v);
+  },[]);
   const onLogin=(s)=>{
     setUser(s);
     const allowed=PORTALS.filter(p=>hasRole(s,p.role));
-    setView(allowed.length===1?allowed[0].view:'picker');
+    const v = allowed.length===1?allowed[0].view:'picker';
+    setView(v); try{ sessionStorage.setItem('nelis.view', v); }catch(e){}
     reloadAll();   // the token is set now, so fetch what they're allowed to see
   };
 
