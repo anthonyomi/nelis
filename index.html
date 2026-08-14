@@ -2253,7 +2253,15 @@ function App() {
   useEffect(()=>{ onSaveError=(m)=>setSaveError(m); return ()=>{ onSaveError=null; }; },[]);
 
   // write-through setters: update the screen AND save to the database
-  const setJobs=useCallback(u=>setJobsState(prev=>{ const next=typeof u==='function'?u(prev):u; saveJobs(next); return next; }),[]);
+  // Write ONLY the rows that actually changed. This used to save every job on
+  // every edit, so a single unsaveable row blocked all other saves.
+  const setJobs=useCallback(u=>setJobsState(prev=>{
+    const next=typeof u==='function'?u(prev):u;
+    const before=new Map(prev.map(j=>[j.id, JSON.stringify(toJobRow(j))]));
+    const changed=next.filter(j=>before.get(j.id)!==JSON.stringify(toJobRow(j)));
+    if(changed.length) saveJobs(changed);
+    return next;
+  }),[]);
   const setRates=useCallback(u=>setRatesState(prev=>{ const next=typeof u==='function'?u(prev):u; saveRates(next); return next; }),[]);
   const setDrivers=useCallback(u=>setDriversState(prev=>{ const next=typeof u==='function'?u(prev):u; DRIVERS=next; saveDrivers(next); return next; }),[]);
   const deleteDriver=useCallback((id)=>{ setDriversState(prev=>{ const d=prev.find(x=>x.id===id); const next=prev.filter(x=>x.id!==id); DRIVERS=next;
@@ -2357,13 +2365,22 @@ function App() {
     setJobsState(prev=>{
       const n=prev.filter(x=>x.driverId===j.driverId && (x.runDate||TODAY)===day).length;
       const nj={...j, runDate:day, orderId, seq:n+1};
-      // persist: order first, THEN the job — awaited so the order exists before the job's FK
+      // persist: order first, THEN the job — awaited so the order exists before the job's FK.
+      // If either write fails, take the booking back off the screen: leaving it
+      // there would point at an order the database doesn't have, and every later
+      // save would fail against that dangling link.
+      const undo=(why)=>{
+        setJobsState(p=>p.filter(x=>x.id!==nj.id));
+        setOrdersState(p=>p.filter(x=>x.id!==orderId));
+        if(db) db.from('orders').delete().eq('id',orderId);   // clear a half-written order
+        reportErr(why, { message:'the booking was not saved, so it has been removed from the screen — please add it again' });
+      };
       (async()=>{
         if(!db) return;
         try {
-          const o=await db.from('orders').insert(toOrderRow(order)); if(o.error){ reportErr('save booking', o.error); return; }
-          const r=await db.from('jobs').insert(toJobRow(nj)); if(r.error) reportErr('save job', r.error);
-        } catch(e){ reportErr('save job', e); }
+          const o=await db.from('orders').insert(toOrderRow(order)); if(o.error){ reportErr('save booking', o.error); undo('save booking'); return; }
+          const r=await db.from('jobs').insert(toJobRow(nj));        if(r.error){ reportErr('save job', r.error);     undo('save job'); }
+        } catch(e){ reportErr('save job', e); undo('save job'); }
       })();
       return [...prev, nj];
     });
