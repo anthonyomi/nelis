@@ -32,6 +32,15 @@
   ::-webkit-scrollbar { width:9px; height:9px; }
   ::-webkit-scrollbar-thumb { background:#cdd6da; border-radius:6px; }
   .drag-over { outline:2px dashed #3AAFCB; outline-offset:-2px; background:#eaf7fb; }
+  /* the grip is the drag handle; touch-action:none stops the page scrolling
+     while a finger is dragging FROM it (swiping the card still scrolls) */
+  .grip-handle { touch-action:none; cursor:grab; }
+  .grip-handle:active { cursor:grabbing; }
+  .dragging-now { opacity:.4; }
+  body.is-dragging { user-select:none; -webkit-user-select:none; }
+  .drag-ghost { position:fixed; z-index:60; pointer-events:none; transform:translate(-50%,-140%);
+    background:#1f2a30; color:#fff; font:600 12px Inter,sans-serif; padding:6px 10px;
+    border-radius:9px; box-shadow:0 6px 18px rgba(0,0,0,.25); white-space:nowrap; }
   select, input, textarea, button { font-family:inherit; }
   html { -webkit-text-size-adjust:100%; }
   body { overflow-x:hidden; }
@@ -123,7 +132,12 @@ const INITIAL_RATES = {
   minOrder: 25.00,
   firstOrderDiscount: 0.10,
 };
-const PACKAGING = ['Hanging', 'Hanging in box', 'Box only'];
+// Packaging is decided at the SHOP and chosen when the order goes on the van —
+// at the door on a collection nobody knows yet what it will come back as.
+const PACKAGING = ['Hanging only', 'Box and hanging', 'Box only'];
+// older orders used the previous wording
+const PACKAGING_ALIAS = { 'Hanging':'Hanging only', 'Hanging in box':'Box and hanging' };
+const packLabel = p => PACKAGING_ALIAS[p] || p || '—';
 const EXTRA_TYPES = ['Dry cleaning', 'Bedding / duvet', 'Repairs & alterations'];
 // The round starts at 5pm and the driver works the stops in the quickest order,
 // so the standard booking has no fixed hour — only the exceptions need one.
@@ -164,7 +178,22 @@ let CUSTOMERS = [
   { id:'c5', title:'Mrs', first:'Priya',   last:'Sharma',  addr:'9 Nightingale Ln, Wanstead, E11 2EW',  mob:'07700 900566', email:'priya@example.com',   lat:51.5725, lng: 0.0175 },
   { id:'c6', title:'Ms',  first:'Grace',   last:'Bennett', addr:'5 Myrtle Rd, Walthamstow, E17 8BX',    mob:'07700 900677', email:'grace@example.com',   lat:51.5895, lng:-0.0225 },
 ];
-const SHOP = { name:'NEL Ironing Service', addr:'5 Blackhorse Road, Walthamstow, E17 7AH', lat:51.5865, lng:-0.0410 };
+// Verified against the postcode database (E17 7AH). The previous values were
+// entered by hand and sat ~670m north-west of the shop, which skewed every
+// distance and the whole suggested running order.
+const SHOP = { name:'NEL Ironing Service', addr:'5 Blackhorse Road, Walthamstow, E17 7AH', lat:51.58199, lng:-0.034595 };
+// Re-check the shop position from its postcode on startup, so a corrected
+// address fixes the map without anyone editing code.
+(function fixShopPosition(){
+  try{
+    const pc=(SHOP.addr.match(/[A-Z]{1,2}\d[A-Z\d]?\s*\d[A-Z]{2}/i)||[''])[0];
+    if(!pc) return;
+    fetch(`https://api.postcodes.io/postcodes/${encodeURIComponent(pc.replace(/\s+/g,''))}`)
+      .then(r=>r.json())
+      .then(j=>{ if(j&&j.status===200&&j.result){ SHOP.lat=j.result.latitude; SHOP.lng=j.result.longitude; } })
+      .catch(()=>{});
+  }catch(e){}
+})();
 let DRIVERS = [ { id:'d1', name:'Sam Okoro', pin:'1234', roles:['driver'] }, { id:'d2', name:'Maria Silva', pin:'1234', roles:['driver'] }, { id:'d0', name:'Boss', pin:'0000', roles:['admin','store','driver'], canDelete:true } ];
 
 const INITIAL_JOBS = [
@@ -266,12 +295,16 @@ function groupOrdersByDue(orders, today) {
 // Anything physically in the shop counts, and anything past its due date always
 // shows regardless of the Today/This week toggle — it can't be allowed to vanish.
 const IN_SHOP_STATUSES = ['Collected','Needs pricing','In Shop','Ready'];
+// scope is 'week' or a specific date. Overdue work is pinned to TODAY (and the
+// week view) so it demands attention, without cluttering a future day's list.
 function storeList(orders, scope, today) {
   const end = addDays(today, 6);
+  const showsOverdue = scope==='week' || scope===today;
   return (orders||[])
     .filter(o => IN_SHOP_STATUSES.includes(o.status))
-    .filter(o => { const d=o.dueDate||''; if(!d || d<today) return true;      // overdue / undated: always
-                   return scope==='today' ? d===today : d<=end; })
+    .filter(o => { const d=o.dueDate||'';
+                   if(!d || d<today) return showsOverdue;      // overdue / undated
+                   return scope==='week' ? d<=end : d===scope; })
     .sort((a,b)=> (a.dueDate||'').localeCompare(b.dueDate||'') || (a.collectedAt||'').localeCompare(b.collectedAt||''));
 }
 // PURE — can the driver reopen a finished stop? (unit-tested)
@@ -287,6 +320,23 @@ function canReopen(job, order) {
       return { ok:false, reason:`The shop has already taken this in (${order.status}) — ask the shop to change it.` };
   }
   return { ok:true, reason:'' };
+}
+// PURE — deliveries for one driver grouped by how they're packed (unit-tested).
+// Mark loads the van by packaging type, not by driving order.
+function loadingGroups(jobs, driverId, day) {
+  const mine=(jobs||[]).filter(j=>j.driverId===driverId && (j.runDate||TODAY)===day
+                                 && j.type==='delivery' && j.status==='pending')
+                       .sort((a,b)=>a.seq-b.seq);
+  const groups=PACKAGING.map(p=>({ packaging:p, stops:[], bags:0 }));
+  const other={ packaging:'Not set yet', stops:[], bags:0 };
+  mine.forEach(j=>{
+    const label=packLabel(j.packaging);
+    const g=groups.find(x=>x.packaging===label) || other;
+    g.stops.push({ seq:j.seq, name:fullName(custById(j.customerId)), bags:j.bags||0 });
+    g.bags += j.bags||0;
+  });
+  const all=[...groups, other].filter(g=>g.stops.length);
+  return { groups:all, total:mine.length, bags:all.reduce((n,g)=>n+g.bags,0) };
 }
 // PURE reorder helpers (unit-tested).
 // Every helper is scoped to one driver on ONE DAY — stops are numbered 1..n per
@@ -715,23 +765,35 @@ function PortalPicker({ user, onPick, onLogout }) {
 // friendly label for a run date — "Today", "Tomorrow", else the date
 const dayLabel = iso => iso===TODAY ? 'Today' : iso===addDays(TODAY,1) ? 'Tomorrow'
   : iso===addDays(TODAY,-1) ? 'Yesterday' : fmtDate(iso);
-function DayPicker({ day, setDay, count }) {
+// PURE — the next few days as named tabs (unit-tested).
+// Mark thinks in "today, tomorrow, Wednesday", not in dates.
+function dayTabs(today, span=6, extra=null) {
+  const days=[];
+  for(let i=0;i<span;i++){ const d=addDays(today,i);
+    days.push({ date:d, label: i===0?'Today' : i===1?'Tomorrow'
+      : new Date(d+'T00:00:00').toLocaleDateString('en-GB',{weekday:'short'}) }); }
+  // a day being viewed that sits outside the window (e.g. next week) still gets a tab
+  if(extra && !days.some(d=>d.date===extra))
+    days.push({ date:extra, label:fmtDate(extra).replace(/^\w+ /,'') });
+  return days;
+}
+function DayPicker({ day, setDay, counts, span=6 }) {
+  const tabs = dayTabs(TODAY, span, day);
   return (
-    <div className="bg-white card rounded-2xl p-2 flex items-center gap-2">
-      <button onClick={()=>setDay(addDays(day,-1))} title="Previous day"
-        className="w-9 h-9 rounded-lg border border-gray-200 flex items-center justify-center text-slate2 hover:bg-gray-50 shrink-0"><Ic name="left" size={18}/></button>
-      <div className="flex-1 text-center min-w-0">
-        <div className="font-extrabold text-ink leading-tight truncate">{dayLabel(day)}</div>
-        <div className="text-[11px] text-slate2 truncate">{fmtDate(day)}{count!=null?` · ${count} stop${count===1?'':'s'}`:''}</div>
-      </div>
-      <button onClick={()=>setDay(addDays(day,1))} title="Next day"
-        className="w-9 h-9 rounded-lg border border-gray-200 flex items-center justify-center text-slate2 hover:bg-gray-50 shrink-0"><Ic name="right" size={18}/></button>
-      {day!==TODAY && <button onClick={()=>setDay(TODAY)} className="text-xs font-semibold text-teal-dark px-2 shrink-0">Today</button>}
+    <div className="bg-white card rounded-2xl p-1.5 flex gap-1 overflow-x-auto">
+      {tabs.map(t=>{ const on=t.date===day, n=counts?counts[t.date]:null;
+        return (
+          <button key={t.date} onClick={()=>setDay(t.date)}
+            className={`px-3 py-1.5 rounded-xl text-sm font-semibold whitespace-nowrap shrink-0 inline-flex items-center gap-1.5 ${on?'bg-teal text-white':'text-slate2 hover:bg-gray-50'}`}>
+            {t.label}
+            {n!=null && n>0 && <span className={`text-[10px] font-bold px-1.5 rounded-full ${on?'bg-white/25':'bg-gray-100 text-gray-600'}`}>{n}</span>}
+          </button>); })}
     </div>);
 }
-function DriverApp({ driver, go, jobs, setJobs, orders, rates, addAudit, addOrder, updateOrder }) {
+function DriverApp({ driver, go, jobs, setJobs, orders, customers, rates, addAudit, addOrder, updateOrder }) {
   const [openId,setOpenId]=useState(null);
   const [day,setDay]=useState(TODAY);
+  const [showMap,setShowMap]=useState(false);
   const myJobs = jobs.filter(j=>j.driverId===driver.id && (j.runDate||TODAY)===day).sort((a,b)=>a.seq-b.seq);
   const myPending = myJobs.filter(j=>j.status==='pending');   // only these can be shuffled
   const nextPendingId = (myPending[0]||{}).id;
@@ -739,6 +801,11 @@ function DriverApp({ driver, go, jobs, setJobs, orders, rates, addAudit, addOrde
   const openJob = openId ? jobs.find(j=>j.id===openId) : null;
   useEffect(()=>{ window.scrollTo(0,0); },[openId,day]);  // opening/closing a stop starts at the top
   // how many stops are waiting on other days, so nothing gets silently missed
+  const dayCounts = useMemo(()=>{
+    const m={}; jobs.forEach(j=>{ if(j.driverId!==driver.id) return;
+      const d=j.runDate||TODAY; m[d]=(m[d]||0)+1; });
+    return m;
+  },[jobs,driver.id]);
   const otherDays = useMemo(()=>{
     const m={}; jobs.forEach(j=>{ if(j.driverId!==driver.id||j.status!=='pending') return;
       const d=j.runDate||TODAY; if(d!==day) m[d]=(m[d]||0)+1; });
@@ -826,7 +893,17 @@ function DriverApp({ driver, go, jobs, setJobs, orders, rates, addAudit, addOrde
           </div>
           <p className="text-slate2 text-sm mb-1">In driving order. <span className="text-rose-500 font-semibold">Pink = collection</span>, white = delivery. Next job highlighted; done jobs greyed out.</p>
           {myPending.length>1 && <p className="text-slate2 text-xs mb-3 inline-flex items-center gap-1"><Ic name="up" size={13}/>Use the arrows to change the order if you'd rather do a stop earlier — the office sees the change.</p>}
-          <div className="mb-3"><DayPicker day={day} setDay={setDay} count={myJobs.length}/></div>
+          <div className="mb-3"><DayPicker day={day} setDay={setDay} counts={dayCounts}/></div>
+          {myJobs.length>0 && <div className="bg-white card rounded-2xl p-2 mb-3">
+            <button onClick={()=>setShowMap(v=>!v)} className="w-full flex items-center justify-between px-1.5 py-1 text-sm font-semibold text-ink">
+              <span className="inline-flex items-center gap-1.5"><Ic name="pin" size={16}/>Your stops on the map</span>
+              <span className="text-slate2 inline-flex items-center gap-1 text-xs font-normal">{showMap?'Hide':'Show'}<Ic name={showMap?'up':'down'} size={14}/></span>
+            </button>
+            {showMap && <div className="mt-2">
+              <RouteMap jobs={myJobs} drivers={[driver]} filterDriver={driver.id} customers={customers} height="240px"/>
+              <p className="text-[11px] text-slate2 mt-1.5"><span className="text-rose-500 font-semibold">Pink = collection</span>, <span className="text-teal-dark font-semibold">blue = delivery</span>, grey = done. The house marker is the shop.</p>
+            </div>}
+          </div>}
           {otherDays.length>0 && <div className="mb-3 flex flex-wrap gap-1.5">
             {otherDays.map(([d,n])=>(
               <button key={d} onClick={()=>setDay(d)} className="px-2.5 py-1 rounded-full text-[11px] font-semibold bg-teal-light text-teal-dark">
@@ -856,7 +933,7 @@ function DriverApp({ driver, go, jobs, setJobs, orders, rates, addAudit, addOrde
                         <div className={`font-semibold mt-1 ${resolved?'text-slate2':'text-ink'}`}>{fullName(c)}</div>
                         <div className={`text-sm ${resolved?'text-gray-400':'text-slate2'}`}>{c.addr}</div>
                         {job.type==='delivery'
-                          ? <div className="text-xs text-slate2 mt-0.5 inline-flex items-center gap-1"><Ic name="box" size={13}/>{job.packaging}</div>
+                          ? <div className="text-xs text-slate2 mt-0.5 inline-flex items-center gap-1"><Ic name="box" size={13}/>{packLabel(job.packaging)}</div>
                           : job.returnDate && <div className="text-xs text-slate2 mt-0.5">Return {fmtDate(job.returnDate)}</div>}
                         {c && c.standingNotes && <div className="mt-1"><StandingNote customer={c} size="xs"/></div>}
                         {job.instructions && <div className="text-xs text-rose-700 mt-1 bg-rose-50 rounded-lg px-2 py-1 inline-flex items-start gap-1"><Ic name="note" size={13}/><span>{job.instructions}</span></div>}
@@ -1093,7 +1170,7 @@ function DeliveryView({ job, onBack, onConfirm, onNoAnswer }) {
         <div className="bg-gray-50 rounded-xl p-4 mt-4 text-sm text-ink space-y-1">
           <div className="flex justify-between"><span className="text-slate2">Service</span><span>{job.service}</span></div>
           <div className="flex justify-between"><span className="text-slate2">Bags</span><span>{job.bags} · {job.weight}kg</span></div>
-          <div className="flex justify-between"><span className="text-slate2">Packaging</span><span>{job.packaging}</span></div>
+          <div className="flex justify-between"><span className="text-slate2">Packaging</span><span>{packLabel(job.packaging)}</span></div>
           <div className="flex justify-between"><span className="text-slate2">Amount</span><span>{gbp(job.amount)}</span></div>
         </div>
         {c && c.standingNotes && <div className="mt-3"><StandingNote customer={c}/></div>}
@@ -1154,6 +1231,7 @@ function OrderModal({ order, rates, onClose, onSave, addAudit, onDelete, onDispa
   const [dispDriver,setDispDriver]=useState((driverStaff[0]&&driverStaff[0].id)||'');
   const [dispWindow,setDispWindow]=useState(EVENING_RUN);
   const [dispDay,setDispDay]=useState(TODAY);
+  const [dispPack,setDispPack]=useState(packLabel(order.packaging)!=='—'?packLabel(order.packaging):PACKAGING[0]);
   const groups = useMemo(()=>{ const g={}; rates.items.forEach(r=>{(g[r.group]=g[r.group]||[]).push(r)}); return g; },[rates]);
   const calc = useMemo(()=>orderTotal(rates, order.weightCharge, added, order.firstOrder), [rates,order,added]);
 
@@ -1209,7 +1287,9 @@ function OrderModal({ order, rates, onClose, onSave, addAudit, onDelete, onDispa
   };
   const advance = () => { const ns=NEXT_STATUS[order.status]; if(!ns) return;
     onSave(order.id, { status:ns }); addAudit(`${actor} marked ${fullName(c)}'s order ${ns}`); };
-  const dispatch = () => { if(!dispDriver) return; onDispatch(order, dispDriver, dispWindow, dispDay); onClose(); };
+  const dispatch = () => { if(!dispDriver) return;
+    if(dispPack!==order.packaging) onSave(order.id,{ packaging:dispPack });   // remember how it was packed
+    onDispatch({...order, packaging:dispPack}, dispDriver, dispWindow, dispDay); onClose(); };
 
   return (
     <div className="fixed inset-0 bg-black/40 flex items-center justify-center p-4 z-50" onClick={onClose}>
@@ -1258,7 +1338,7 @@ function OrderModal({ order, rates, onClose, onSave, addAudit, onDelete, onDispa
               <Row k="Services" v={(order.services||[]).join(', ')||'—'}/>
               {(order.extras||[]).length>0 && <Row k="Extras" v={<span className="text-amber-700">{(order.extras||[]).join(', ')}</span>}/>}
               <Row k="Bags" v={order.bagsCount>0?`${order.bagsCount} · ${(order.bagWeights||[]).join('+')}kg = ${order.weight}kg`:'—'}/>
-              <Row k="Packaging" v={order.packaging}/>
+              <Row k="Packaging" v={packLabel(order.packaging)}/>
               {assignedDriver && <Row k="Driver" v={<span className="inline-flex items-center gap-1"><Ic name="truck" size={13}/>{assignedDriver.name}</span>}/>}
               <Row k="Collected" v={order.collectedDate?`${fmtDate(order.collectedDate)} · ${order.collectedAt}`:'Not yet collected'}/>
               <Row k="Deliver by" v={fmtDate(order.dueDate)}/>
@@ -1289,6 +1369,14 @@ function OrderModal({ order, rates, onClose, onSave, addAudit, onDelete, onDispa
                 <select value={dispWindow} onChange={e=>setDispWindow(e.target.value)} className={inputCls+' !py-1.5'}>
                   <WindowOptions/></select>
                 <div className="col-span-2"><input type="date" value={dispDay} min={TODAY} onChange={e=>setDispDay(e.target.value)} className={inputCls+' !py-1.5'}/></div>
+                <div className="col-span-2">
+                  <div className="text-[11px] font-semibold text-violet-700 mb-1">How is it packed?</div>
+                  <div className="flex flex-wrap gap-1.5">
+                    {PACKAGING.map(pk=>(
+                      <button key={pk} onClick={()=>setDispPack(pk)}
+                        className={`px-2.5 py-1.5 rounded-full text-xs font-semibold border ${dispPack===pk?'bg-violet-600 text-white border-violet-600':'bg-white text-slate2 border-gray-200'}`}>{pk}</button>))}
+                  </div>
+                </div>
               </div>
               <Btn kind="primary" icon="truck" className="w-full mt-2" onClick={dispatch}>Add to {dayLabel(dispDay).toLowerCase()}’s run</Btn>
             </div>}
@@ -1365,10 +1453,13 @@ function StoreLogin({ go, onLogin }) {
   );
 }
 function StoreApp({ go, orders, rates, updateOrder, addAudit, deleteOrder, jobs, drivers, onDispatch, user }) {
-  const [scope,setScope]=useState('today');
+  const [scope,setScope]=useState(TODAY);
   const [sel,setSel]=useState(null);
   const list = useMemo(()=>storeList(orders, scope, TODAY), [orders,scope]);
   const lateCount = list.filter(o=>(o.dueDate||'')<TODAY).length;
+  const dayCounts = useMemo(()=>{ const m={};
+    (orders||[]).forEach(o=>{ if(!IN_SHOP_STATUSES.includes(o.status)) return;
+      const d=o.dueDate||''; if(d) m[d]=(m[d]||0)+1; }); return m; },[orders]);
 
   const printList = () => {
     const itemLabel = k => { const r=rates.items.find(x=>x.key===k); return r ? r.label.replace(/^Dry clean — /,'') : k; };
@@ -1378,12 +1469,12 @@ function StoreApp({ go, orders, rates, updateOrder, addAudit, deleteOrder, jobs,
         <td>${(o.services||[]).join(', ')}${extra?`<br><span class="r">+ ${extra}</span>`:''}</td>
         <td>${o.bagsCount} (${(o.bagWeights||[]).join('+')}kg) · ${o.weight}kg</td>
         <td>${gbp(o.amount)}${o.needsPricing?' <span class="r">(prov.)</span>':''}<br><span class="a">${o.paidInAdvance?'PAID':o.paymentMethod}</span></td>
-        <td>${o.packaging}</td><td>${o.collectedDate?`${fmtDate(o.collectedDate)} ${o.collectedAt||''}`:'—'}</td><td>${o.status==='Needs pricing'?`<span class="r">${o.status}</span>`:o.status}</td><td>${c&&c.standingNotes?`<b class="v">Always: ${c.standingNotes}</b><br>`:''}${o.notes||''}</td></tr>`; }).join('');
-    const html = `<html><head><title>NELIS — ${scope==='today'?'Today':'This week'}</title>
+        <td>${packLabel(o.packaging)}</td><td>${o.collectedDate?`${fmtDate(o.collectedDate)} ${o.collectedAt||''}`:'—'}</td><td>${o.status==='Needs pricing'?`<span class="r">${o.status}</span>`:o.status}</td><td>${c&&c.standingNotes?`<b class="v">Always: ${c.standingNotes}</b><br>`:''}${o.notes||''}</td></tr>`; }).join('');
+    const html = `<html><head><title>NELIS — ${scope==='week'?'This week':dayLabel(scope)}</title>
       <style>body{font-family:Arial;padding:18px;color:#1f2a30}h1{font-size:16px;margin:0}.sub{color:#777;font-size:12px;margin:2px 0 12px}
       table{width:100%;border-collapse:collapse;font-size:11px}th{background:#3AAFCB;color:#fff;text-align:left;padding:5px 6px}
       td{border-bottom:1px solid #ddd;padding:5px 6px;vertical-align:top}.a{color:#888;font-size:10px}.r{color:#dc2626;font-weight:bold}.v{color:#6d28d9}@media print{@page{size:landscape;margin:10mm}}</style></head>
-      <body><h1>NEL Ironing Service — Production list</h1><div class="sub">${scope==='today'?'Due today':'Due this week'} · printed ${fmtDate(TODAY)} · ${list.length} order(s)</div>
+      <body><h1>NEL Ironing Service — Production list</h1><div class="sub">${scope==='week'?'Due this week':'Due '+dayLabel(scope).toLowerCase()} · printed ${fmtDate(TODAY)} · ${list.length} order(s)</div>
       <table><thead><tr><th>Due</th><th>Customer</th><th>Services</th><th>Bags / weight</th><th>Price</th><th>Pack</th><th>Collected</th><th>Status</th><th>Notes</th></tr></thead>
       <tbody>${rows}</tbody></table></body></html>`;
     const w = window.open('','_blank'); if(!w){alert('Please allow pop-ups to print the list.');return;}
@@ -1402,19 +1493,17 @@ function StoreApp({ go, orders, rates, updateOrder, addAudit, deleteOrder, jobs,
         <div className="flex items-center justify-between mb-1 flex-wrap gap-2">
           <h2 className="text-xl font-extrabold text-ink">Production list</h2>
           <div className="flex items-center gap-2">
-            <div className="bg-white rounded-xl p-1 card flex">
-              {[['today','Today'],['week','This week']].map(([k,l])=>(
-                <button key={k} onClick={()=>setScope(k)} className={`px-3 py-1.5 rounded-lg text-sm font-semibold ${scope===k?'bg-teal text-white':'text-slate2'}`}>{l}</button>))}
-            </div>
+            <button onClick={()=>setScope('week')} className={`px-3 py-1.5 rounded-xl text-sm font-semibold card ${scope==='week'?'bg-teal text-white':'bg-white text-slate2'}`}>This week</button>
             <Btn kind="ghost" icon="printer" onClick={printList}>Print / PDF</Btn>
           </div>
         </div>
         <p className="text-slate2 text-sm mb-1">Sorted by soonest due first, so you know which bags to deal with first. Tap an order for full details and to price extras.</p>
-        <p className="text-slate2 text-xs mb-4">Anything still in the shop past its due date always shows here, whichever view you pick.</p>
+        <p className="text-slate2 text-xs mb-4">Overdue work is pinned to Today so it can't be missed.</p>
+        <div className="mb-3"><DayPicker day={scope==='week'?TODAY:scope} setDay={setScope} counts={dayCounts}/></div>
         {lateCount>0 && <div className="mb-3 rounded-xl border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-700 font-semibold inline-flex items-center gap-2">
           <Ic name="alert" size={16}/>{lateCount} order{lateCount>1?'s are':' is'} past the delivery date</div>}
 
-        {list.length===0 ? <div className="bg-white card rounded-2xl p-8 text-center text-slate2">Nothing in the shop due {scope==='today'?'today':'this week'}.</div>
+        {list.length===0 ? <div className="bg-white card rounded-2xl p-8 text-center text-slate2">Nothing in the shop due {scope==='week'?'this week':dayLabel(scope).toLowerCase()}.</div>
         : <div className="space-y-3">
             {list.map(o=>{ const c=custById(o.customerId); const dueToday=o.dueDate===TODAY; const late=(o.dueDate||'')<TODAY;
               return (
@@ -1508,7 +1597,7 @@ function IntakeModal({ drivers, onClose, onCreate, customers, addCustomer }) {
   const [q,setQ]=useState(''); const [customerId,setCustomerId]=useState(null); const [addingCust,setAddingCust]=useState(false);
   const [type,setType]=useState('collection'); const [driverId,setDriverId]=useState((driverStaff[0]||{}).id);
   const [runDate,setRunDate]=useState(TODAY);   // which day's run this booking goes on
-  const [returnDate,setReturnDate]=useState(addDays(TODAY,2)); const [packaging,setPackaging]=useState('Hanging');
+  const [returnDate,setReturnDate]=useState(addDays(TODAY,2)); const [packaging,setPackaging]=useState(PACKAGING[0]);
   const [instructions,setInstructions]=useState(''); const [paid,setPaid]=useState(false); const [window_,setWindow]=useState(EVENING_RUN);
   // delivery-only bookings: what's owed and how it's being settled
   const [amount,setAmount]=useState(''); const [payMethod,setPayMethod]=useState('Cash');
@@ -1521,6 +1610,7 @@ function IntakeModal({ drivers, onClose, onCreate, customers, addCustomer }) {
   const create=()=>{ if(!customerId)return;
     onCreate({ id:uuid(), driverId, type, customerId, window:window_, status:'pending', packaging, instructions, runDate,
       returnDate: type==='collection'?returnDate:undefined, paidInAdvance:paid,
+      ...(isDelivery?{}:{packaging:null}),   // decided later, at the shop
       ...(isDelivery?{ bags:parseInt(bags)||1, weight:0, amount:parseFloat(amount)||0,
                        service:service.trim()||'—', paymentMethod: paid?'Paid in advance':payMethod }:{}) });
     onClose(); };
@@ -1569,8 +1659,8 @@ function IntakeModal({ drivers, onClose, onCreate, customers, addCustomer }) {
           <Field label="Time window"><select value={window_} onChange={e=>setWindow(e.target.value)} className={inputCls+' mt-1'}>
             <WindowOptions/></select></Field>
           {type==='collection' && <Field label="Return by"><input type="date" value={returnDate} min={runDate} onChange={e=>setReturnDate(e.target.value)} className={inputCls+' mt-1'}/></Field>}
-          <div className="col-span-2"><Field label="Packaging"><select value={packaging} onChange={e=>setPackaging(e.target.value)} className={inputCls+' mt-1'}>
-            {PACKAGING.map(p=><option key={p}>{p}</option>)}</select></Field></div>
+          {isDelivery && <div className="col-span-2"><Field label="Packaging"><select value={packaging} onChange={e=>setPackaging(e.target.value)} className={inputCls+' mt-1'}>
+            {PACKAGING.map(p=><option key={p}>{p}</option>)}</select></Field></div>}
         </div>
         {runDate!==TODAY && <p className="text-[11px] text-teal-dark font-semibold mt-2 inline-flex items-center gap-1"><Ic name="clock" size={13}/>Booked for {fmtDate(runDate)} — it'll appear on that day's run, not today's.</p>}
 
@@ -1835,6 +1925,7 @@ function Orders({ orders, rates, updateOrder, addAudit, filter, onClearFilter, d
         <span className="font-semibold text-ink truncate">{fullName(c)}</span>
         <Badge tone={statusTone(o.status)}>{o.status}</Badge>
       </div>
+      <div className="text-sm text-slate2 truncate flex items-start gap-1.5 mt-0.5"><Ic name="pin" size={13} className="mt-0.5 shrink-0"/>{c.addr}</div>
       <div className="flex items-center justify-between gap-2 mt-1 text-sm">
         <span className="text-slate2 truncate">{(o.services||[]).join(', ')||'—'}{(o.extras||[]).length?<span className="text-amber-600"> +{(o.extras||[]).length}</span>:''}</span>
         <span className="text-slate2 shrink-0">{o.bagsCount} · {o.weight}kg</span>
@@ -2028,7 +2119,7 @@ function StaffAdmin({ drivers, setDrivers, deleteDriver, user }) {
   </div>);
 }
 /* Free map — Leaflet + OpenStreetMap tiles. No API key, no billing account. */
-function RouteMap({ jobs, drivers, filterDriver, customers }) {
+function RouteMap({ jobs, drivers, filterDriver, customers, height='340px' }) {
   const elRef = useRef(null), mapRef = useRef(null), layerRef = useRef(null);
 
   useEffect(()=>{
@@ -2082,14 +2173,13 @@ function RouteMap({ jobs, drivers, filterDriver, customers }) {
   if (typeof L === 'undefined') return (
     <div className="h-40 rounded-2xl border border-gray-100 bg-gray-50 flex items-center justify-center text-sm text-slate2">
       Map needs an internet connection to load.</div>);
-  return <div ref={elRef} style={{height:'340px'}} className="w-full rounded-2xl overflow-hidden border border-gray-100 z-0"/>;
+  return <div ref={elRef} style={{height}} className="w-full rounded-2xl overflow-hidden border border-gray-100 z-0"/>;
 }
 
 function Logistics({ jobs, setJobs, drivers, onNew, deleteJob, customers, user }) {
   const driverStaff = drivers.filter(d=>hasRole(d,'driver'));
   const [mapDriver,setMapDriver]=useState('all');
   const [saving,setSaving]=useState(null);
-  const [drag,setDrag]=useState(null);
   const [day,setDay]=useState(TODAY);
   useEffect(()=>{ setSaving(null); },[day]);
   const dayJobs = useMemo(()=>jobs.filter(j=>(j.runDate||TODAY)===day), [jobs,day]);
@@ -2097,6 +2187,9 @@ function Logistics({ jobs, setJobs, drivers, onNew, deleteJob, customers, user }
   const roundMiles = useMemo(()=>totalMiles(jobs,targets,day), [jobs,mapDriver,drivers,day]);
   const noLoc = dayJobs.filter(j=>targets.includes(j.driverId) && j.status==='pending').filter(j=>{const c=custById(j.customerId); return !c||c.lat==null;}).length;
   // stops booked on other days, so Mark can see what's coming without hunting
+  const dayCounts = useMemo(()=>{
+    const m={}; jobs.forEach(j=>{ const d=j.runDate||TODAY; m[d]=(m[d]||0)+1; }); return m;
+  },[jobs]);
   const otherDays = useMemo(()=>{
     const m={}; jobs.forEach(j=>{ if(j.status!=='pending') return; const d=j.runDate||TODAY; if(d!==day) m[d]=(m[d]||0)+1; });
     return Object.entries(m).sort((a,b)=>a[0].localeCompare(b[0])).slice(0,6);
@@ -2108,17 +2201,107 @@ function Logistics({ jobs, setJobs, drivers, onNew, deleteJob, customers, user }
     setJobs(next); setSaving({before,after});
   };
   const move=(driverId,jobId,dir)=>setJobs(prev=>moveJob(prev,driverId,jobId,dir,day));
-  const dropOnJob=(toDriverId,targetId)=>{ if(drag) setJobs(prev=>moveJobTo(prev,drag.jobId,toDriverId,targetId,day)); setDrag(null); };
-  const dropOnColumn=(toDriverId)=>{ if(drag) setJobs(prev=>moveJobTo(prev,drag.jobId,toDriverId,null,day)); setDrag(null); };
   const reassign=(jobId,toDriverId)=>setJobs(prev=>moveJobTo(prev,jobId,toDriverId,null,day));
+  const [showLoading,setShowLoading]=useState(false);
+
+  // Reordering by touch. The browser's built-in drag-and-drop is mouse-only,
+  // which is why this never worked on a phone. Pointer events cover all three.
+  const dragRef = useRef(null);
+  const [draggingId,setDraggingId] = useState(null);
+  const clearMarks = () => document.querySelectorAll('.drag-over').forEach(el=>el.classList.remove('drag-over'));
+
+  const startDrag = (e, job, fromDriverId) => {
+    if(e.pointerType==='mouse' && e.button!==0) return;
+    e.preventDefault(); e.stopPropagation();
+    const ghost=document.createElement('div');
+    ghost.className='drag-ghost';
+    ghost.textContent=fullName(custById(job.customerId));
+    document.body.appendChild(ghost);
+    document.body.classList.add('is-dragging');
+    dragRef.current={ jobId:job.id, fromDriverId, ghost, x:e.clientX, y:e.clientY, overJob:null, overDriver:null };
+    ghost.style.left=e.clientX+'px'; ghost.style.top=e.clientY+'px';
+    setDraggingId(job.id);
+  };
+
+  useEffect(()=>{
+    if(!draggingId) return;
+    const D=()=>dragRef.current;
+
+    const aim = (x,y) => {
+      const el=document.elementFromPoint(x,y); if(!el) return;
+      const card=el.closest('[data-job-id]'), col=el.closest('[data-driver-col]');
+      clearMarks();
+      const d=D(); if(!d) return;
+      d.overJob = card && card.getAttribute('data-job-id')!==d.jobId ? card.getAttribute('data-job-id') : null;
+      d.overDriver = col ? col.getAttribute('data-driver-col') : null;
+      if(d.overJob) card.classList.add('drag-over');
+      else if(col) col.classList.add('drag-over');
+    };
+
+    const move=(ev)=>{
+      const d=D(); if(!d) return;
+      ev.preventDefault();
+      d.x=ev.clientX; d.y=ev.clientY;
+      d.ghost.style.left=d.x+'px'; d.ghost.style.top=d.y+'px';
+      aim(d.x,d.y);
+    };
+
+    // creep the page when the finger nears the top or bottom — essential with
+    // a long run on a small screen
+    const edge=setInterval(()=>{
+      const d=D(); if(!d) return;
+      const h=window.innerHeight;
+      if(d.y<90) window.scrollBy(0,-14);
+      else if(d.y>h-90) window.scrollBy(0,14);
+      if(d.y<90||d.y>h-90) aim(d.x,d.y);
+    },16);
+
+    const finish=()=>{
+      const d=D(); if(!d) return;
+      if(d.ghost && d.ghost.parentNode) d.ghost.parentNode.removeChild(d.ghost);
+      document.body.classList.remove('is-dragging');
+      clearMarks();
+      if(d.overJob){
+        const target=jobs.find(j=>j.id===d.overJob);
+        if(target) setJobs(prev=>moveJobTo(prev, d.jobId, target.driverId, target.id, day));
+      } else if(d.overDriver && d.overDriver!==d.fromDriverId){
+        setJobs(prev=>moveJobTo(prev, d.jobId, d.overDriver, null, day));
+      }
+      dragRef.current=null; setDraggingId(null);
+    };
+
+    window.addEventListener('pointermove',move,{passive:false});
+    window.addEventListener('pointerup',finish);
+    window.addEventListener('pointercancel',finish);
+    return ()=>{ clearInterval(edge);
+      window.removeEventListener('pointermove',move);
+      window.removeEventListener('pointerup',finish);
+      window.removeEventListener('pointercancel',finish); };
+  },[draggingId,jobs,day]);
+  const printLoading = () => {
+    const blocks = driverStaff.map(d=>{ const L=loadingGroups(jobs,d.id,day);
+      if(!L.total) return '';
+      return `<h2>${d.name} — ${L.total} deliver${L.total===1?'y':'ies'} · ${L.bags} bag(s)</h2>` +
+        L.groups.map(g=>`<h3>${g.packaging} — ${g.stops.length} stop(s), ${g.bags} bag(s)</h3>
+          <table><tbody>${g.stops.map(st=>`<tr><td class="n">${st.seq}</td><td>${st.name}</td><td class="b">${st.bags} bag(s)</td></tr>`).join('')}</tbody></table>`).join('');
+    }).join('');
+    const html = `<html><head><title>NELIS — Van loading ${dayLabel(day)}</title>
+      <style>body{font-family:Arial;padding:18px;color:#1f2a30}h1{font-size:17px;margin:0 0 2px}
+      .sub{color:#777;font-size:12px;margin-bottom:14px}h2{font-size:14px;margin:16px 0 6px;border-bottom:2px solid #3AAFCB;padding-bottom:3px}
+      h3{font-size:12px;margin:10px 0 3px;color:#6d28d9}table{width:100%;border-collapse:collapse;font-size:12px}
+      td{border-bottom:1px solid #eee;padding:4px 6px}.n{width:32px;font-weight:bold;color:#3AAFCB}.b{text-align:right;color:#777;width:80px}</style></head>
+      <body><h1>Van loading list</h1><div class="sub">${dayLabel(day)} · ${fmtDate(day)}</div>${blocks||'<p>No deliveries on this day.</p>'}</body></html>`;
+    const w=window.open('','_blank'); if(!w){alert('Please allow pop-ups to print.');return;}
+    w.document.write(html); w.document.close(); w.focus(); setTimeout(()=>w.print(),300);
+  };
   return (
     <div>
       <div className="flex items-center justify-between mb-1 flex-wrap gap-2">
         <h3 className="font-bold text-ink">Logistics &amp; route planning</h3>
         <Btn kind="rose" icon="plus" onClick={onNew} className="!py-1.5 !px-3">New job</Btn>
       </div>
-      <p className="text-xs text-slate2 mb-3">Each driver's collections + deliveries for the chosen day. Drag a card to reorder <b>or drop it on the other driver</b> to reassign — or use the <b>Move to</b> menu. Chevrons nudge within a driver. <span className="text-rose-500 font-semibold">Pink = collection</span>, white = delivery.</p>
-      <div className="mb-3"><DayPicker day={day} setDay={setDay} count={dayJobs.length}/></div>
+      <p className="text-xs text-slate2 mb-3">Each driver's collections + deliveries for the chosen day. <b>Drag the handle</b> to reorder, or drop a stop on the other driver to reassign — works on phone and computer. The arrows and the <b>Move to</b> menu do the same thing. <span className="text-rose-500 font-semibold">Pink = collection</span>, white = delivery.</p>
+      <div className="mb-3"><DayPicker day={day} setDay={setDay} counts={dayCounts}/></div>
       {otherDays.length>0 && <div className="mb-3 flex flex-wrap gap-1.5">
         <span className="text-[11px] text-slate2 self-center">Also booked:</span>
         {otherDays.map(([d,n])=>(
@@ -2151,40 +2334,73 @@ function Logistics({ jobs, setJobs, drivers, onNew, deleteJob, customers, user }
             ? `Reordered — about ${(saving.before-saving.after).toFixed(1)} miles shorter (${saving.before.toFixed(1)} → ${saving.after.toFixed(1)} miles).`
             : `Already in a good order — no shorter route found (${saving.before.toFixed(1)} miles).`}</div>}
       </div>
+      <div className="bg-white card rounded-2xl p-3 mb-4">
+        <div className="flex items-center justify-between gap-2 flex-wrap">
+          <button onClick={()=>setShowLoading(v=>!v)} className="font-bold text-ink text-sm inline-flex items-center gap-1.5">
+            <Ic name="box" size={16}/>Van loading list
+            <span className="text-slate2 font-normal text-xs inline-flex items-center gap-1">{showLoading?'Hide':'Show'}<Ic name={showLoading?'up':'down'} size={13}/></span>
+          </button>
+          {showLoading && <Btn kind="ghost" icon="printer" onClick={printLoading} className="!py-1 !px-2.5 text-xs">Print</Btn>}
+        </div>
+        {showLoading && <div className="mt-3 grid md:grid-cols-2 gap-4">
+          {driverStaff.map(d=>{ const L=loadingGroups(jobs,d.id,day);
+            return (
+              <div key={d.id}>
+                <h4 className="font-bold text-ink text-sm inline-flex items-center gap-1.5"><Ic name="truck" size={15}/>{d.name}
+                  <span className="text-slate2 font-normal">· {L.total} deliver{L.total===1?'y':'ies'}{L.bags?` · ${L.bags} bag${L.bags===1?'':'s'}`:''}</span></h4>
+                {L.total===0
+                  ? <p className="text-sm text-slate2 mt-1">No deliveries on this day.</p>
+                  : L.groups.map(g=>(
+                      <div key={g.packaging} className="mt-2">
+                        <div className={`text-[11px] font-bold uppercase tracking-wide ${g.packaging==='Not set yet'?'text-rose-600':'text-violet-700'}`}>
+                          {g.packaging} · {g.stops.length} stop{g.stops.length===1?'':'s'}{g.bags?` · ${g.bags} bag${g.bags===1?'':'s'}`:''}</div>
+                        <div className="mt-1 space-y-0.5">
+                          {g.stops.map(st=>(
+                            <div key={st.seq} className="flex items-center gap-2 text-sm">
+                              <span className="w-6 h-6 rounded-full bg-teal text-white text-xs font-bold flex items-center justify-center shrink-0">{st.seq}</span>
+                              <span className="text-ink truncate flex-1">{st.name}</span>
+                              {st.bags>0 && <span className="text-slate2 text-xs shrink-0">{st.bags} bag{st.bags===1?'':'s'}</span>}
+                            </div>))}
+                        </div>
+                      </div>))}
+              </div>); })}
+          <p className="text-[11px] text-slate2 md:col-span-2">Numbers are the driving order — load the last stop deepest in the van.</p>
+        </div>}
+      </div>
       <div className="grid md:grid-cols-2 gap-4">
         {driverStaff.map(d=>{
           const list=dayJobs.filter(j=>j.driverId===d.id).sort((a,b)=>a.seq-b.seq);
-          const isDropTarget = drag && drag.fromDriverId!==d.id;
           return (
-            <div key={d.id}
-              onDragOver={e=>{ if(isDropTarget){ e.preventDefault(); e.currentTarget.classList.add('drag-over'); } }}
-              onDragLeave={e=>e.currentTarget.classList.remove('drag-over')}
-              onDrop={e=>{ e.currentTarget.classList.remove('drag-over'); dropOnColumn(d.id); }}
-              className="bg-white card rounded-2xl p-4">
+            <div key={d.id} data-driver-col={d.id} className="bg-white card rounded-2xl p-4">
               <h4 className="font-bold text-ink text-sm mb-2 inline-flex items-center gap-1.5"><Ic name="truck" size={16}/>{d.name} <span className="text-slate2 font-normal">· {list.length} stops{list.filter(x=>x.status!=='pending').length?` · ${list.filter(x=>x.status!=='pending').length} done`:''}</span>
-                {isDropTarget && <span className="text-teal-dark text-xs font-normal ml-1">— drop to reassign</span>}</h4>
+</h4>
               {(()=>{ const moved=list.filter(x=>x.reorderedBy);
                 if(!moved.length) return null;
                 const last=moved.reduce((a,b)=>(a.reorderedAt||'')>(b.reorderedAt||'')?a:b);
                 return <div className="text-[11px] text-amber-700 bg-amber-50 border border-amber-100 rounded-lg px-2 py-1 mb-2 inline-flex items-center gap-1.5">
                   <Ic name="info" size={13}/>{last.reorderedBy} changed this run — {moved.length} stop{moved.length>1?'s':''} moved, last at {last.reorderedAt}</div>; })()}
-              {list.length===0 ? <p className="text-sm text-slate2 border-2 border-dashed border-gray-200 rounded-xl p-4 text-center">No route assigned{isDropTarget?' — drop a job here':''}.</p> :
+              {list.length===0 ? <p className="text-sm text-slate2 border-2 border-dashed border-gray-200 rounded-xl p-4 text-center">No route assigned — drag a stop here to reassign it.</p> :
                 <div className="space-y-2">
                   {list.map((j,idx)=>{ const c=custById(j.customerId); const done=j.status==='done', na=j.status==='no-answer', resolved=done||na;
                     return (
-                      <div key={j.id} draggable onDragStart={()=>setDrag({fromDriverId:d.id,jobId:j.id})} onDragEnd={()=>setDrag(null)}
-                        onDragOver={e=>{e.preventDefault(); e.stopPropagation(); e.currentTarget.classList.add('drag-over');}}
-                        onDragLeave={e=>e.currentTarget.classList.remove('drag-over')}
-                        onDrop={e=>{e.preventDefault(); e.stopPropagation(); e.currentTarget.classList.remove('drag-over'); dropOnJob(d.id,j.id);}}
-                        className={`rounded-xl border px-2 py-2 cursor-move ${resolved?'opacity-60 bg-gray-50 border-gray-100':j.type==='collection'?'bg-rose-50/70 border-rose-100':'bg-white border-gray-100'}`}>
+                      <div key={j.id} data-job-id={j.id}
+                        className={`rounded-xl border px-2 py-2 ${draggingId===j.id?'dragging-now':''} ${resolved?'opacity-60 bg-gray-50 border-gray-100':j.type==='collection'?'bg-rose-50/70 border-rose-100':'bg-white border-gray-100'}`}>
                         <div className="flex items-center gap-2">
-                          <span className="text-gray-300"><Ic name="grip" size={16}/></span>
+                          <span className="grip-handle text-gray-400 hover:text-slate2 -m-1 p-1 touch-none"
+                            title="Drag to reorder" onPointerDown={e=>startDrag(e, j, d.id)}><Ic name="grip" size={18}/></span>
                           <span className={`w-6 h-6 rounded-full flex items-center justify-center text-xs font-bold text-white shrink-0 ${resolved?'bg-gray-300':j.type==='collection'?'bg-rose-500':'bg-teal'}`}>{j.seq}</span>
                           <div className="flex-1 min-w-0">
                             <div className="flex items-center gap-1.5 flex-wrap"><TypeBadge type={j.type}/><span className="text-xs text-slate2">{j.window}</span>{done && <Badge tone="green">Done</Badge>}{na && <Badge tone="rose">No answer</Badge>}
                               {j.reorderedBy && <span title={`Moved by ${j.reorderedBy} at ${j.reorderedAt}`}><Badge tone="amber">Moved by driver</Badge></span>}</div>
                             <div className="text-sm text-ink truncate">{fullName(c)}</div>
                             <div className="text-xs text-slate2 truncate">{c.addr}</div>
+                            {j.type==='delivery' && <div className="text-[11px] text-slate2 mt-0.5 flex flex-wrap items-center gap-x-2.5 gap-y-0.5">
+                              <span className="inline-flex items-center gap-1 font-semibold text-teal-dark"><Ic name="box" size={12}/>{packLabel(j.packaging)}</span>
+                              {j.bags!=null && <span>{j.bags} bag{j.bags===1?'':'s'}</span>}
+                              {j.amount>0 && <span className="font-semibold text-ink">{gbp(j.amount)}</span>}
+                              {j.paidInAdvance ? <Badge tone="green">Paid</Badge> : (j.paymentMethod && j.paymentMethod!=='—' && <span>{j.paymentMethod}</span>)}
+                            </div>}
+                            {c.standingNotes && <div className="mt-1"><StandingNote customer={c} size="xs"/></div>}
                           </div>
                           <div className="flex flex-col text-slate2">
                             <button onClick={()=>move(d.id,j.id,'up')} disabled={idx===0} className={idx===0?'text-gray-200':'hover:text-teal'}><Ic name="up" size={16}/></button>
@@ -2299,8 +2515,39 @@ function App() {
     if(d) addAudit(`${actor()} removed staff member ${d.name}`); return next; }); },[]);
   const addAudit=useCallback(text=>{ const e={time:now(),text}; setAudit(prev=>[e,...prev]); insertAudit(e); },[]);
   const addOrder=useCallback(o=>{ setOrdersState(prev=>[o,...prev]); saveOrder(o); },[]);
-  const updateOrder=useCallback((id,patch)=>setOrdersState(prev=>{ const next=prev.map(o=>o.id===id?{...o,...patch}:o);
-    const upd=next.find(o=>o.id===id); if(upd) saveOrder(upd); return next; }),[]);
+  const updateOrder=useCallback((id,patch)=>{
+    let upd=null;
+    setOrdersState(prev=>{ const next=prev.map(o=>o.id===id?{...o,...patch}:o);
+      upd=next.find(o=>o.id===id); if(upd) saveOrder(upd); return next; });
+    // The order and the driver's stop keep SEPARATE copies of packaging, price,
+    // payment and dates. Without this, anything changed in the office never
+    // reaches the van — the driver keeps seeing the values from when it was
+    // first sent out. Only stops still to do are touched; finished ones are history.
+    setJobsState(prev=>{
+      if(!upd) return prev;
+      const job = prev.find(j=>j.orderId===id && j.status==='pending');
+      if(!job) return prev;
+      const fields = job.type==='delivery'
+        ? { packaging:upd.packaging, amount:upd.amount, paymentMethod:upd.paymentMethod,
+            paidInAdvance:!!upd.paidInAdvance, bags:upd.bagsCount, weight:upd.weight,
+            service:(upd.services||[]).join(', ')||'—',
+            runDate: upd.dueDate || job.runDate || TODAY }   // deliver-by decides which day's run
+        : { returnDate: upd.dueDate || job.returnDate };     // a collection only shows "return by"
+      if(!Object.keys(fields).some(k=>job[k]!==fields[k])) return prev;
+
+      const fromDay = job.runDate||TODAY, toDay = fields.runDate;
+      const moved = job.type==='delivery' && toDay && toDay!==fromDay;
+      let next = prev.map(j=>j.id===job.id?{...j,...fields}:j);
+      if(moved){
+        next = reseqDriver(next, job.driverId, fromDay);                    // close the gap on the old day
+        const n = next.filter(j=>j.driverId===job.driverId && (j.runDate||TODAY)===toDay && j.id!==job.id).length;
+        next = next.map(j=>j.id===job.id?{...j, seq:n+1}:j);                // add to the end of the new day
+        addAudit(`${fullName(custById(upd.customerId))}'s delivery moved to ${fmtDate(toDay)}'s run`);
+      }
+      saveJobs(next.filter(j=>j.id===job.id));
+      return next;
+    });
+  },[addAudit]);
   // stops are numbered per driver PER DAY, so a booking for tomorrow starts at 1 again
   const reseqDriver=(arr,did,day)=>{ const on=j=>j.driverId===did && (!day || (j.runDate||TODAY)===day);
     const mine=arr.filter(on).sort((a,b)=>a.seq-b.seq).map((j,i)=>({...j,seq:i+1}));
@@ -2433,7 +2680,7 @@ function App() {
   if (phase==='loading') screen=<LoadingScreen/>;
   else if (phase==='error') screen=<ErrorScreen msg={err}/>;
   else if (!user)                 screen=<StaffLogin staff={drivers} onLogin={onLogin}/>;
-  else if (view==='driver-app' && hasRole(user,'driver')) screen=<DriverApp driver={user} go={go} jobs={jobs} setJobs={setJobs} orders={orders} rates={rates} addAudit={addAudit} addOrder={addOrder} updateOrder={updateOrder}/>;
+  else if (view==='driver-app' && hasRole(user,'driver')) screen=<DriverApp driver={user} go={go} jobs={jobs} setJobs={setJobs} orders={orders} customers={customers} rates={rates} addAudit={addAudit} addOrder={addOrder} updateOrder={updateOrder}/>;
   else if (view==='store-app' && hasRole(user,'store'))   screen=<StoreApp go={go} orders={orders} rates={rates} updateOrder={updateOrder} addAudit={addAudit} deleteOrder={deleteOrder} jobs={jobs} drivers={drivers} onDispatch={dispatchDelivery} user={user}/>;
   else if (view==='admin-app' && hasRole(user,'admin'))   screen=<AdminApp go={go} jobs={jobs} setJobs={setJobs} rates={rates} setRates={setRates} audit={audit} drivers={drivers} setDrivers={setDrivers} deleteDriver={deleteDriver} orders={orders} addJob={addJob} updateOrder={updateOrder} addAudit={addAudit} deleteJob={deleteJob} deleteOrder={deleteOrder} dispatchDelivery={dispatchDelivery} customers={customers} addCustomer={addCustomer} updateCustomer={updateCustomer} deleteCustomer={deleteCustomer} user={user}/>;
   else                            screen=<PortalPicker user={user} onPick={v=>setView(v)} onLogout={()=>go('logout')}/>;
