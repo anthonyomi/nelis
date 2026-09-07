@@ -250,6 +250,37 @@ const mapsUrl = addr => `https://www.google.com/maps/dir/?api=1&destination=${en
 const sum = a => a.reduce((s,x)=>s+(parseFloat(x)||0),0);
 
 // PURE pricing engine (unit-tested)
+// PURE — price a collection where EACH BAG can be a different service
+// (unit-tested). A bag of ironing at £6/kg and a bag of wash-dry-iron at
+// £8/kg are charged at their own rates, not lumped onto one.
+// bags: [{ weight, serviceKey }]  — serviceKey 'shirts' is counted at the shop.
+const SHIRTS_KEY = 'shirts';
+function priceBags(rates, bags) {
+  const lines=[]; let subtotal=0, weight=0, needsPricing=false;
+  (bags||[]).forEach((b,i)=>{
+    const kg = parseFloat(b.weight)||0;
+    if (b.serviceKey === SHIRTS_KEY) {
+      needsPricing = true;                       // counted and priced at the shop
+      lines.push({ label:`Bag ${i+1} · Shirt service`, kg:0, amt:0, atShop:true });
+      return;
+    }
+    const r = (rates.weight||[]).find(x=>x.key===b.serviceKey);
+    if (!r || kg<=0) return;
+    const amt = kg*r.price; subtotal += amt; weight += kg;
+    lines.push({ label:`Bag ${i+1} · ${r.label.replace(/ \(.*\)/,'')} — ${kg}kg × ${gbp(r.price)}`, kg, amt });
+  });
+  return { lines, subtotal, weight, needsPricing };
+}
+// the distinct service names on an order, for display
+function bagServiceLabels(rates, bags) {
+  const seen=[];
+  (bags||[]).forEach(b=>{
+    const label = b.serviceKey===SHIRTS_KEY ? 'Shirt service'
+      : ((rates.weight||[]).find(x=>x.key===b.serviceKey)||{}).label;
+    if(label && !seen.includes(label)) seen.push(label);
+  });
+  return seen;
+}
 function calcPrice(rates, weightInputs, itemInputs, firstOrder) {
   let subtotal = 0; const lines = [];
   rates.weight.forEach(r => { const kg = parseFloat(weightInputs[r.key]) || 0;
@@ -461,7 +492,7 @@ const toCustomerRow = c => ({ id:c.id, title:c.title, first_name:c.first, last_n
   mobile:c.mob, mobile2:c.mob2 || null, email:c.email, notes:c.standingNotes || null, lat:c.lat ?? null, lng:c.lng ?? null });
 // NOTE: PINs are deliberately absent here — they live only in the database as
 // hashes and are checked by verify_staff_pin(). hasPin just says whether one is set.
-const fromDriverRow = r => ({ id:r.id, name:r.name, roles:(r.roles&&r.roles.length?r.roles:['driver']), canDelete:!!r.can_delete, active:r.active!==false, hasPin:!!r.has_pin });
+const fromDriverRow = r => ({ id:r.id, name:r.name, roles:(r.roles&&r.roles.length?r.roles:['driver']), canDelete:!!r.can_delete, active:r.active!==false, hasPin:!!r.has_pin, sortOrder:num(r.sort_order) });
 const hasRole = (u,role) => !!(u && u.roles && u.roles.includes(role));
 const mayDelete = u => hasRole(u,'admin') || !!(u && u.canDelete);
 // the portals a person can reach, decided by their roles
@@ -521,7 +552,8 @@ function splitAddr(addr){
 const ratesFromRows = (rows, settings) => ({
   weight: rows.filter(r=>r.kind==='weight').sort((a,b)=>a.sort-b.sort).map(r=>({key:r.key,label:r.label,unit:r.unit||'kg',price:num(r.price)})),
   items:  rows.filter(r=>r.kind==='item').sort((a,b)=>a.sort-b.sort).map(r=>({key:r.key,label:r.label,price:num(r.price),group:r.group_name})),
-  minOrder: num(settings?.min_order ?? 25), firstOrderDiscount: num(settings?.first_order_discount ?? 0.10) });
+  minOrder: num(settings?.min_order ?? 25), firstOrderDiscount: num(settings?.first_order_discount ?? 0.10),
+  shopName: settings?.shop_name || SHOP.name, shopAddress: settings?.shop_address || SHOP.addr });
 
 const fromJobRow = r => ({ id:r.id, runDate:r.run_date||TODAY, driverId:r.driver_id, seq:num(r.seq), type:r.type, customerId:r.customer_id,
   orderId:r.order_id||undefined, window:r.time_window, status:r.status, packaging:r.packaging, instructions:r.instructions,
@@ -538,11 +570,13 @@ const toJobRow = j => ({ id:j.id, run_date:j.runDate||TODAY, driver_id:j.driverI
 const fromOrderRow = r => ({ id:r.id, customerId:r.customer_id, status:r.status, services:r.services||[], extras:r.extras||[],
   needsPricing:r.needs_pricing, bagsCount:num(r.bags_count), bagWeights:(r.bag_weights||[]).map(num), weight:num(r.weight),
   weightCharge:num(r.weight_charge), amount:num(r.amount), initialAmount:num(r.initial_amount), addedItems:r.added_items||{},
+  bagServices:r.bag_services||[],
   firstOrder:r.first_order, packaging:r.packaging, paymentMethod:r.payment_method, paidInAdvance:r.paid_in_advance,
   collectedDate:r.collected_date||null, collectedAt:r.collected_at||null, dueDate:r.due_date, notes:r.notes });
 const toOrderRow = o => ({ id:o.id, customer_id:o.customerId, status:o.status, services:o.services||[], extras:o.extras||[],
   needs_pricing:!!o.needsPricing, bags_count:o.bagsCount||0, bag_weights:o.bagWeights||[], weight:o.weight||0,
   weight_charge:o.weightCharge||0, amount:o.amount||0, initial_amount:o.initialAmount||0, added_items:o.addedItems||{},
+  bag_services:o.bagServices||[],
   first_order:!!o.firstOrder, packaging:o.packaging ?? null, payment_method:o.paymentMethod ?? null,
   paid_in_advance:!!o.paidInAdvance, collected_date:o.collectedDate ?? null, collected_at:o.collectedAt ?? null,
   due_date:o.dueDate ?? null, notes:o.notes ?? null });
@@ -550,7 +584,7 @@ const toOrderRow = o => ({ id:o.id, customer_id:o.customerId, status:o.status, s
 async function loadAll() {
   const [cust, drv, rateRows, settings, ord, jb, aud] = await Promise.all([
     db.from('customers').select('*'),
-    db.from('drivers').select('id,name,roles,can_delete,active,has_pin').eq('active',true).order('created_at'),
+    db.from('drivers').select('id,name,roles,can_delete,active,has_pin,sort_order').eq('active',true).order('sort_order',{nullsFirst:false}).order('created_at'),
     db.from('service_rates').select('*'),
     db.from('app_settings').select('*').limit(1).maybeSingle(),
     db.from('orders').select('*'),
@@ -573,7 +607,7 @@ const logErr = (where) => (r) => { if (r && r.error) reportErr(where, r.error); 
 const saveJobs   = arr => { if(!db) return; arr.forEach(j => db.from('jobs').upsert(toJobRow(j)).then(logErr('saveJob'))); };
 const saveOrder  = o   => db && db.from('orders').upsert(toOrderRow(o)).then(logErr('saveOrder'));
 // PINs are never written from here — set_staff_pin() hashes them server-side.
-const saveDrivers= arr => db && db.from('drivers').upsert(arr.map(d=>({id:d.id,name:d.name,roles:d.roles||['driver'],can_delete:!!d.canDelete,active:d.active!==false}))).then(logErr('saveDrivers'));
+const saveDrivers= arr => db && db.from('drivers').upsert(arr.map((d,i)=>({id:d.id,name:d.name,roles:d.roles||['driver'],can_delete:!!d.canDelete,active:d.active!==false,sort_order:d.sortOrder!=null?d.sortOrder:(i+1)*10}))).then(logErr('saveDrivers'));
 // Proof that this browser passed the PIN check. Held in memory only, so it is
 // gone when the tab closes and never written to disk.
 let SESSION_TOKEN = null;
@@ -597,7 +631,8 @@ const saveRates  = r   => { if(!db) return;
   db.from('service_rates').upsert(rows,{onConflict:'key'}).then(logErr('saveRates'));
   // remove any rows the boss deleted (keys no longer present)
   const keys=rows.map(x=>x.key); if(keys.length) db.from('service_rates').delete().not('key','in',`(${keys.join(',')})`).then(logErr('pruneRates'));
-  db.from('app_settings').upsert({id:1,min_order:r.minOrder,first_order_discount:r.firstOrderDiscount}).then(logErr('saveSettings')); };
+  db.from('app_settings').upsert({id:1,min_order:r.minOrder,first_order_discount:r.firstOrderDiscount,
+    shop_name:r.shopName||null, shop_address:r.shopAddress||null}).then(logErr('saveSettings')); };
 
 /* =================================================================== */
 /*  SHARED UI                                                          */
@@ -815,7 +850,8 @@ function DriverApp({ driver, go, jobs, setJobs, orders, customers, rates, addAud
   const completeCollection = (job, data) => {
     setJobs(prev => prev.map(j => j.id===job.id ? {...j, status:'done', doneAt:now(), ...data} : j));
     const c = custById(job.customerId);
-    const patch = { services:[data.service], extras:data.extras, needsPricing:data.needsPricing,
+    const patch = { services:data.services&&data.services.length?data.services:[data.service],
+      bagServices:data.bagServices||[], extras:data.extras, needsPricing:data.needsPricing,
       bagsCount:data.bagWeights.length, bagWeights:data.bagWeights, weight:data.weight,
       weightCharge:data.weightCharge, amount:data.amount, initialAmount:data.amount,
       paymentMethod:data.paymentMethod, collectedDate:TODAY, collectedAt:now(),
@@ -987,22 +1023,30 @@ function CallBtn({ mob, mob2 }) {
 // PURE — rebuild the collection form from an order that was already filled in,
 // so reopening a stop doesn't throw the driver's work away (unit-tested).
 function prefillFromOrder(order, job, rates) {
-  const blank = { bags:[{id:1,weight:''}], serviceKey:'iron', shirtType:'io', shirtCount:'',
+  const firstKey = ((rates.weight||[])[0]||{}).key || 'iron';
+  const blank = { bags:[{id:1,weight:'',serviceKey:firstKey}], shirtCount:'',
                   extras:[], firstOrder:false, notes:'', hasPrev:false };
   // nothing was entered before unless the order carries collected details
   if (!order || (!(order.bagWeights||[]).length && !(order.services||[]).length)) return blank;
   const svc = (order.services||[])[0] || '';
   const isShirts = /^Shirt service/.test(svc);
   const match = (rates.weight||[]).find(r=>r.label.replace(/ \(.*\)/,'')===svc);
+  // which service each bag was. Older orders have one service for the lot.
+  const fallbackKey = isShirts ? SHIRTS_KEY : (match ? match.key : firstKey);
+  const svcFor = i => {
+    const k=(order.bagServices||[])[i];
+    if(k && (k===SHIRTS_KEY || (rates.weight||[]).some(r=>r.key===k))) return k;
+    return fallbackKey;
+  };
   // order.notes is "instructions · driver note · shirt note" — recover the driver's part
   let notes = order.notes || '';
   if (job && job.instructions && notes.startsWith(job.instructions)) notes = notes.slice(job.instructions.length);
   notes = notes.split(' · ').filter(p=>p.trim() && !/^Customer said ~/.test(p.trim())).join(' · ').trim();
   const shirtNote = (order.notes||'').match(/Customer said ~(\d+) shirts/);
   return {
-    bags: (order.bagWeights||[]).length ? order.bagWeights.map((w,i)=>({id:i+1,weight:String(w)})) : [{id:1,weight:''}],
-    serviceKey: isShirts ? 'shirts' : (match ? match.key : 'iron'),
-    shirtType: /wash & iron/i.test(svc) ? 'wi' : 'io',
+    bags: (order.bagWeights||[]).length
+      ? order.bagWeights.map((w,i)=>({id:i+1, weight:String(w), serviceKey:svcFor(i)}))
+      : [{id:1, weight:'', serviceKey:fallbackKey}],
     shirtCount: shirtNote ? shirtNote[1] : '',
     extras: order.extras || [],
     firstOrder: !!order.firstOrder,
@@ -1015,37 +1059,42 @@ function CollectionForm({ job, order, rates, onBack, onConfirm, onNoAnswer }) {
   // If this stop was filled in before and reopened, start from what the driver
   // already entered rather than a blank form — he's usually just adding a bag.
   const pre = useMemo(()=>prefillFromOrder(order, job, rates), []);
-  const [bags,setBags]=useState(pre.bags);
-  const [serviceKey,setServiceKey]=useState(pre.serviceKey);
-  const [shirtType,setShirtType]=useState(pre.shirtType);
+  const [bags,setBags]=useState(pre.bags);          // [{id, weight, serviceKey}]
   const [shirtCount,setShirtCount]=useState(pre.shirtCount);
   const [extras,setExtras]=useState(pre.extras);
   const [firstOrder,setFirstOrder]=useState(pre.firstOrder);
   const [notes,setNotes]=useState(pre.notes);
   const [confirmed,setConfirmed]=useState(false);
 
-  const isShirts = serviceKey==='shirts';
-  const totalWeight = useMemo(()=>sum(bags.map(b=>b.weight)), [bags]);
-  const result = useMemo(()=>calcPrice(rates, isShirts?{}:{[serviceKey]:totalWeight},{},firstOrder), [rates,serviceKey,isShirts,totalWeight,firstOrder]);
-  const wsvc = rates.weight.find(r=>r.key===serviceKey);
-  const svcLabel = isShirts ? `Shirt service (${shirtType==='io'?'iron only':'wash & iron'})` : wsvc.label.replace(/ \(.*\)/,'');
-  const needsPricing = extras.length>0 || isShirts;
-  const canConfirm = isShirts || result.charged>0;
-  const confirmData = { bagWeights:isShirts?[]:bags.map(b=>parseFloat(b.weight)||0), weight:isShirts?0:totalWeight,
-    service:svcLabel, weightCharge:isShirts?0:result.subtotal, amount:isShirts?0:result.charged, firstOrder,
-    paymentMethod:'On delivery', customerNotes:notes, extras, needsPricing, shirtCount:isShirts?shirtCount:'' };
+  // Each bag is priced at its OWN rate, so one bag of ironing and one of
+  // wash-dry-iron on the same collection come out right.
+  const priced = useMemo(()=>priceBags(rates, bags), [rates,bags]);
+  const result = useMemo(()=>orderTotal(rates, priced.subtotal, {}, firstOrder), [rates,priced.subtotal,firstOrder]);
+  const anyShirts = bags.some(b=>b.serviceKey===SHIRTS_KEY);
+  const svcLabels = bagServiceLabels(rates, bags);
+  const needsPricing = extras.length>0 || anyShirts;
+  const canConfirm = anyShirts || result.charged>0;
+  const confirmData = { bagWeights:bags.map(b=>parseFloat(b.weight)||0),
+    bagServices:bags.map(b=>b.serviceKey), weight:priced.weight,
+    service:svcLabels.join(', ')||'—', services:svcLabels,
+    weightCharge:priced.subtotal, amount:result.charged, firstOrder,
+    paymentMethod:'On delivery', customerNotes:notes, extras, needsPricing,
+    shirtCount:anyShirts?shirtCount:'' };
 
-  const addBag=()=>setBags(b=>[...b,{id:(b[b.length-1]?.id||0)+1,weight:''}]);
+  const defaultSvc = (rates.weight[0]||{}).key || 'iron';
+  const addBag=()=>setBags(b=>[...b,{id:(b[b.length-1]?.id||0)+1,weight:'',
+    serviceKey:(b[b.length-1]||{}).serviceKey||defaultSvc}]);   // same service as the last bag
   const rmBag=id=>setBags(b=>b.length>1?b.filter(x=>x.id!==id):b);
   const setBagW=(id,v)=>setBags(b=>b.map(x=>x.id===id?{...x,weight:v}:x));
+  const setBagSvc=(id,v)=>setBags(b=>b.map(x=>x.id===id?{...x,serviceKey:v}:x));
   const toggleExtra=x=>setExtras(e=>e.includes(x)?e.filter(y=>y!==x):[...e,x]);
 
   if (confirmed) return (
     <div className="bg-white card rounded-2xl p-8 text-center">
       <div className="w-16 h-16 mx-auto rounded-full bg-emerald-50 text-emerald-600 flex items-center justify-center"><Ic name="check" size={34} stroke={2.4}/></div>
       <h3 className="text-xl font-bold text-ink mt-3">Collection confirmed</h3>
-      <p className="text-slate2 mt-1">{fullName(c)} · {isShirts?'priced at shop':gbp(result.charged)+(needsPricing?' (provisional)':'')}</p>
-      {needsPricing && <div className="bg-amber-50 text-amber-700 rounded-xl p-3 mt-4 text-sm inline-flex items-center gap-2"><Ic name="alert" size={16}/>{isShirts?`Shirts will be counted & priced at the shop${extras.length?`, along with ${extras.join(', ').toLowerCase()}`:''}.`:`Extras noted — shop will price ${extras.join(', ').toLowerCase()} and finalise the total.`}</div>}
+      <p className="text-slate2 mt-1">{fullName(c)} · {result.charged>0?gbp(result.charged)+(needsPricing?' (provisional)':''):'priced at shop'}</p>
+      {needsPricing && <div className="bg-amber-50 text-amber-700 rounded-xl p-3 mt-4 text-sm inline-flex items-center gap-2"><Ic name="alert" size={16}/>{anyShirts?`Shirts will be counted & priced at the shop${extras.length?`, along with ${extras.join(', ').toLowerCase()}`:''}.`:`Extras noted — shop will price ${extras.join(', ').toLowerCase()} and finalise the total.`}</div>}
       <div className="bg-teal-light text-teal-dark rounded-xl p-3 mt-3 text-sm flex items-center justify-center gap-2"><Ic name="mail" size={16}/>{needsPricing?'Provisional':'Receipt'} email sent to {c.email}</div>
       <div className="mt-6"><Btn icon="right" onClick={()=>onConfirm(job,confirmData)}>Back to run</Btn></div>
     </div>
@@ -1070,47 +1119,48 @@ function CollectionForm({ job, order, rates, onBack, onConfirm, onNoAnswer }) {
         {job.instructions && <div className="text-xs text-rose-700 mt-2 bg-rose-50 rounded-lg px-2 py-1.5 inline-flex items-start gap-1"><Ic name="note" size={14}/><span>Boss note: {job.instructions}</span></div>}
 
         <hr className="my-4 border-gray-100"/>
-        <h4 className="font-bold text-ink text-sm mb-1">Service</h4>
-        <div className="space-y-1">
-          {rates.weight.map(r=>(
-            <label key={r.key} className="flex items-center gap-2 text-sm text-ink">
-              <input type="radio" name="svc" checked={serviceKey===r.key} onChange={()=>setServiceKey(r.key)} className="accent-teal"/>
-              {r.label} <span className="text-slate2">({gbp(r.price)}/kg)</span></label>))}
-          <label className="flex items-center gap-2 text-sm text-ink">
-            <input type="radio" name="svc" checked={isShirts} onChange={()=>setServiceKey('shirts')} className="accent-teal"/>
-            Shirt service <span className="text-slate2">(counted at the shop)</span></label>
+        <div className="flex items-center justify-between">
+          <h4 className="font-bold text-ink text-sm">Bags</h4>
+          <Btn kind="subtle" icon="plus" onClick={addBag} className="!py-1 !px-2 text-xs">Add bag</Btn>
+        </div>
+        <p className="text-xs text-slate2 mb-2">Each bag can be a different service — weigh it and pick what it is.</p>
+        <div className="space-y-2">
+          {bags.map((b,i)=>{ const shirts=b.serviceKey===SHIRTS_KEY;
+            const r=rates.weight.find(x=>x.key===b.serviceKey);
+            return (
+            <div key={b.id} className="rounded-xl border border-gray-100 bg-gray-50/60 p-2.5">
+              <div className="flex items-center gap-2">
+                <span className="w-7 h-7 rounded-full bg-teal text-white text-xs font-bold flex items-center justify-center shrink-0">{i+1}</span>
+                <select value={b.serviceKey} onChange={e=>setBagSvc(b.id,e.target.value)} className={inputCls+' !py-1.5 flex-1 min-w-0'}>
+                  {rates.weight.map(x=><option key={x.key} value={x.key}>{x.label.replace(/ \(.*\)/,'')} — {gbp(x.price)}/kg</option>)}
+                  <option value={SHIRTS_KEY}>Shirt service — counted at the shop</option>
+                </select>
+                {bags.length>1 && <button onClick={()=>rmBag(b.id)} title="Remove bag"
+                  className="text-rose-400 hover:text-rose-600 shrink-0"><Ic name="close" size={16}/></button>}
+              </div>
+              <div className="flex items-center gap-2 mt-2 pl-9">
+                {shirts
+                  ? <span className="text-xs text-amber-700 inline-flex items-center gap-1"><Ic name="info" size={13}/>No need to weigh — the shop counts the shirts.</span>
+                  : <>
+                      <input type="number" min="0" step="0.1" value={b.weight} onChange={e=>setBagW(b.id,e.target.value)}
+                        inputMode="decimal" className={inputCls+' !w-24 text-right !py-1.5'} placeholder="0.0"/>
+                      <span className="text-xs text-slate2">kg</span>
+                      {r && parseFloat(b.weight)>0 && <span className="text-sm font-semibold text-ink ml-auto">{gbp((parseFloat(b.weight)||0)*r.price)}</span>}
+                    </>}
+              </div>
+            </div>); })}
+          <div className="text-sm text-ink font-semibold pt-1">
+            Total weight: {priced.weight.toFixed(1)} kg <span className="text-slate2 font-normal">across {bags.length} bag{bags.length>1?'s':''}</span></div>
         </div>
 
-        {!isShirts ? <>
-          <div className="flex items-center justify-between mt-4">
-            <h4 className="font-bold text-ink text-sm">Bags &amp; weight</h4>
-            <Btn kind="subtle" icon="plus" onClick={addBag} className="!py-1 !px-2 text-xs">Add bag</Btn>
+        {anyShirts && <div className="mt-3 bg-amber-50 border border-amber-100 rounded-xl p-3">
+          <div className="text-sm font-semibold text-ink">Shirts — counted at the shop</div>
+          <p className="text-xs text-amber-700 mb-2">No need to count or price on the doorstep.</p>
+          <div className="flex items-center gap-2">
+            <span className="text-sm text-slate2">Shirts (only if the customer gave a number)</span>
+            <input type="number" min="0" step="1" value={shirtCount} onChange={e=>setShirtCount(e.target.value)} className={inputCls+' !w-20 text-right'} placeholder="—"/>
           </div>
-          <div className="space-y-2 mt-2">
-            {bags.map((b,i)=>(
-              <div key={b.id} className="flex items-center gap-2">
-                <span className="text-sm text-slate2 w-14">Bag {i+1}</span>
-                <input type="number" min="0" step="0.1" value={b.weight} onChange={e=>setBagW(b.id,e.target.value)} className={inputCls+' !w-24 text-right'} placeholder="0.0"/>
-                <span className="text-xs text-slate2">kg</span>
-                {bags.length>1 && <button onClick={()=>rmBag(b.id)} className="text-rose-400 text-xs ml-1 hover:text-rose-600 inline-flex items-center gap-0.5"><Ic name="close" size={13}/>remove</button>}
-              </div>
-            ))}
-            <div className="text-sm text-ink font-semibold pt-1">Total weight: {totalWeight.toFixed(1)} kg <span className="text-slate2 font-normal">across {bags.length} bag{bags.length>1?'s':''}</span></div>
-          </div>
-        </> : <>
-          <div className="mt-3 bg-amber-50 border border-amber-100 rounded-xl p-3">
-            <div className="text-sm font-semibold text-ink">Shirts — counted at the shop</div>
-            <p className="text-xs text-amber-700 mb-2">No need to count or price on the doorstep. Just take the bag; the shop confirms the count.</p>
-            <div className="space-y-1">
-              <label className="flex items-center gap-2 text-sm text-ink"><input type="radio" name="shirt" checked={shirtType==='io'} onChange={()=>setShirtType('io')} className="accent-teal"/>Iron only <span className="text-slate2">(£2.00/shirt)</span></label>
-              <label className="flex items-center gap-2 text-sm text-ink"><input type="radio" name="shirt" checked={shirtType==='wi'} onChange={()=>setShirtType('wi')} className="accent-teal"/>Wash &amp; iron <span className="text-slate2">(£3.00/shirt)</span></label>
-            </div>
-            <div className="flex items-center gap-2 mt-2">
-              <span className="text-sm text-slate2">Shirts (only if the customer gave a number)</span>
-              <input type="number" min="0" step="1" value={shirtCount} onChange={e=>setShirtCount(e.target.value)} className={inputCls+' !w-20 text-right'} placeholder="—"/>
-            </div>
-          </div>
-        </>}
+        </div>}
 
         <h4 className="font-bold text-ink text-sm mt-4 mb-1">Extras in the bag <span className="text-slate2 font-normal">— priced at the shop</span></h4>
         <p className="text-xs text-slate2 mb-2">Just tick what the customer says is in there. No need to unpack or price it at the door.</p>
@@ -1120,7 +1170,7 @@ function CollectionForm({ job, order, rates, onBack, onConfirm, onNoAnswer }) {
               className={`inline-flex items-center gap-1 px-3 py-1.5 rounded-full text-xs font-semibold border transition ${extras.includes(x)?'bg-amber-50 border-amber-300 text-amber-700':'bg-white border-gray-200 text-slate2 hover:border-gray-300'}`}>
               {extras.includes(x)&&<Ic name="check" size={13}/>}{x}</button>))}
         </div>
-        {needsPricing && <div className="text-xs text-amber-700 bg-amber-50 rounded-lg px-2 py-1.5 mt-2 inline-flex items-center gap-1"><Ic name="alert" size={14}/>{isShirts?'Shirts and any extras are counted & priced at the shop.':'Price below is provisional — shop finalises it.'}</div>}
+        {needsPricing && <div className="text-xs text-amber-700 bg-amber-50 rounded-lg px-2 py-1.5 mt-2 inline-flex items-center gap-1"><Ic name="alert" size={14}/>{anyShirts?'Shirts and any extras are counted & priced at the shop.':'Price below is provisional — shop finalises it.'}</div>}
 
         <label className="flex items-center gap-2 mt-3 text-sm text-ink">
           <input type="checkbox" checked={firstOrder} onChange={e=>setFirstOrder(e.target.checked)} className="accent-teal"/> Apply first-order discount (10%)</label>
@@ -1129,22 +1179,21 @@ function CollectionForm({ job, order, rates, onBack, onConfirm, onNoAnswer }) {
         <textarea value={notes} onChange={e=>setNotes(e.target.value)} rows="2" placeholder="e.g. stain on white shirt collar, handle silk gently…" className={inputCls}></textarea>
 
         <div className="bg-gray-50 rounded-xl p-4 mt-4">
-          {isShirts
-            ? <p className="text-slate2 text-sm">Shirts are counted and priced at the shop.</p>
-            : result.lines.length===0
-              ? <p className="text-slate2 text-sm">Enter bag weights to calculate the price…</p>
-              : <div className="space-y-1">
-                  {result.lines.map((l,i)=>(<div key={i} className="flex justify-between text-sm text-slate2"><span>{l.label}</span><span>{gbp(l.amt)}</span></div>))}
-                  {result.discount>0 && <div className="flex justify-between text-sm text-emerald-600"><span>First-order discount</span><span>−{gbp(result.discount)}</span></div>}
-                  {result.belowMin && <div className="flex justify-between text-xs text-amber-600"><span>Below {gbp(rates.minOrder)} minimum — rounded up</span><span></span></div>}
-                </div>}
+          {priced.lines.length===0
+            ? <p className="text-slate2 text-sm">Enter bag weights to calculate the price…</p>
+            : <div className="space-y-1">
+                {priced.lines.map((l,i)=>(<div key={i} className="flex justify-between text-sm text-slate2">
+                  <span>{l.label}</span><span>{l.atShop?'at shop':gbp(l.amt)}</span></div>))}
+                {result.discount>0 && <div className="flex justify-between text-sm text-emerald-600"><span>First-order discount</span><span>−{gbp(result.discount)}</span></div>}
+                {result.belowMin && <div className="flex justify-between text-xs text-amber-600"><span>Below {gbp(rates.minOrder)} minimum — rounded up</span><span></span></div>}
+              </div>}
           <div className="flex justify-between items-center mt-2 pt-2 border-t border-gray-200">
-            <span className="font-bold text-ink">{(isShirts||needsPricing)?'Provisional total':'Total to charge'}</span>
-            <span className="text-2xl font-extrabold text-teal-dark">{isShirts?'At shop':gbp(result.charged)}</span></div>
+            <span className="font-bold text-ink">{needsPricing?'Provisional total':'Total to charge'}</span>
+            <span className="text-2xl font-extrabold text-teal-dark">{result.charged>0?gbp(result.charged):'At shop'}</span></div>
         </div>
 
         <Btn kind="green" className="w-full mt-4" onClick={()=>setConfirmed(true)} {...(!canConfirm?{disabled:true}:{})}>
-          Confirm collection{!isShirts&&result.charged>0?` · ${gbp(result.charged)}`:''}</Btn>
+          Confirm collection{result.charged>0?` · ${gbp(result.charged)}`:''}</Btn>
         <button onClick={()=>onNoAnswer(job)} className="w-full mt-2 border-2 border-rose-200 bg-white text-rose-600 rounded-xl py-2 text-sm font-semibold inline-flex items-center justify-center gap-1.5 hover:bg-rose-50 transition"><Ic name="alert" size={15}/>No answer — reschedule</button>
       </div>
     </div>
@@ -1233,13 +1282,22 @@ function OrderModal({ order, rates, onClose, onSave, addAudit, onDelete, onDispa
   const [dispDay,setDispDay]=useState(TODAY);
   const [dispPack,setDispPack]=useState(packLabel(order.packaging)!=='—'?packLabel(order.packaging):PACKAGING[0]);
   const groups = useMemo(()=>{ const g={}; rates.items.forEach(r=>{(g[r.group]=g[r.group]||[]).push(r)}); return g; },[rates]);
+  // rebuild what the driver entered per bag, so the shop sees each rate applied
+  const bagLines = useMemo(()=>priceBags(rates,
+    (order.bagWeights||[]).map((w,i)=>({ weight:w, serviceKey:(order.bagServices||[])[i] }))
+  ).lines, [rates, order.bagWeights, order.bagServices]);
   const calc = useMemo(()=>orderTotal(rates, order.weightCharge, added, order.firstOrder), [rates,order,added]);
 
   // ---- edit the order's own details (service, weight, due date, packaging, payment, notes) ----
   const [editing,setEditing]=useState(false);
-  const [eSvc,setESvc]=useState(order.services[0]||'');
-  const [eWeight,setEWeight]=useState(order.weight||0);
-  const [eBags,setEBags]=useState(order.bagsCount||0);
+  const rowsFromOrder = () => {
+    const ws=order.bagWeights||[], ks=order.bagServices||[];
+    const fallback = (rates.weight.find(r=>r.label.replace(/ \(.*\)/,'')===(order.services||[])[0])||rates.weight[0]||{}).key;
+    if(!ws.length) return [];
+    return ws.map((w,i)=>({ id:i+1, weight:String(w),
+      serviceKey: (ks[i] && (ks[i]===SHIRTS_KEY || rates.weight.some(r=>r.key===ks[i]))) ? ks[i] : fallback }));
+  };
+  const [eRows,setERows]=useState(rowsFromOrder);
   const [eCharge,setECharge]=useState(order.weightCharge||0);
   const [eExtras,setEExtras]=useState(order.extras||[]);
   const [eDue,setEDue]=useState(order.dueDate||'');
@@ -1247,25 +1305,31 @@ function OrderModal({ order, rates, onClose, onSave, addAudit, onDelete, onDispa
   const [ePay,setEPay]=useState(order.paymentMethod||'—');
   const [eNotes,setENotes]=useState(order.notes||'');
   const [chargeTouched,setChargeTouched]=useState(false);
-  const svcOpts = [...new Set([...rates.weight.map(r=>r.label), ...order.services].filter(Boolean))];
-  // when the service or weight changes, re-price the weight part automatically (unless hand-edited)
+  const ePriced = useMemo(()=>priceBags(rates, eRows), [rates,eRows]);
+  // re-price from the bags whenever they change, unless a figure was typed in by hand
   useEffect(()=>{ if(!editing||chargeTouched) return;
-    const r=rates.weight.find(x=>x.label===eSvc);
-    if(r) setECharge(+(r.price*(parseFloat(eWeight)||0)).toFixed(2));
-  },[eSvc,eWeight,editing,chargeTouched]);
+    setECharge(+ePriced.subtotal.toFixed(2));
+  },[ePriced.subtotal,editing,chargeTouched]);
+  const eAddRow=()=>setERows(r=>[...r,{id:(r[r.length-1]?.id||0)+1,weight:'',
+    serviceKey:(r[r.length-1]||{}).serviceKey||(rates.weight[0]||{}).key}]);
+  const eRmRow=id=>setERows(r=>r.filter(x=>x.id!==id));
+  const eSetW=(id,v)=>setERows(r=>r.map(x=>x.id===id?{...x,weight:v}:x));
+  const eSetSvc=(id,v)=>setERows(r=>r.map(x=>x.id===id?{...x,serviceKey:v}:x));
   const editCalc = useMemo(()=>orderTotal(rates, parseFloat(eCharge)||0, added, order.firstOrder), [rates,eCharge,added,order.firstOrder]);
-  const startEdit=()=>{ setESvc(order.services[0]||''); setEWeight(order.weight||0); setEBags(order.bagsCount||0);
+  const startEdit=()=>{ setERows(rowsFromOrder());
     setECharge(order.weightCharge||0); setEExtras(order.extras||[]); setEDue(order.dueDate||''); setEPack(order.packaging||PACKAGING[0]);
     setEPay(order.paymentMethod||'—'); setENotes(order.notes||''); setChargeTouched(false); setPricing(false); setEditing(true); };
   const toggleExtra=(x)=>setEExtras(list=>list.includes(x)?list.filter(y=>y!==x):[...list,x]);
   const saveEdit=()=>{
-    const wc=parseFloat(eCharge)||0, wt=parseFloat(eWeight)||0, bags=parseInt(eBags)||0;
-    const patch={ services:eSvc?[eSvc]:[], weight:wt, bagsCount:bags, weightCharge:wc, extras:eExtras,
+    const wc=parseFloat(eCharge)||0, wt=ePriced.weight, bags=eRows.length;
+    const patch={ services:bagServiceLabels(rates,eRows), bagServices:eRows.map(r=>r.serviceKey),
+      bagWeights:eRows.map(r=>parseFloat(r.weight)||0),
+      weight:wt, bagsCount:bags, weightCharge:wc, extras:eExtras,
       dueDate:eDue||order.dueDate, packaging:ePack, paymentMethod:ePay, notes:eNotes,
       amount:editCalc.charged, needsPricing: order.needsPricing && eExtras.length>0 };
     // describe what actually changed, for the audit trail
     const ch=[];
-    if((order.services[0]||'')!==eSvc) ch.push(`service → ${eSvc||'none'}`);
+    if((order.services||[]).join(', ')!==bagServiceLabels(rates,eRows).join(', ')) ch.push(`services → ${bagServiceLabels(rates,eRows).join(' + ')||'none'}`);
     if((order.weight||0)!==wt) ch.push(`weight → ${wt}kg`);
     if((order.bagsCount||0)!==bags) ch.push(`bags → ${bags}`);
     if((order.extras||[]).join(',')!==eExtras.join(',')) ch.push(`extras → ${eExtras.join(', ')||'none'}`);
@@ -1305,16 +1369,32 @@ function OrderModal({ order, rates, onClose, onSave, addAudit, onDelete, onDispa
               {!editing && <Btn kind="subtle" icon="edit" className="!py-1 !px-2 text-xs" onClick={startEdit}>Edit details</Btn>}
             </div>
             {editing ? (<div className="space-y-2.5">
-              <Field label="Service"><select value={eSvc} onChange={e=>setESvc(e.target.value)} className={inputCls+' mt-1'}>
-                <option value="">— none / priced by item —</option>
-                {svcOpts.map(s=><option key={s}>{s}</option>)}</select></Field>
-              <div className="grid grid-cols-3 gap-2">
-                <Field label="Bags"><input type="number" min="0" value={eBags} onChange={e=>setEBags(e.target.value)} className={inputCls+' mt-1'}/></Field>
-                <Field label="Weight (kg)"><input type="number" min="0" step="0.1" value={eWeight} onChange={e=>setEWeight(e.target.value)} className={inputCls+' mt-1'}/></Field>
-                <Field label="Weight charge £"><input type="number" min="0" step="0.5" value={eCharge}
-                  onChange={e=>{setECharge(e.target.value);setChargeTouched(true);}} className={inputCls+' mt-1'}/></Field>
+              <div>
+                <div className="flex items-center justify-between mb-1">
+                  <div className="text-xs font-semibold text-slate2">Bags &amp; services</div>
+                  <Btn kind="subtle" icon="plus" onClick={eAddRow} className="!py-0.5 !px-2 text-[11px]">Add bag</Btn>
+                </div>
+                {eRows.length===0 && <p className="text-[11px] text-slate2">No bags — priced by item only.</p>}
+                <div className="space-y-1.5">
+                  {eRows.map((r,i)=>{ const rt=rates.weight.find(x=>x.key===r.serviceKey); const shirts=r.serviceKey===SHIRTS_KEY;
+                    return (
+                    <div key={r.id} className="flex items-center gap-1.5">
+                      <span className="text-[11px] text-slate2 w-8 shrink-0">Bag {i+1}</span>
+                      <select value={r.serviceKey} onChange={e=>eSetSvc(r.id,e.target.value)} className={inputCls+' !py-1 flex-1 min-w-0 text-xs'}>
+                        {rates.weight.map(x=><option key={x.key} value={x.key}>{x.label.replace(/ \(.*\)/,'')} — {gbp(x.price)}/kg</option>)}
+                        <option value={SHIRTS_KEY}>Shirt service — at shop</option>
+                      </select>
+                      <input type="number" min="0" step="0.1" value={r.weight} onChange={e=>eSetW(r.id,e.target.value)}
+                        {...(shirts?{disabled:true}:{})} className={inputCls+' !w-16 !py-1 text-right text-xs'} placeholder="0.0"/>
+                      <span className="text-[11px] text-slate2 shrink-0">kg</span>
+                      <span className="text-xs font-semibold text-ink w-14 text-right shrink-0">{shirts?'at shop':gbp((parseFloat(r.weight)||0)*((rt||{}).price||0))}</span>
+                      <button onClick={()=>eRmRow(r.id)} title="Remove bag" className="text-rose-400 hover:text-rose-600 shrink-0"><Ic name="close" size={14}/></button>
+                    </div>); })}
+                </div>
               </div>
-              <p className="text-[11px] text-slate2 -mt-1">Charge updates automatically from the service rate × weight. Type over it to set your own figure.</p>
+              <Field label="Weight charge £"><input type="number" min="0" step="0.5" value={eCharge}
+                onChange={e=>{setECharge(e.target.value);setChargeTouched(true);}} className={inputCls+' mt-1'}/>
+                <p className="text-[11px] text-slate2 mt-1">Adds the bags up at their own rates. Type over it to set your own figure.</p></Field>
               <div><div className="text-xs font-semibold text-slate2 mb-1">Extras flagged</div>
                 <div className="flex flex-wrap gap-2">{EXTRA_TYPES.map(x=>(
                   <button key={x} onClick={()=>toggleExtra(x)} className={`px-2.5 py-1 text-[11px] rounded-full font-semibold border ${eExtras.includes(x)?'bg-amber-100 text-amber-800 border-amber-300':'bg-white text-slate2 border-gray-200'}`}>{x}</button>))}</div></div>
@@ -1335,7 +1415,7 @@ function OrderModal({ order, rates, onClose, onSave, addAudit, onDelete, onDispa
               </div>
             </div>) : (<>
             <div className="text-sm space-y-1.5">
-              <Row k="Services" v={(order.services||[]).join(', ')||'—'}/>
+              <Row k="Services" v={(order.services||[]).join(' + ')||'—'}/>
               {(order.extras||[]).length>0 && <Row k="Extras" v={<span className="text-amber-700">{(order.extras||[]).join(', ')}</span>}/>}
               <Row k="Bags" v={order.bagsCount>0?`${order.bagsCount} · ${(order.bagWeights||[]).join('+')}kg = ${order.weight}kg`:'—'}/>
               <Row k="Packaging" v={packLabel(order.packaging)}/>
@@ -1392,7 +1472,9 @@ function OrderModal({ order, rates, onClose, onSave, addAudit, onDelete, onDispa
             {!pricing
               ? <div>
                   <div className="bg-gray-50 rounded-xl p-3 text-sm space-y-1">
-                    {order.weightCharge>0 && <div className="flex justify-between text-slate2"><span>{order.services[0]||'Weight-based'} ({order.weight}kg)</span><span>{gbp(order.weightCharge)}</span></div>}
+                    {bagLines.length>0
+                      ? bagLines.map((l,i)=>(<div key={i} className="flex justify-between text-slate2"><span>{l.label}</span><span>{l.atShop?'at shop':gbp(l.amt)}</span></div>))
+                      : order.weightCharge>0 && <div className="flex justify-between text-slate2"><span>{(order.services||[]).join(', ')||'Weight-based'} ({order.weight}kg)</span><span>{gbp(order.weightCharge)}</span></div>}
                     {calc.lines.map((l,i)=>(<div key={i} className="flex justify-between text-slate2"><span>{l.label}</span><span>{gbp(l.amt)}</span></div>))}
                     {calc.discount>0 && <div className="flex justify-between text-emerald-600"><span>First-order discount</span><span>−{gbp(calc.discount)}</span></div>}
                     {order.weightCharge===0 && calc.lines.length===0 && <div className="text-slate2">Nothing priced yet.</div>}
@@ -1402,7 +1484,9 @@ function OrderModal({ order, rates, onClose, onSave, addAudit, onDelete, onDispa
                 </div>
               : <>
                   <div className="bg-gray-50 rounded-xl p-3 text-sm mb-3">
-                    <div className="flex justify-between text-slate2"><span>Weight-based ({order.services[0]})</span><span>{gbp(order.weightCharge)}</span></div>
+                    {bagLines.length>0
+                      ? bagLines.map((l,i)=>(<div key={i} className="flex justify-between text-slate2"><span>{l.label}</span><span>{l.atShop?'at shop':gbp(l.amt)}</span></div>))
+                      : <div className="flex justify-between text-slate2"><span>{(order.services||[]).join(', ')||'Weight-based'}</span><span>{gbp(order.weightCharge)}</span></div>}
                   </div>
                   <p className="text-[11px] text-slate2 -mt-2 mb-2">Set a quantity to <b>0</b> (or clear it) to remove something added by mistake.</p>
                   <div className="max-h-56 overflow-y-auto pr-1">
@@ -1466,8 +1550,8 @@ function StoreApp({ go, orders, rates, updateOrder, addAudit, deleteOrder, jobs,
     const addedStr = o => Object.entries(o.addedItems||{}).filter(([k,q])=>parseInt(q)>0).map(([k,q])=>`${itemLabel(k)} ×${q}`).join(', ');
     const rows = list.map(o=>{ const c=custById(o.customerId); const extra = addedStr(o) || ((o.extras||[]).length ? (o.extras||[]).join(', ') : '');
       return `<tr><td><b>${fmtDate(o.dueDate)}</b></td><td>${fullName(c)}<br><span class="a">${c.addr}</span></td>
-        <td>${(o.services||[]).join(', ')}${extra?`<br><span class="r">+ ${extra}</span>`:''}</td>
-        <td>${o.bagsCount} (${(o.bagWeights||[]).join('+')}kg) · ${o.weight}kg</td>
+        <td>${(o.services||[]).join(' + ')}${extra?`<br><span class="r">+ ${extra}</span>`:''}</td>
+        <td>${o.bagsCount} (${(o.bagWeights||[]).join('+')}kg) · ${o.weight}kg${(o.bagServices||[]).length>1?'<br><span class="a">mixed services</span>':''}</td>
         <td>${gbp(o.amount)}${o.needsPricing?' <span class="r">(prov.)</span>':''}<br><span class="a">${o.paidInAdvance?'PAID':o.paymentMethod}</span></td>
         <td>${packLabel(o.packaging)}</td><td>${o.collectedDate?`${fmtDate(o.collectedDate)} ${o.collectedAt||''}`:'—'}</td><td>${o.status==='Needs pricing'?`<span class="r">${o.status}</span>`:o.status}</td><td>${c&&c.standingNotes?`<b class="v">Always: ${c.standingNotes}</b><br>`:''}${o.notes||''}</td></tr>`; }).join('');
     const html = `<html><head><title>NELIS — ${scope==='week'?'This week':dayLabel(scope)}</title>
@@ -1521,7 +1605,7 @@ function StoreApp({ go, orders, rates, updateOrder, addAudit, deleteOrder, jobs,
                       {(o.extras||[]).length>0 && <div className="text-xs text-amber-700 mt-1 inline-flex items-center gap-1"><Ic name="alert" size={13}/>To price: {(o.extras||[]).join(', ')}</div>}
                     </div>
                     <div className="text-sm grid grid-cols-2 gap-x-6 gap-y-0.5">
-                      <span className="text-slate2">Services</span><span className="text-ink text-right">{(o.services||[]).join(', ')}</span>
+                      <span className="text-slate2">Services</span><span className="text-ink text-right">{(o.services||[]).join(' + ')||'—'}</span>
                       <span className="text-slate2">Bags</span><span className="text-ink text-right">{o.bagsCount} · {o.weight}kg</span>
                       <span className="text-slate2">Price</span><span className="text-ink text-right">{gbp(o.amount)}{o.needsPricing?' (prov.)':''}</span>
                       <span className="text-slate2">Collected</span><span className="text-ink text-right">{o.collectedDate?`${fmtDate(o.collectedDate)} · ${o.collectedAt||''}`:'Not collected — delivery only'}</span>
@@ -2001,6 +2085,12 @@ function Pricing({ rates, setRates, canDelete }) {
           <Btn kind="primary" icon="check" onClick={saveW} className="!py-1.5">Add</Btn>
           <Btn kind="ghost" onClick={()=>setAddW(false)} className="!py-1.5">Cancel</Btn>
         </div>) : (<button onClick={()=>setAddW(true)} className="text-teal-dark text-xs font-semibold mt-2 inline-flex items-center gap-1"><Ic name="plus" size={13}/>Add a service</button>)}
+        <div className="mt-3 pt-3 border-t border-gray-100">
+          <div className="text-xs font-semibold text-slate2 mb-1">Shop address <span className="font-normal">(start &amp; end of every round)</span></div>
+          <input value={rates.shopAddress||''} onChange={e=>setRates({...rates, shopAddress:e.target.value})}
+            placeholder="5 Blackhorse Road, Walthamstow, E17 7AH" className={inputCls+' text-sm'}/>
+          <p className="text-[11px] text-slate2 mt-1">Every distance and the suggested driving order are measured from here, so the postcode must be right.</p>
+        </div>
         <div className="mt-3 pt-3 border-t border-gray-100 text-sm flex justify-between"><span className="text-slate2">Minimum order</span><span className="font-semibold text-ink">{gbp(rates.minOrder)}</span></div>
         <div className="text-sm flex justify-between"><span className="text-slate2">First-order discount</span><span className="font-semibold text-ink">{Math.round(rates.firstOrderDiscount*100)}%</span></div>
       </div>
@@ -2077,12 +2167,20 @@ function StaffAdmin({ drivers, setDrivers, deleteDriver, user }) {
     setStaffPin(id, pin.trim());
     setName(''); setPin(''); setRoles(['driver']); setCanDel(false); };
   const update=(id,patch)=>setDrivers(drivers.map(d=>d.id===id?{...d,...patch}:d));
+  // Mark arranges the list himself — the order drives every driver dropdown and
+  // the top name becomes the default on new jobs, so the rota can change without me.
+  const moveStaff=(idx,dir)=>{
+    const j=idx+(dir==='up'?-1:1);
+    if(j<0||j>=drivers.length) return;
+    const arr=drivers.slice(); const [m]=arr.splice(idx,1); arr.splice(j,0,m);
+    setDrivers(arr.map((d,i)=>({...d, sortOrder:(i+1)*10})));
+  };
   const saveEdited=(s,newPin)=>{ update(s.id,s);
     if(newPin){ setStaffPin(s.id,newPin); update(s.id,{...s,hasPin:true}); } };
   const toggleRole=(d,r)=>update(d.id,{roles: d.roles.includes(r)?d.roles.filter(x=>x!==r):[...d.roles,r]});
   return (<div>
     <h3 className="font-bold text-ink mb-1">Staff</h3>
-    <p className="text-xs text-slate2 mb-3">Add team members and choose which portals each can use. Someone can be both a driver and store team. Everyone signs in with their own PIN — PINs are stored scrambled and can't be read back, only replaced.</p>
+    <p className="text-xs text-slate2 mb-3">Add team members and choose which portals each can use. Someone can be both a driver and store team. Use the arrows to set the order — whoever is at the top is picked by default on new jobs. Everyone signs in with their own PIN; PINs are stored scrambled and can't be read back, only replaced.</p>
     <div className="bg-white card rounded-2xl p-4 mb-3">
       <div className="grid sm:grid-cols-2 gap-3">
         <Field label="Full name"><input value={name} onChange={e=>setName(e.target.value)} placeholder="e.g. Jamie Lee" className={inputCls+' mt-1'} onKeyDown={e=>e.key==='Enter'&&add()}/></Field>
@@ -2095,12 +2193,20 @@ function StaffAdmin({ drivers, setDrivers, deleteDriver, user }) {
       <Btn icon="plus" onClick={add} className="mt-3" {...(!name.trim()||!roles.length||pin.trim().length<4?{disabled:true}:{})}>Add staff member</Btn>
     </div>
     <div className="space-y-2">
-      {drivers.map(d=>(
+      {drivers.map((d,idx)=>(
         <div key={d.id} className={`bg-white card rounded-2xl p-3.5 ${d.active===false?'opacity-60':''}`}>
           <div className="flex items-center justify-between gap-2">
-            <div className="font-semibold text-ink">{d.name} {d.hasPin
+            <div className="flex items-center gap-2 min-w-0">
+              <div className="flex flex-col shrink-0">
+                <button onClick={()=>moveStaff(idx,'up')} {...(idx===0?{disabled:true}:{})} title="Move up"
+                  className={`w-6 h-5 rounded flex items-center justify-center ${idx===0?'text-gray-200':'text-slate2 hover:bg-gray-100'}`}><Ic name="up" size={14}/></button>
+                <button onClick={()=>moveStaff(idx,'down')} {...(idx===drivers.length-1?{disabled:true}:{})} title="Move down"
+                  className={`w-6 h-5 rounded flex items-center justify-center ${idx===drivers.length-1?'text-gray-200':'text-slate2 hover:bg-gray-100'}`}><Ic name="down" size={14}/></button>
+              </div>
+              <div className="font-semibold text-ink truncate">{d.name} {idx===0&&hasRole(d,'driver')&&<Badge tone="teal">Default driver</Badge>} {d.hasPin
               ? <span className="text-slate2 font-normal text-xs">· PIN set</span>
               : <span className="text-rose-600 font-semibold text-xs">· no PIN — can't sign in</span>}</div>
+            </div>
             <div className="flex items-center gap-2">
               <Badge tone={d.active!==false?'green':'grey'}>{d.active!==false?'Active':'Inactive'}</Badge>
               <button onClick={()=>setEditing(d)} title="Edit staff member" className="w-8 h-8 rounded-lg border border-gray-200 flex items-center justify-center text-slate2 hover:bg-gray-50"><Ic name="edit" size={15}/></button>
@@ -2509,6 +2615,16 @@ function App() {
     return next;
   }),[]);
   const setRates=useCallback(u=>setRatesState(prev=>{ const next=typeof u==='function'?u(prev):u; saveRates(next); return next; }),[]);
+  // keep the map's start point on the shop's saved address
+  useEffect(()=>{
+    const addr=rates.shopAddress; if(!addr) return;
+    SHOP.addr=addr; if(rates.shopName) SHOP.name=rates.shopName;
+    const pc=(addr.match(/[A-Z]{1,2}\d[A-Z\d]?\s*\d[A-Z]{2}/i)||[''])[0];
+    if(!pc) return;
+    fetch(`https://api.postcodes.io/postcodes/${encodeURIComponent(pc.replace(/\s+/g,''))}`)
+      .then(r=>r.json()).then(j=>{ if(j&&j.status===200&&j.result){ SHOP.lat=j.result.latitude; SHOP.lng=j.result.longitude; } })
+      .catch(()=>{});
+  },[rates.shopAddress,rates.shopName]);
   const setDrivers=useCallback(u=>setDriversState(prev=>{ const next=typeof u==='function'?u(prev):u; DRIVERS=next; saveDrivers(next); return next; }),[]);
   const deleteDriver=useCallback((id)=>{ setDriversState(prev=>{ const d=prev.find(x=>x.id===id); const next=prev.filter(x=>x.id!==id); DRIVERS=next;
     if(db) db.from('drivers').delete().eq('id',id).then(r=>{ if(r&&r.error) reportErr('delete staff', r.error); });
