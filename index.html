@@ -2862,16 +2862,21 @@ function App() {
       if(!upd) return prev;
       const job = prev.find(j=>j.orderId===id && j.status==='pending');
       if(!job) return prev;
+      // Only move the stop to another day when the DELIVER-BY DATE is what was
+      // actually changed. Re-asserting it on every edit meant that simply
+      // tapping a packaging button re-filed the stop onto a different day and
+      // it vanished from the list you were looking at.
+      const dateChanged = Object.prototype.hasOwnProperty.call(patch||{}, 'dueDate');
       const fields = job.type==='delivery'
         ? { packaging:upd.packaging, amount:upd.amount, paymentMethod:upd.paymentMethod,
             paidInAdvance:!!upd.paidInAdvance, bags:upd.bagsCount, weight:upd.weight,
             service:(upd.services||[]).join(', ')||'—',
-            runDate: upd.dueDate || job.runDate || TODAY }   // deliver-by decides which day's run
-        : { returnDate: upd.dueDate || job.returnDate };     // a collection only shows "return by"
+            ...(dateChanged && upd.dueDate ? { runDate: upd.dueDate } : {}) }
+        : (dateChanged ? { returnDate: upd.dueDate || job.returnDate } : {});
       if(!Object.keys(fields).some(k=>job[k]!==fields[k])) return prev;
 
       const fromDay = job.runDate||TODAY, toDay = fields.runDate;
-      const moved = job.type==='delivery' && toDay && toDay!==fromDay;
+      const moved = job.type==='delivery' && !!toDay && toDay!==fromDay;
       let next = prev.map(j=>j.id===job.id?{...j,...fields}:j);
       if(moved){
         next = reseqDriver(next, job.driverId, fromDay);                    // close the gap on the old day
