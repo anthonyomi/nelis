@@ -857,6 +857,20 @@ function PortalPicker({ user, onPick, onLogout }) {
 // friendly label for a run date — "Today", "Tomorrow", else the date
 const dayLabel = iso => iso===TODAY ? 'Today' : iso===addDays(TODAY,1) ? 'Tomorrow'
   : iso===addDays(TODAY,-1) ? 'Yesterday' : fmtDate(iso);
+// PURE — stops that were never done on a day now past (unit-tested).
+// Day views only look forward, so without this a stop that got skipped simply
+// disappears: nobody looks at last Friday, and the customer never gets a call.
+function missedStops(jobs, driverIds, today) {
+  const ids = driverIds && driverIds.length ? driverIds : null;
+  const late = (jobs||[]).filter(j =>
+    j.status === 'pending' &&
+    (j.runDate || today) < today &&
+    (!ids || ids.includes(j.driverId)));
+  const byDay = {};
+  late.forEach(j => { const d = j.runDate || today; (byDay[d] = byDay[d] || []).push(j); });
+  const days = Object.keys(byDay).sort();
+  return { count: late.length, days, oldest: days[0] || null, byDay };
+}
 // PURE — the next few days as named tabs (unit-tested).
 // Mark thinks in "today, tomorrow, Wednesday", not in dates.
 function dayTabs(today, span=6, extra=null) {
@@ -869,10 +883,64 @@ function dayTabs(today, span=6, extra=null) {
     days.push({ date:extra, label:fmtDate(extra).replace(/^\w+ /,'') });
   return days;
 }
+// Remembers which sections you folded, for as long as the tab is open, so a
+// long run stays out of the way instead of collapsing again on every visit.
+function useCollapsed(key){
+  const [set,setSet]=useState(()=>{
+    try{ return new Set(JSON.parse(sessionStorage.getItem('nelis.fold.'+key)||'[]')); }
+    catch(e){ return new Set(); }
+  });
+  const toggle=(id)=>setSet(prev=>{
+    const next=new Set(prev); next.has(id)?next.delete(id):next.add(id);
+    try{ sessionStorage.setItem('nelis.fold.'+key, JSON.stringify([...next])); }catch(e){}
+    return next;
+  });
+  return [set,toggle];
+}
+// A fold/unfold chevron with a count, used on section headers.
+function FoldToggle({ open, count, label }){
+  return (
+    <span className="ml-auto text-xs font-semibold text-slate2 inline-flex items-center gap-1 shrink-0">
+      {open ? (label||'Hide') : `Show${count!=null?` ${count}`:''}`}
+      <Ic name={open?'up':'down'} size={13}/>
+    </span>);
+}
+// Work that never got done, shown wherever a day is being viewed.
+function MissedBanner({ missed, onGo }) {
+  if(!missed || !missed.count) return null;
+  const n=missed.count, days=missed.days;
+  return (
+    <div className="mb-3 rounded-xl border border-rose-300 bg-rose-50 p-3">
+      <div className="flex items-start gap-2">
+        <span className="text-rose-600 mt-0.5"><Ic name="alert" size={17}/></span>
+        <div className="flex-1 min-w-0">
+          <div className="font-bold text-rose-700 text-sm">
+            {n} stop{n===1?'':'s'} not completed{days.length===1?` on ${dayLabel(days[0])}`:''}
+          </div>
+          <div className="text-rose-700/80 text-xs mt-0.5">
+            {days.length===1
+              ? 'Still outstanding — complete it, move it to another day, or cancel it.'
+              : `Still outstanding across ${days.length} earlier days.`}
+          </div>
+          <div className="flex flex-wrap gap-1.5 mt-2">
+            {days.map(d=>(
+              <button key={d} onClick={()=>onGo(d)}
+                className="px-2.5 py-1 rounded-full text-[11px] font-bold bg-white text-rose-700 border border-rose-300 hover:bg-rose-100">
+                {dayLabel(d)} · {missed.byDay[d].length}
+              </button>))}
+          </div>
+        </div>
+      </div>
+    </div>);
+}
 function DayPicker({ day, setDay, counts, span=6 }) {
   const tabs = dayTabs(TODAY, span, day);
+  const isPast = day < TODAY;
   return (
     <div className="bg-white card rounded-2xl p-1.5 flex gap-1 overflow-x-auto">
+      {isPast && <button onClick={()=>setDay(day)}
+        className="px-3 py-1.5 rounded-xl text-sm font-semibold whitespace-nowrap shrink-0 bg-rose-500 text-white inline-flex items-center gap-1.5">
+        {dayLabel(day)}{counts&&counts[day]?<span className="text-[10px] font-bold px-1.5 rounded-full bg-white/25">{counts[day]}</span>:null}</button>}
       {tabs.map(t=>{ const on=t.date===day, n=counts?counts[t.date]:null;
         return (
           <button key={t.date} onClick={()=>setDay(t.date)}
@@ -898,10 +966,12 @@ function DriverApp({ driver, go, jobs, setJobs, orders, customers, rates, addAud
       const d=j.runDate||TODAY; m[d]=(m[d]||0)+1; });
     return m;
   },[jobs,driver.id]);
+  const missed = useMemo(()=>missedStops(jobs,[driver.id],TODAY), [jobs,driver.id]);
+  // days AHEAD with work on them; anything behind is handled by the missed banner
   const otherDays = useMemo(()=>{
-    const m={}; jobs.forEach(j=>{ if(j.driverId!==driver.id||j.status!=='pending') return;
-      const d=j.runDate||TODAY; if(d!==day) m[d]=(m[d]||0)+1; });
-    return Object.entries(m).sort((a,b)=>a[0].localeCompare(b[0]));
+    const ahead={}; jobs.forEach(j=>{ if(j.driverId!==driver.id||j.status!=='pending') return;
+      const d=j.runDate||TODAY; if(d>TODAY && d!==day) ahead[d]=(ahead[d]||0)+1; });
+    return Object.entries(ahead).sort((a,b)=>a[0].localeCompare(b[0]));
   },[jobs,driver.id,day]);
 
   const completeCollection = (job, data) => {
@@ -987,6 +1057,7 @@ function DriverApp({ driver, go, jobs, setJobs, orders, customers, rates, addAud
           <p className="text-slate2 text-sm mb-1">In driving order. <span className="text-rose-500 font-semibold">Pink = collection</span>, white = delivery. Next job highlighted; done jobs greyed out.</p>
           {myPending.length>1 && <p className="text-slate2 text-xs mb-3 inline-flex items-center gap-1"><Ic name="up" size={13}/>Use the arrows to change the order if you'd rather do a stop earlier — the office sees the change.</p>}
           <div className="mb-3"><DayPicker day={day} setDay={setDay} counts={dayCounts}/></div>
+          <MissedBanner missed={missed} onGo={setDay}/>
           {myJobs.length>0 && <div className="bg-white card rounded-2xl p-2 mb-3">
             <button onClick={()=>setShowMap(v=>!v)} className="w-full flex items-center justify-between px-1.5 py-1 text-sm font-semibold text-ink">
               <span className="inline-flex items-center gap-1.5"><Ic name="pin" size={16}/>Your stops on the map</span>
@@ -2055,7 +2126,7 @@ const ORDER_SECTIONS = [
 ];
 function Orders({ orders, rates, updateOrder, addAudit, filter, onClearFilter, deleteOrder, jobs, drivers, onDispatch, user }) {
   const [sel,setSel]=useState(null);
-  const [showDone,setShowDone]=useState(false);
+  const [folded,fold]=useCollapsed('orders');
   const base = filter==='needsPricing' ? orders.filter(o=>o.needsPricing) : orders;
   const groups = useMemo(()=>groupOrdersByDue(base, TODAY), [base]);
   const total = base.length;
@@ -2089,17 +2160,17 @@ function Orders({ orders, rates, updateOrder, addAudit, filter, onClearFilter, d
     <div className="space-y-5">
       {ORDER_SECTIONS.map(s=>{
         const list = groups[s.key]; if(!list.length) return null;
-        const collapsible = s.key==='done';
-        const open = !collapsible || showDone;
+        // completed work starts folded; everything else starts open
+        const open = s.key==='done' ? folded.has('done-open') : !folded.has(s.key);
         return (
           <div key={s.key}>
-            <div className={`flex items-center gap-2 pb-1.5 mb-2 border-b-2 ${s.accent}`}>
+            <button onClick={()=>fold(s.key==='done'?'done-open':s.key)}
+              className={`w-full flex items-center gap-2 pb-1.5 mb-2 border-b-2 text-left ${s.accent}`}>
               <span className={`w-2 h-2 rounded-full ${s.dot}`}></span>
               <h4 className="font-extrabold text-ink text-sm">{s.title}</h4>
               <span className={`text-[11px] font-bold px-1.5 py-0.5 rounded-full ${s.pill}`}>{list.length}</span>
-              {collapsible && <button onClick={()=>setShowDone(v=>!v)} className="ml-auto text-xs text-teal-dark font-semibold inline-flex items-center gap-1">
-                {open?'Hide':'Show'}<Ic name={open?'up':'down'} size={13}/></button>}
-            </div>
+              <FoldToggle open={open} count={list.length}/>
+            </button>
             {open && <>
               <p className="text-[11px] text-slate2 -mt-1 mb-2">{s.note}</p>
               <div className="space-y-2">{list.map(card)}</div>
@@ -2365,8 +2436,10 @@ function Logistics({ jobs, setJobs, drivers, onNew, deleteJob, customers, user }
   const dayCounts = useMemo(()=>{
     const m={}; jobs.forEach(j=>{ const d=j.runDate||TODAY; m[d]=(m[d]||0)+1; }); return m;
   },[jobs]);
+  const missedAll = useMemo(()=>missedStops(jobs, driverStaff.map(d=>d.id), TODAY), [jobs,drivers]);
   const otherDays = useMemo(()=>{
-    const m={}; jobs.forEach(j=>{ if(j.status!=='pending') return; const d=j.runDate||TODAY; if(d!==day) m[d]=(m[d]||0)+1; });
+    const m={}; jobs.forEach(j=>{ if(j.status!=='pending') return; const d=j.runDate||TODAY;
+      if(d>TODAY && d!==day) m[d]=(m[d]||0)+1; });   // past days are in the missed banner
     return Object.entries(m).sort((a,b)=>a[0].localeCompare(b[0])).slice(0,6);
   },[jobs,day]);
   const [optimising,setOptimising]=useState(false);
@@ -2416,6 +2489,7 @@ function Logistics({ jobs, setJobs, drivers, onNew, deleteJob, customers, user }
   const move=(driverId,jobId,dir)=>setJobs(prev=>moveJob(prev,driverId,jobId,dir,day));
   const reassign=(jobId,toDriverId)=>setJobs(prev=>moveJobTo(prev,jobId,toDriverId,null,day));
   const [showLoading,setShowLoading]=useState(false);
+  const [foldedDrv,foldDrv]=useCollapsed('logistics-drivers');
 
   // Reordering by touch. The browser's built-in drag-and-drop is mouse-only,
   // which is why this never worked on a phone. Pointer events cover all three.
@@ -2515,8 +2589,9 @@ function Logistics({ jobs, setJobs, drivers, onNew, deleteJob, customers, user }
       </div>
       <p className="text-xs text-slate2 mb-3">Each driver's collections + deliveries for the chosen day. <b>Drag the handle</b> to reorder, or drop a stop on the other driver to reassign — works on phone and computer. The arrows and the <b>Move to</b> menu do the same thing. <span className="text-rose-500 font-semibold">Pink = collection</span>, white = delivery.</p>
       <div className="mb-3"><DayPicker day={day} setDay={setDay} counts={dayCounts}/></div>
+      <MissedBanner missed={missedAll} onGo={setDay}/>
       {otherDays.length>0 && <div className="mb-3 flex flex-wrap gap-1.5">
-        <span className="text-[11px] text-slate2 self-center">Also booked:</span>
+        <span className="text-[11px] text-slate2 self-center">Also booked ahead:</span>
         {otherDays.map(([d,n])=>(
           <button key={d} onClick={()=>setDay(d)} className="px-2.5 py-1 rounded-full text-[11px] font-semibold bg-teal-light text-teal-dark">
             {dayLabel(d)} · {n}</button>))}
@@ -2593,10 +2668,17 @@ function Logistics({ jobs, setJobs, drivers, onNew, deleteJob, customers, user }
       <div className="grid md:grid-cols-2 gap-4">
         {driverStaff.map(d=>{
           const list=dayJobs.filter(j=>j.driverId===d.id).sort((a,b)=>a.seq-b.seq);
+          const open = !foldedDrv.has(d.id);
+          const doneN = list.filter(x=>x.status!=='pending').length;
           return (
             <div key={d.id} data-driver-col={d.id} className="bg-white card rounded-2xl p-4">
-              <h4 className="font-bold text-ink text-sm mb-2 inline-flex items-center gap-1.5"><Ic name="truck" size={16}/>{d.name} <span className="text-slate2 font-normal">· {list.length} stops{list.filter(x=>x.status!=='pending').length?` · ${list.filter(x=>x.status!=='pending').length} done`:''}</span>
-</h4>
+              <button onClick={()=>foldDrv(d.id)} className="w-full flex items-center gap-1.5 mb-2 text-left">
+                <Ic name="truck" size={16}/>
+                <h4 className="font-bold text-ink text-sm">{d.name}</h4>
+                <span className="text-slate2 font-normal text-sm">· {list.length} stop{list.length===1?'':'s'}{doneN?` · ${doneN} done`:''}</span>
+                <FoldToggle open={open} count={list.length}/>
+              </button>
+              {open && <>
               {(()=>{ const moved=list.filter(x=>x.reorderedBy);
                 if(!moved.length) return null;
                 const last=moved.reduce((a,b)=>(a.reorderedAt||'')>(b.reorderedAt||'')?a:b);
@@ -2641,6 +2723,7 @@ function Logistics({ jobs, setJobs, drivers, onNew, deleteJob, customers, user }
                       </div>);
                   })}
                 </div>}
+              </>}
             </div>);
         })}
       </div>
