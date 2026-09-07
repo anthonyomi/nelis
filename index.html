@@ -2777,6 +2777,10 @@ function App() {
   const actor = () => (userRef.current && userRef.current.name) || 'Someone';
   const [jobs,setJobsState]=useState(INITIAL_JOBS);
   const [orders,setOrdersState]=useState(INITIAL_ORDERS);
+  // Always holds the latest orders, readable immediately rather than on the
+  // next redraw. updateOrder needs this — see the note there.
+  const ordersRef = useRef(orders); ordersRef.current = orders;
+  const jobsRef   = useRef(jobs);   jobsRef.current   = jobs;
   const [rates,setRatesState]=useState(INITIAL_RATES);
   const [drivers,setDriversState]=useState(DRIVERS);
   const [audit,setAudit]=useState([]);
@@ -2849,64 +2853,74 @@ function App() {
     if(db) db.from('drivers').delete().eq('id',id).then(r=>{ if(r&&r.error) reportErr('delete staff', r.error); });
     if(d) addAudit(`${actor()} removed staff member ${d.name}`); return next; }); },[]);
   const addAudit=useCallback(text=>{ const e={time:now(),text}; setAudit(prev=>[e,...prev]); insertAudit(e); },[]);
-  const addOrder=useCallback(o=>{ setOrdersState(prev=>[o,...prev]); saveOrder(o); },[]);
+  const addOrder=useCallback(o=>{ ordersRef.current=[o,...ordersRef.current]; setOrdersState(prev=>[o,...prev]); saveOrder(o); },[]);
   const updateOrder=useCallback((id,patch)=>{
-    let upd=null;
-    setOrdersState(prev=>{ const next=prev.map(o=>o.id===id?{...o,...patch}:o);
-      upd=next.find(o=>o.id===id); if(upd) saveOrder(upd); return next; });
+    // THE ONE THAT CAUSED ALL THE TROUBLE. This used to work out the updated
+    // order as a side effect INSIDE the orders state updater, then read it back
+    // when updating the driver's stop. React is free to run those two updaters
+    // later, and in the order the states were declared — jobs before orders —
+    // so the stop update often ran while the order was still blank and quietly
+    // did nothing at all. Sometimes React ran them straight away and it worked.
+    // That is exactly why a button would work once, then refuse to budge, and
+    // why it behaved differently for two people on the same screen.
+    // The order is now worked out up front, before anything is queued.
+    const before = ordersRef.current.find(o=>o.id===id);
+    if(!before) return;
+    const upd = { ...before, ...patch };
+    ordersRef.current = ordersRef.current.map(o=>o.id===id?upd:o);  // ready for a second tap before the redraw
+    setOrdersState(prev=>prev.map(o=>o.id===id?{...o,...patch}:o));
+    saveOrder(upd);
     // The order and the driver's stop keep SEPARATE copies of packaging, price,
     // payment and dates. Without this, anything changed in the office never
     // reaches the van — the driver keeps seeing the values from when it was
     // first sent out. Only stops still to do are touched; finished ones are history.
-    setJobsState(prev=>{
-      if(!upd) return prev;
-      // An order can have MORE THAN ONE stop still outstanding — most often a
-      // delivery plus a collection that nobody ever ticked off. Looking up only
-      // the first match meant that whenever the collection happened to come
-      // first in the list, packaging and price changes were quietly thrown away
-      // and the delivery stop never heard about them. That is why the buttons
-      // worked on some stops and not others, and differed between two people
-      // looking at the same screen.
-      const linked = prev.filter(j=>j.orderId===id && j.status==='pending');
-      if(!linked.length) return prev;
-      // Only move the stop to another day when the DELIVER-BY DATE is what was
-      // actually changed. Re-asserting it on every edit meant that simply
-      // tapping a packaging button re-filed the stop onto a different day and
-      // it vanished from the list you were looking at.
-      const dateChanged = Object.prototype.hasOwnProperty.call(patch||{}, 'dueDate');
-      const changed = new Set();
-      let next = prev;
+    // Worked out here and now, not inside a state updater, for the same reason
+    // as above: an updater may run later, more than once, or not at all.
+    const prevJobs = jobsRef.current;
+    // An order can have MORE THAN ONE stop still outstanding — most often a
+    // delivery plus a collection that nobody ever ticked off. Looking up only
+    // the first match meant packaging and price changes were quietly thrown
+    // away whenever the collection came first in the list.
+    const linked = prevJobs.filter(j=>j.orderId===id && j.status==='pending');
+    if(!linked.length) return;
+    // Only move the stop to another day when the DELIVER-BY DATE is what was
+    // actually changed. Re-asserting it on every edit meant that simply
+    // tapping a packaging button re-filed the stop onto a different day and
+    // it vanished from the list you were looking at.
+    const dateChanged = Object.prototype.hasOwnProperty.call(patch||{}, 'dueDate');
+    const changed = new Set();
+    let next = prevJobs;
 
-      // A collection stop only ever carries the return-by date.
-      if(dateChanged && upd.dueDate) linked
-        .filter(j=>j.type!=='delivery' && j.returnDate!==upd.dueDate)
-        .forEach(j=>{ changed.add(j.id); next = next.map(x=>x.id===j.id?{...x,returnDate:upd.dueDate}:x); });
+    // A collection stop only ever carries the return-by date.
+    if(dateChanged && upd.dueDate) linked
+      .filter(j=>j.type!=='delivery' && j.returnDate!==upd.dueDate)
+      .forEach(j=>{ changed.add(j.id); next = next.map(x=>x.id===j.id?{...x,returnDate:upd.dueDate}:x); });
 
-      // The delivery stop carries everything the driver needs at the door.
-      // EVERY outstanding delivery for this order is updated, not just one of
-      // them — if an order was ever sent out twice, updating only one of the
-      // two left the other showing stale details and looking unresponsive.
-      linked.filter(j=>j.type==='delivery').forEach(del=>{
-        const fields = { packaging:upd.packaging, amount:upd.amount, paymentMethod:upd.paymentMethod,
-          paidInAdvance:!!upd.paidInAdvance, bags:upd.bagsCount, weight:upd.weight,
-          service:(upd.services||[]).join(', ')||'—',
-          ...(dateChanged && upd.dueDate ? { runDate: upd.dueDate } : {}) };
-        if(!Object.keys(fields).some(k=>del[k]!==fields[k])) return;
-        changed.add(del.id);
-        const fromDay = del.runDate||TODAY, toDay = fields.runDate;
-        const moved = !!toDay && toDay!==fromDay;
-        next = next.map(j=>j.id===del.id?{...j,...fields}:j);
-        if(moved){
-          next = reseqDriver(next, del.driverId, fromDay);                    // close the gap on the old day
-          const n = next.filter(j=>j.driverId===del.driverId && (j.runDate||TODAY)===toDay && j.id!==del.id).length;
-          next = next.map(j=>j.id===del.id?{...j, seq:n+1}:j);                // add to the end of the new day
-          addAudit(`${fullName(custById(upd.customerId))}'s delivery moved to ${fmtDate(toDay)}'s run`);
-        }
-      });
-      if(!changed.size) return prev;
-      saveJobs(next.filter(j=>changed.has(j.id)));
-      return next;
+    // The delivery stop carries everything the driver needs at the door.
+    // EVERY outstanding delivery for this order is updated, not just one of
+    // them — if an order was ever sent out twice, updating only one of the
+    // two left the other showing stale details and looking unresponsive.
+    linked.filter(j=>j.type==='delivery').forEach(del=>{
+      const fields = { packaging:upd.packaging, amount:upd.amount, paymentMethod:upd.paymentMethod,
+        paidInAdvance:!!upd.paidInAdvance, bags:upd.bagsCount, weight:upd.weight,
+        service:(upd.services||[]).join(', ')||'—',
+        ...(dateChanged && upd.dueDate ? { runDate: upd.dueDate } : {}) };
+      if(!Object.keys(fields).some(k=>del[k]!==fields[k])) return;
+      changed.add(del.id);
+      const fromDay = del.runDate||TODAY, toDay = fields.runDate;
+      const moved = !!toDay && toDay!==fromDay;
+      next = next.map(j=>j.id===del.id?{...j,...fields}:j);
+      if(moved){
+        next = reseqDriver(next, del.driverId, fromDay);                    // close the gap on the old day
+        const n = next.filter(j=>j.driverId===del.driverId && (j.runDate||TODAY)===toDay && j.id!==del.id).length;
+        next = next.map(j=>j.id===del.id?{...j, seq:n+1}:j);                // add to the end of the new day
+        addAudit(`${fullName(custById(upd.customerId))}'s delivery moved to ${fmtDate(toDay)}'s run`);
+      }
     });
+    if(!changed.size) return;
+    jobsRef.current = next;                                  // ready for a second tap before the redraw
+    saveJobs(next.filter(j=>changed.has(j.id)));
+    setJobsState(next);
   },[addAudit]);
   // stops are numbered per driver PER DAY, so a booking for tomorrow starts at 1 again
   const reseqDriver=(arr,did,day)=>{ const on=j=>j.driverId===did && (!day || (j.runDate||TODAY)===day);
