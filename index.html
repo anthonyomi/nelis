@@ -2860,31 +2860,51 @@ function App() {
     // first sent out. Only stops still to do are touched; finished ones are history.
     setJobsState(prev=>{
       if(!upd) return prev;
-      const job = prev.find(j=>j.orderId===id && j.status==='pending');
-      if(!job) return prev;
+      // An order can have MORE THAN ONE stop still outstanding — most often a
+      // delivery plus a collection that nobody ever ticked off. Looking up only
+      // the first match meant that whenever the collection happened to come
+      // first in the list, packaging and price changes were quietly thrown away
+      // and the delivery stop never heard about them. That is why the buttons
+      // worked on some stops and not others, and differed between two people
+      // looking at the same screen.
+      const linked = prev.filter(j=>j.orderId===id && j.status==='pending');
+      if(!linked.length) return prev;
       // Only move the stop to another day when the DELIVER-BY DATE is what was
       // actually changed. Re-asserting it on every edit meant that simply
       // tapping a packaging button re-filed the stop onto a different day and
       // it vanished from the list you were looking at.
       const dateChanged = Object.prototype.hasOwnProperty.call(patch||{}, 'dueDate');
-      const fields = job.type==='delivery'
-        ? { packaging:upd.packaging, amount:upd.amount, paymentMethod:upd.paymentMethod,
-            paidInAdvance:!!upd.paidInAdvance, bags:upd.bagsCount, weight:upd.weight,
-            service:(upd.services||[]).join(', ')||'—',
-            ...(dateChanged && upd.dueDate ? { runDate: upd.dueDate } : {}) }
-        : (dateChanged ? { returnDate: upd.dueDate || job.returnDate } : {});
-      if(!Object.keys(fields).some(k=>job[k]!==fields[k])) return prev;
+      const changed = new Set();
+      let next = prev;
 
-      const fromDay = job.runDate||TODAY, toDay = fields.runDate;
-      const moved = job.type==='delivery' && !!toDay && toDay!==fromDay;
-      let next = prev.map(j=>j.id===job.id?{...j,...fields}:j);
-      if(moved){
-        next = reseqDriver(next, job.driverId, fromDay);                    // close the gap on the old day
-        const n = next.filter(j=>j.driverId===job.driverId && (j.runDate||TODAY)===toDay && j.id!==job.id).length;
-        next = next.map(j=>j.id===job.id?{...j, seq:n+1}:j);                // add to the end of the new day
-        addAudit(`${fullName(custById(upd.customerId))}'s delivery moved to ${fmtDate(toDay)}'s run`);
-      }
-      saveJobs(next.filter(j=>j.id===job.id));
+      // A collection stop only ever carries the return-by date.
+      if(dateChanged && upd.dueDate) linked
+        .filter(j=>j.type!=='delivery' && j.returnDate!==upd.dueDate)
+        .forEach(j=>{ changed.add(j.id); next = next.map(x=>x.id===j.id?{...x,returnDate:upd.dueDate}:x); });
+
+      // The delivery stop carries everything the driver needs at the door.
+      // EVERY outstanding delivery for this order is updated, not just one of
+      // them — if an order was ever sent out twice, updating only one of the
+      // two left the other showing stale details and looking unresponsive.
+      linked.filter(j=>j.type==='delivery').forEach(del=>{
+        const fields = { packaging:upd.packaging, amount:upd.amount, paymentMethod:upd.paymentMethod,
+          paidInAdvance:!!upd.paidInAdvance, bags:upd.bagsCount, weight:upd.weight,
+          service:(upd.services||[]).join(', ')||'—',
+          ...(dateChanged && upd.dueDate ? { runDate: upd.dueDate } : {}) };
+        if(!Object.keys(fields).some(k=>del[k]!==fields[k])) return;
+        changed.add(del.id);
+        const fromDay = del.runDate||TODAY, toDay = fields.runDate;
+        const moved = !!toDay && toDay!==fromDay;
+        next = next.map(j=>j.id===del.id?{...j,...fields}:j);
+        if(moved){
+          next = reseqDriver(next, del.driverId, fromDay);                    // close the gap on the old day
+          const n = next.filter(j=>j.driverId===del.driverId && (j.runDate||TODAY)===toDay && j.id!==del.id).length;
+          next = next.map(j=>j.id===del.id?{...j, seq:n+1}:j);                // add to the end of the new day
+          addAudit(`${fullName(custById(upd.customerId))}'s delivery moved to ${fmtDate(toDay)}'s run`);
+        }
+      });
+      if(!changed.size) return prev;
+      saveJobs(next.filter(j=>changed.has(j.id)));
       return next;
     });
   },[addAudit]);
