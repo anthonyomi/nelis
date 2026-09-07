@@ -413,21 +413,78 @@ function moveJobTo(jobs, jobId, toDriverId, targetJobId, day) {
   return [...others, ...source, ...nt.map((j,i)=>({...j, seq:i+1}))];
 }
 
-/* ---- PURE route optimiser (unit-tested). Free: runs in the app, no API. ---- */
+/* =================================================================== */
+/*  ROAD ROUTING (Mapbox) — optional                                    */
+/*  Without a token the app still works exactly as before, measuring    */
+/*  in straight lines. With one, it uses real driving distances and     */
+/*  draws the actual roads. Every call falls back quietly on failure —  */
+/*  a driver waiting on a spinner is worse than an imperfect order.     */
+/* =================================================================== */
+// Paste your Mapbox public token here (see mapbox_setup.md). Safe to leave blank.
+const MAPBOX_TOKEN = 'pk.eyJ1IjoiYW50LW9taSIsImEiOiJjbXRyMXZvYWUwbnliMnhzZHh0N3MydmsyIn0.TRA8GlvEtnF5FchMKNjLjg';
+const MAPBOX_MAX_COORDS = 25;            // Mapbox limit per request, driving profile
+const hasMapbox = () => !!MAPBOX_TOKEN;
+const lngLat = p => `${p.lng},${p.lat}`;
+
+// Road distances between every pair of points, in km. null if unavailable.
+async function roadMatrix(points){
+  if(!hasMapbox() || points.length<2 || points.length>MAPBOX_MAX_COORDS) return null;
+  try{
+    const url=`https://api.mapbox.com/directions-matrix/v1/mapbox/driving/${points.map(lngLat).join(';')}`
+      +`?annotations=distance&access_token=${MAPBOX_TOKEN}`;
+    const r=await fetch(url); if(!r.ok) return null;
+    const j=await r.json();
+    if(!j || !Array.isArray(j.distances)) return null;
+    return j.distances.map(row=>row.map(m=>m==null?null:m/1000));   // metres -> km
+  }catch(e){ console.warn('road matrix unavailable, using straight lines', e); return null; }
+}
+// The driven road shape through the given points, as [lat,lng] pairs for the map.
+// Splits long runs into legs because Mapbox caps each request at 25 points.
+async function roadLine(points){
+  if(!hasMapbox() || points.length<2) return null;
+  const legs=[];
+  for(let i=0;i<points.length-1;i+=MAPBOX_MAX_COORDS-1)
+    legs.push(points.slice(i, i+MAPBOX_MAX_COORDS));
+  try{
+    const shapes=await Promise.all(legs.map(async leg=>{
+      if(leg.length<2) return [];
+      const url=`https://api.mapbox.com/directions/v5/mapbox/driving/${leg.map(lngLat).join(';')}`
+        +`?geometries=geojson&overview=full&access_token=${MAPBOX_TOKEN}`;
+      const r=await fetch(url); if(!r.ok) throw new Error('directions '+r.status);
+      const j=await r.json();
+      const co=j && j.routes && j.routes[0] && j.routes[0].geometry && j.routes[0].geometry.coordinates;
+      if(!co) throw new Error('no geometry');
+      return co.map(([lng,lat])=>[lat,lng]);
+    }));
+    return shapes.flat();
+  }catch(e){ console.warn('road shape unavailable, drawing straight lines', e); return null; }
+}
+// Turn a matrix into the distance function the optimiser expects.
+// Points carry a _i index so lookups are exact.
+function matrixDistance(matrix){
+  return (a,b)=>{
+    const d = (a._i!=null && b._i!=null && matrix[a._i] && matrix[a._i][b._i]!=null)
+      ? matrix[a._i][b._i] : null;
+    return d==null ? haversineKm(a,b) : d;     // any gap falls back to straight line
+  };
+}
+
+/* ---- PURE route optimiser (unit-tested). Straight-line by default. ---- */
 function haversineKm(a,b){
   const R=6371, rad=x=>x*Math.PI/180;
   const dLat=rad(b.lat-a.lat), dLng=rad(b.lng-a.lng);
   const s=Math.sin(dLat/2)**2 + Math.cos(rad(a.lat))*Math.cos(rad(b.lat))*Math.sin(dLng/2)**2;
   return 2*R*Math.asin(Math.sqrt(s));
 }
-function routeLengthKm(points){ let t=0; for(let i=0;i<points.length-1;i++) t+=haversineKm(points[i],points[i+1]); return t; }
+// dist defaults to straight-line; pass a road-distance function to use real driving distances
+function routeLengthKm(points, dist=haversineKm){ let t=0; for(let i=0;i<points.length-1;i++) t+=dist(points[i],points[i+1]); return t; }
 // nearest-neighbour, then 2-opt clean-up. Round starts and ends at `depot`.
-function optimiseStops(stops, depot){
+function optimiseStops(stops, depot, dist=haversineKm){
   if (stops.length<2) return stops.slice();
   const remaining=stops.slice(), order=[]; let cur=depot;
   while(remaining.length){
     let bi=0,bd=Infinity;
-    remaining.forEach((s,i)=>{ const d=haversineKm(cur,s); if(d<bd){bd=d;bi=i;} });
+    remaining.forEach((s,i)=>{ const d=dist(cur,s); if(d<bd){bd=d;bi=i;} });
     cur=remaining[bi]; order.push(cur); remaining.splice(bi,1);
   }
   let improved=true, guard=0;
@@ -435,16 +492,16 @@ function optimiseStops(stops, depot){
     improved=false;
     for(let i=0;i<order.length-1;i++){
       for(let k=i+1;k<order.length;k++){
-        const cur=routeLengthKm([depot,...order,depot]);
+        const cur=routeLengthKm([depot,...order,depot],dist);
         const cand=[...order.slice(0,i),...order.slice(i,k+1).reverse(),...order.slice(k+1)];
-        if(routeLengthKm([depot,...cand,depot]) < cur-1e-9){ order.splice(0,order.length,...cand); improved=true; }
+        if(routeLengthKm([depot,...cand,depot],dist) < cur-1e-9){ order.splice(0,order.length,...cand); improved=true; }
       }
     }
   }
   return order;
 }
 // reorder one driver's PENDING stops; already-done stops keep their place at the front
-function optimiseDriver(jobs, driverId, day){
+function optimiseDriver(jobs, driverId, day, dist=haversineKm){
   const mine = jobs.filter(j=>onRun(j,driverId,day)).sort((a,b)=>a.seq-b.seq);
   const doneJobs = mine.filter(j=>j.status!=='pending');
   const pending  = mine.filter(j=>j.status==='pending');
@@ -453,17 +510,17 @@ function optimiseDriver(jobs, driverId, day){
   if (stops.length<2) return jobs;
   const lastDone = doneJobs.length ? custById(doneJobs[doneJobs.length-1].customerId) : null;
   const start = (lastDone&&lastDone.lat!=null) ? {lat:lastDone.lat,lng:lastDone.lng} : SHOP;
-  const rank={}; optimiseStops(stops,start).forEach((s,i)=>rank[s.id]=i+1);
+  const rank={}; optimiseStops(stops,start,dist).forEach((s,i)=>rank[s.id]=i+1);
   const newPending=[...pending].sort((a,b)=>(rank[a.id]||99)-(rank[b.id]||99));
   return [...jobs.filter(j=>!onRun(j,driverId,day)),
           ...[...doneJobs,...newPending].map((j,i)=>({...j,seq:i+1}))];
 }
-function totalMiles(jobs, driverIds, day){
+function totalMiles(jobs, driverIds, day, dist=haversineKm){
   let km=0;
   driverIds.forEach(did=>{
     const pts=jobs.filter(j=>onRun(j,did,day)).sort((a,b)=>a.seq-b.seq)
       .map(j=>custById(j.customerId)).filter(c=>c&&c.lat!=null);
-    if(pts.length) km+=routeLengthKm([SHOP,...pts,SHOP]);
+    if(pts.length) km+=routeLengthKm([SHOP,...pts,SHOP],dist);
   });
   return km*0.621371;
 }
@@ -2271,7 +2328,19 @@ function RouteMap({ jobs, drivers, filterDriver, customers, height='340px' }) {
         pts.push([c.lat,c.lng]); bounds.push([c.lat,c.lng]);
       });
       pts.push([SHOP.lat,SHOP.lng]);
-      if (pts.length>2) L.polyline(pts,{ color: di===0?'#2b93ac':'#7c3aed', weight:3, opacity:.55, dashArray:'6,7' }).addTo(group);
+      if (pts.length>2){
+        const colour = di===0?'#2b93ac':'#7c3aed';
+        // straight lines first so the map is never empty, then swap in the real
+        // roads once Mapbox answers (if it's configured and reachable)
+        const guess = L.polyline(pts,{ color:colour, weight:3, opacity:.35, dashArray:'6,7' }).addTo(group);
+        if (hasMapbox()){
+          roadLine(pts.map(([lat,lng])=>({lat,lng}))).then(shape=>{
+            if(!shape || !shape.length || !layerRef.current) return;
+            if(group.hasLayer(guess)) group.removeLayer(guess);
+            L.polyline(shape,{ color:colour, weight:4, opacity:.75 }).addTo(group);
+          }).catch(()=>{});
+        }
+      }
     });
     if (bounds.length>1) map.fitBounds(bounds,{ padding:[35,35] });
   },[jobs,drivers,filterDriver,customers]);
@@ -2300,11 +2369,49 @@ function Logistics({ jobs, setJobs, drivers, onNew, deleteJob, customers, user }
     const m={}; jobs.forEach(j=>{ if(j.status!=='pending') return; const d=j.runDate||TODAY; if(d!==day) m[d]=(m[d]||0)+1; });
     return Object.entries(m).sort((a,b)=>a[0].localeCompare(b[0])).slice(0,6);
   },[jobs,day]);
-  const optimise = () => {
-    const before = totalMiles(jobs,targets,day);
-    let next = jobs; targets.forEach(did=>{ next = optimiseDriver(next,did,day); });
-    const after = totalMiles(next,targets,day);
-    setJobs(next); setSaving({before,after});
+  const [optimising,setOptimising]=useState(false);
+  // Ask Mapbox for real driving distances between the shop and every stop, then
+  // order the run on those. Falls back to straight lines if it can't — an
+  // imperfect order beats a driver waiting on a spinner.
+  const optimise = async () => {
+    if(optimising) return;
+    setOptimising(true); setSaving(null);
+    try{
+      let next = jobs, usedRoads = false, tooMany = false, beforeKm = 0, afterKm = 0;
+      for(const did of targets){
+        // this driver's outstanding stops, in their current order
+        const stopsOf = (arr) => arr.filter(j=>onRun(j,did,day) && j.status==='pending')
+          .sort((a,b)=>a.seq-b.seq)
+          .map(j=>{ const c=custById(j.customerId); return (c&&c.lat!=null)?{lat:c.lat,lng:c.lng,id:j.id}:null; })
+          .filter(Boolean);
+        const beforeStops = stopsOf(jobs);
+        let dist = haversineKm, depot = {lat:SHOP.lat,lng:SHOP.lng};
+
+        if(hasMapbox() && beforeStops.length>1){
+          if(beforeStops.length+1 > MAPBOX_MAX_COORDS){ tooMany = true; }
+          else {
+            const m = await roadMatrix([depot,...beforeStops]);
+            if(m){
+              // index each point so the matrix can be looked up exactly
+              depot={...depot,_i:0};
+              const byId={}; beforeStops.forEach((p,i)=>{ byId[p.id]=i+1; });
+              dist = matrixDistance(m);
+              const tag = p => ({...p, _i: p===depot ? 0 : byId[p.id]});
+              beforeKm += routeLengthKm([depot,...beforeStops.map(tag),depot], dist);
+              next = optimiseDriver(next, did, day, (a,b)=>dist(tag(a),tag(b)));
+              afterKm += routeLengthKm([depot,...stopsOf(next).map(tag),depot], dist);
+              usedRoads = true;
+              continue;
+            }
+          }
+        }
+        beforeKm += routeLengthKm([depot,...beforeStops,depot], haversineKm);
+        next = optimiseDriver(next, did, day, haversineKm);
+        afterKm += routeLengthKm([depot,...stopsOf(next),depot], haversineKm);
+      }
+      setJobs(next);
+      setSaving({ before: beforeKm*0.621371, after: afterKm*0.621371, roads: usedRoads, tooMany });
+    } finally { setOptimising(false); }
   };
   const move=(driverId,jobId,dir)=>setJobs(prev=>moveJob(prev,driverId,jobId,dir,day));
   const reassign=(jobId,toDriverId)=>setJobs(prev=>moveJobTo(prev,jobId,toDriverId,null,day));
@@ -2424,21 +2531,31 @@ function Logistics({ jobs, setJobs, drivers, onNew, deleteJob, customers, user }
                 <button key={k} onClick={()=>{setMapDriver(k);setSaving(null);}}
                   className={`px-2.5 py-1 rounded-lg text-xs font-semibold ${mapDriver===k?'bg-teal text-white':'text-slate2'}`}>{l}</button>))}
             </div>
-            <Btn kind="primary" icon="pin" onClick={optimise} className="!py-1.5 !px-3 text-xs">Suggest best order</Btn>
+            <Btn kind="primary" icon="pin" onClick={optimise} className="!py-1.5 !px-3 text-xs" {...(optimising?{disabled:true}:{})}>
+              {optimising?'Working out the route…':'Suggest best order'}</Btn>
           </div>
         </div>
         <RouteMap jobs={dayJobs} drivers={driverStaff} filterDriver={mapDriver} customers={customers}/>
         <div className="flex items-center justify-between gap-3 flex-wrap mt-2">
           <p className="text-[11px] text-slate2 flex-1 min-w-[220px]">
             <span className="text-rose-500 font-semibold">Pink = collection</span>, <span className="text-teal-dark font-semibold">blue = delivery</span>,
-            grey = already done. Each pin shows the driver’s initials and driving order (e.g. SO | 1); the house marker is the shop (start &amp; end). Tap a pin for details.</p>
-          <span className="text-xs font-bold text-ink whitespace-nowrap">Round: ~{roundMiles.toFixed(1)} miles</span>
+            grey = already done. Each pin shows the driver’s initials and driving order (e.g. SO | 1); the house marker is the shop (start &amp; end). Tap a pin for details. The line follows the actual roads once a Mapbox key is set.</p>
+          <span className="text-xs font-bold text-ink whitespace-nowrap" title={hasMapbox()?'Straight-line estimate; tap Suggest best order for real driving miles':'Straight-line estimate'}>Round: ~{roundMiles.toFixed(1)} miles</span>
         </div>
         {noLoc>0 && <div className="text-xs text-amber-600 mt-1 inline-flex items-center gap-1"><Ic name="info" size={13}/>{noLoc} stop{noLoc>1?'s':''} not on the map yet — finding location from the address…</div>}
-        {saving && <div className={`text-xs rounded-lg px-2.5 py-1.5 mt-2 inline-flex items-center gap-1.5 ${saving.after < saving.before-0.05 ? 'bg-emerald-50 text-emerald-700':'bg-gray-50 text-slate2'}`}>
-          <Ic name="check" size={14}/>{saving.after < saving.before-0.05
-            ? `Reordered — about ${(saving.before-saving.after).toFixed(1)} miles shorter (${saving.before.toFixed(1)} → ${saving.after.toFixed(1)} miles).`
-            : `Already in a good order — no shorter route found (${saving.before.toFixed(1)} miles).`}</div>}
+        {saving && <div className="mt-2 space-y-1">
+          <div className={`text-xs rounded-lg px-2.5 py-1.5 inline-flex items-center gap-1.5 ${saving.after < saving.before-0.05 ? 'bg-emerald-50 text-emerald-700':'bg-gray-50 text-slate2'}`}>
+            <Ic name="check" size={14}/>{saving.after < saving.before-0.05
+              ? `Reordered — about ${(saving.before-saving.after).toFixed(1)} miles shorter (${saving.before.toFixed(1)} → ${saving.after.toFixed(1)} miles).`
+              : `Already in a good order — no shorter route found (${saving.before.toFixed(1)} miles).`}</div>
+          <div className="text-[11px] text-slate2 inline-flex items-center gap-1">
+            <Ic name="info" size={12}/>
+            {saving.roads ? 'Ordered by real driving distance.'
+              : saving.tooMany ? `More than ${MAPBOX_MAX_COORDS-1} stops on one run — ordered in straight lines instead.`
+              : hasMapbox() ? 'Road distances unavailable just now — ordered in straight lines.'
+              : 'Ordered in straight lines. Add a Mapbox key to use real driving distances.'}
+          </div>
+        </div>}
       </div>
       <div className="bg-white card rounded-2xl p-3 mb-4">
         <div className="flex items-center justify-between gap-2 flex-wrap">
