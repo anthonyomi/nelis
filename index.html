@@ -91,6 +91,7 @@ const ICONS = {
   info:<g><circle cx="12" cy="12" r="9"/><path d="M12 11v5M12 8v.2"/></g>,
   phone:<path d="M6.5 3h3l1.5 4-2 1.3a12 12 0 0 0 5.7 5.7l1.3-2 4 1.5v3a2 2 0 0 1-2.2 2A17 17 0 0 1 4.5 5.2 2 2 0 0 1 6.5 3z"/>,
   trash:<g><path d="M4 7h16M9 7V5a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/><path d="M6 7l1 13a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1l1-13"/><path d="M10 11v6M14 11v6"/></g>,
+  help:<g><circle cx="12" cy="12" r="9"/><path d="M9.6 9.3a2.5 2.5 0 1 1 3.4 2.3c-.6.3-1 .9-1 1.6v.3"/><path d="M12 17v.2"/></g>,
 };
 function Ic({ name, size=18, className='', stroke=1.9 }) {
   const grip = name==='grip';
@@ -139,6 +140,16 @@ const PACKAGING = ['Hanging only', 'Box and hanging', 'Box only'];
 const PACKAGING_ALIAS = { 'Hanging':'Hanging only', 'Hanging in box':'Box and hanging' };
 const packLabel = p => PACKAGING_ALIAS[p] || p || '—';
 // short forms for tight spaces, in loading order
+// PURE — "3 · 1.4kg + 4kg + 2kg = 7.4kg". Every figure carries its unit, so the
+// weights can't be misread as a sum of bare numbers. One bag needs no total.
+function bagsSummary(order){
+  const n = (order && order.bagsCount) || 0;
+  const w = ((order && order.bagWeights) || []).filter(x=>x!=null && x!=='');
+  if(!n) return '—';
+  if(!w.length) return `${n} · weight not recorded`;
+  const each = w.map(x=>`${x}kg`).join(' + ');
+  return w.length===1 ? `${n} · ${each}` : `${n} · ${each} = ${order.weight}kg`;
+}
 const PACK_SHORT = { 'Hanging only':'Hang', 'Box and hanging':'Hang + box', 'Box only':'Box' };
 const packShort = p => PACK_SHORT[packLabel(p)] || packLabel(p);
 const EXTRA_TYPES = ['Dry cleaning', 'Bedding / duvet', 'Repairs & alterations'];
@@ -957,6 +968,7 @@ function DriverApp({ driver, go, jobs, setJobs, orders, customers, rates, addAud
   const [openId,setOpenId]=useState(null);
   const [day,setDay]=useState(TODAY);
   const [showMap,setShowMap]=useState(false);
+  const [showHelp,setShowHelp]=useState(false);
   const myJobs = jobs.filter(j=>j.driverId===driver.id && (j.runDate||TODAY)===day).sort((a,b)=>a.seq-b.seq);
   const myPending = myJobs.filter(j=>j.status==='pending');   // only these can be shuffled
   const nextPendingId = (myPending[0]||{}).id;
@@ -1050,7 +1062,10 @@ function DriverApp({ driver, go, jobs, setJobs, orders, customers, rates, addAud
           {PORTALS.filter(p=>hasRole(driver,p.role)).length>1 && <button onClick={()=>go('picker')} title="Back to portals" className="w-8 h-8 rounded-lg border border-gray-200 flex items-center justify-center text-slate2 hover:bg-gray-50"><Ic name="left" size={18}/></button>}
           <Logo h={26} hideTextOnMobile/></div>} right={
         <div className="flex items-center gap-2"><span className="text-sm text-ink font-semibold hidden sm:inline">{driver.name}</span>
+          <button onClick={()=>setShowHelp(true)} title="How to use this"
+            className="w-8 h-8 rounded-lg border border-gray-200 flex items-center justify-center text-slate2 hover:bg-gray-50"><Ic name="help" size={18}/></button>
           <Btn kind="ghost" icon="logout" onClick={()=>go('logout')} className="!py-1.5 !px-3">Log out</Btn></div>} />
+      <HelpOverlay role="driver" open={showHelp} onClose={()=>setShowHelp(false)}/>
       <div className="max-w-2xl mx-auto p-4">
         {!openJob && <>
           <div className="flex items-center justify-between mb-1">
@@ -1226,7 +1241,6 @@ function CollectionForm({ job, order, rates, onBack, onConfirm, onNoAnswer }) {
       <h3 className="text-xl font-bold text-ink mt-3">Collection confirmed</h3>
       <p className="text-slate2 mt-1">{fullName(c)} · {result.charged>0?gbp(result.charged)+(needsPricing?' (provisional)':''):'priced at shop'}</p>
       {needsPricing && <div className="bg-amber-50 text-amber-700 rounded-xl p-3 mt-4 text-sm inline-flex items-center gap-2"><Ic name="alert" size={16}/>{anyShirts?`Shirts will be counted & priced at the shop${extras.length?`, along with ${extras.join(', ').toLowerCase()}`:''}.`:`Extras noted — shop will price ${extras.join(', ').toLowerCase()} and finalise the total.`}</div>}
-      <div className="bg-teal-light text-teal-dark rounded-xl p-3 mt-3 text-sm flex items-center justify-center gap-2"><Ic name="mail" size={16}/>{needsPricing?'Provisional':'Receipt'} email sent to {c.email}</div>
       <div className="mt-6"><Btn icon="right" onClick={()=>onConfirm(job,confirmData)}>Back to run</Btn></div>
     </div>
   );
@@ -1548,7 +1562,7 @@ function OrderModal({ order, rates, onClose, onSave, addAudit, onDelete, onDispa
             <div className="text-sm space-y-1.5">
               <Row k="Services" v={(order.services||[]).join(' + ')||'—'}/>
               {(order.extras||[]).length>0 && <Row k="Extras" v={<span className="text-amber-700">{(order.extras||[]).join(', ')}</span>}/>}
-              <Row k="Bags" v={order.bagsCount>0?`${order.bagsCount} · ${(order.bagWeights||[]).join('+')}kg = ${order.weight}kg`:'—'}/>
+              <Row k="Bags" v={order.bagsCount>0?bagsSummary(order):'—'}/>
               <Row k="Packaging" v={packLabel(order.packaging)}/>
               {assignedDriver && <Row k="Driver" v={<span className="inline-flex items-center gap-1"><Ic name="truck" size={13}/>{assignedDriver.name}</span>}/>}
               <Row k="Collected" v={order.collectedDate?`${fmtDate(order.collectedDate)} · ${order.collectedAt}`:'Not yet collected'}/>
@@ -1637,7 +1651,7 @@ function OrderModal({ order, rates, onClose, onSave, addAudit, onDelete, onDispa
                       <span className="font-bold text-ink">New total</span><span className="text-xl font-extrabold text-teal-dark">{gbp(calc.charged)}</span></div>
                   </div>
                   <Btn kind="primary" icon="check" className="w-full mt-3" onClick={save}>Save &amp; notify customer</Btn>
-                  <p className="text-[11px] text-slate2 text-center mt-1.5">Logged to the audit trail; customer emailed the updated total.</p>
+                  <p className="text-[11px] text-slate2 text-center mt-1.5">Logged to the audit trail.</p>
                 </>}
           </div>
         </div>
@@ -1670,6 +1684,7 @@ function StoreLogin({ go, onLogin }) {
 function StoreApp({ go, orders, rates, updateOrder, addAudit, deleteOrder, jobs, drivers, onDispatch, user }) {
   const [scope,setScope]=useState(TODAY);
   const [sel,setSel]=useState(null);
+  const [showHelp,setShowHelp]=useState(false);
   const list = useMemo(()=>storeList(orders, scope, TODAY), [orders,scope]);
   const lateCount = list.filter(o=>(o.dueDate||'')<TODAY).length;
   const dayCounts = useMemo(()=>{ const m={};
@@ -1682,7 +1697,7 @@ function StoreApp({ go, orders, rates, updateOrder, addAudit, deleteOrder, jobs,
     const rows = list.map(o=>{ const c=custById(o.customerId); const extra = addedStr(o) || ((o.extras||[]).length ? (o.extras||[]).join(', ') : '');
       return `<tr><td><b>${fmtDate(o.dueDate)}</b></td><td>${fullName(c)}<br><span class="a">${c.addr}</span></td>
         <td>${(o.services||[]).join(' + ')}${extra?`<br><span class="r">+ ${extra}</span>`:''}</td>
-        <td>${o.bagsCount} (${(o.bagWeights||[]).join('+')}kg) · ${o.weight}kg${(o.bagServices||[]).length>1?'<br><span class="a">mixed services</span>':''}</td>
+        <td>${bagsSummary(o)}${(o.bagServices||[]).length>1?'<br><span class="a">mixed services</span>':''}</td>
         <td>${gbp(o.amount)}${o.needsPricing?' <span class="r">(prov.)</span>':''}<br><span class="a">${o.paidInAdvance?'PAID':o.paymentMethod}</span></td>
         <td>${packLabel(o.packaging)}</td><td>${o.collectedDate?`${fmtDate(o.collectedDate)} ${o.collectedAt||''}`:'—'}</td><td>${o.status==='Needs pricing'?`<span class="r">${o.status}</span>`:o.status}</td><td>${c&&c.standingNotes?`<b class="v">Always: ${c.standingNotes}</b><br>`:''}${o.notes||''}</td></tr>`; }).join('');
     const html = `<html><head><title>NELIS — ${scope==='week'?'This week':dayLabel(scope)}</title>
@@ -1703,7 +1718,10 @@ function StoreApp({ go, orders, rates, updateOrder, addAudit, deleteOrder, jobs,
           {user && PORTALS.filter(p=>hasRole(user,p.role)).length>1 && <button onClick={()=>go('picker')} title="Back to portals" className="w-8 h-8 rounded-lg border border-gray-200 flex items-center justify-center text-slate2 hover:bg-gray-50"><Ic name="left" size={18}/></button>}
           <Logo h={26} hideTextOnMobile/></div>} right={
         <div className="flex items-center gap-2"><span className="text-sm text-ink font-semibold hidden sm:inline">{user?user.name:'Store team'}</span>
+          <button onClick={()=>setShowHelp(true)} title="How to use this"
+            className="w-8 h-8 rounded-lg border border-gray-200 flex items-center justify-center text-slate2 hover:bg-gray-50"><Ic name="help" size={18}/></button>
           <Btn kind="ghost" icon="logout" onClick={()=>go('logout')} className="!py-1.5 !px-3">Log out</Btn></div>} />
+      <HelpOverlay role="store" open={showHelp} onClose={()=>setShowHelp(false)}/>
       <div className="max-w-5xl mx-auto p-4">
         <div className="flex items-center justify-between mb-1 flex-wrap gap-2">
           <h2 className="text-xl font-extrabold text-ink">Production list</h2>
@@ -1768,6 +1786,228 @@ function AdminLogin({ go, onLogin }) {
     </LoginCard>
   );
 }
+/* =================================================================== */
+/*  HELP — a plain-English guide, written separately for each job.      */
+/*  Kept as plain text below so it can be edited without touching any   */
+/*  layout code. A line starting "- " becomes a bullet point.           */
+/* =================================================================== */
+const HELP = {
+  driver: {
+    title: 'Driver guide',
+    lead: 'Everything you need for a shift. You only ever handle bags and payments — the shop does the pricing.',
+    topics: [
+      { q:'Signing in', a:[
+        'Pick your name from the list, then type your PIN. Nobody can see anyone else’s PIN, including the boss.',
+        'Five wrong tries locks you out for five minutes. Wait it out, or ask Mark to set you a new PIN.',
+        'You stay signed in for 12 hours. Closing the browser tab signs you out straight away.' ]},
+      { q:'Reading your run', a:[
+        'Your stops are listed in driving order and numbered 1, 2, 3 and so on.',
+        '- Pink card = a collection',
+        '- White card = a delivery',
+        '- Greyed out = already done',
+        'The badge at the top right shows how many you’ve finished out of the total.',
+        'The day tabs let you look at another day. What you see is always the day that is selected, so if a stop seems to be missing, check you are on the right day first.' ]},
+      { q:'Doing your stops in a different order', a:[
+        'Use the up and down arrows on a stop to move it. Do this if a customer asks you to come later, or if you know a better run.',
+        'The office sees the change and who made it, so there is no need to ring in about it.' ]},
+      { q:'Taking a collection', a:[
+        'Open the stop and work through the form:',
+        '- Count the bags',
+        '- Weigh each bag and enter its weight',
+        '- Choose what each bag is for — bags can be different from each other',
+        '- Add a note for anything unusual (a stain, a delicate item, a customer asking for something)',
+        'You do not price anything. The app shows a provisional figure from the weights, and the shop confirms the real price once the bags are in.' ]},
+      { q:'Nobody in', a:[
+        'Tap "No answer". The stop is flagged rather than deleted, and the office can see it needs rearranging.',
+        'The customer’s phone number is on the card — tap it to call before you give up on the stop.' ]},
+      { q:'Making a delivery', a:[
+        'The card tells you how the order is packed — hanging, boxed, or both — and what is owed.',
+        'If it says "Paid", the customer has already paid and you take nothing.',
+        'Otherwise take the payment shown, then confirm the drop-off. The order is marked delivered and the office sees it immediately.' ]},
+      { q:'A day you didn’t finish', a:[
+        'If work was left over from an earlier day, a red banner appears at the top of your run.',
+        'Tap the day in the banner to go to it, then finish those stops, or tell the office so they can move them.',
+        'The banner stays until nothing is outstanding, so it can’t be quietly forgotten.' ]},
+      { q:'The map', a:[
+        'Tap "Your stops on the map" to see the round.',
+        '- Pink pin = collection',
+        '- Blue pin = delivery',
+        '- Grey pin = done',
+        '- The house is the shop' ]},
+      { q:'I tapped the wrong thing', a:[
+        'Open the stop again and put it right. Everything you do is recorded with your name and the time, so it is always clear what happened.',
+        'If you can’t undo it, tell the office rather than working around it.' ]},
+    ],
+  },
+  store: {
+    title: 'Shop guide',
+    lead: 'The production list is what’s in the shop and when it has to go back out.',
+    topics: [
+      { q:'The production list', a:[
+        'Everything currently in the shop, grouped by the day it is due back to the customer.',
+        'Use the day tabs to look ahead. Anything overdue is called out at the top.' ]},
+      { q:'Pricing an order', a:[
+        'Orders marked "Needs pricing" have a provisional price worked out from the driver’s weights.',
+        'Open the order, check the bags and services against what actually came in, adjust anything that is wrong, and save.',
+        'The old and new price are both recorded, so there is a trail if a customer queries it.' ]},
+      { q:'Adding extras', a:[
+        'Dry cleaning and single items are added on the order itself, on top of the weight price.',
+        'If something isn’t on the list, ask Mark to add it under Pricing rather than fudging the total — that way it is priced the same next time.' ]},
+      { q:'Moving an order along', a:[
+        'An order goes Collected → In Shop → Ready. Move it on as the work is done.',
+        'Marking it Ready is what makes it available to send out.' ]},
+      { q:'Sending an order out', a:[
+        'On a Ready order, use "Send out for delivery". Choose the driver and the day it should go.',
+        'It then appears on that driver’s run for that day, with the price, the packaging and how the customer is paying.',
+        'Pick the day you actually want it delivered. That is the day it will appear on the driver’s list.' ]},
+      { q:'Printing the list', a:[
+        'The Print button opens a clean landscape sheet of the current list — customer, services, bags, weight, price, packaging and notes.',
+        'If nothing happens, your browser is blocking pop-ups; allow them for this site.' ]},
+    ],
+  },
+  admin: {
+    title: 'Admin guide',
+    lead: 'Booking work in, planning the runs, and everything behind the scenes.',
+    topics: [
+      { q:'Booking a job', a:[
+        '"New job" is at the top of every screen. Choose Collection or Delivery, then the customer — or add a new one there and then.',
+        'Pick the day the driver should go, the driver, and the time window. The default is the evening run from 5pm, which is the usual round.',
+        'For a collection you also set the day the work is due back to the customer.' ]},
+      { q:'The Orders tab', a:[
+        'Every order, grouped by when it is due — due today, tomorrow, later, and anything overdue.',
+        'Tap a heading to fold that group away when the list gets long.',
+        'Open an order to see its whole history, change the price, change the deliver-by date, send it out, or cancel it.' ]},
+      { q:'What the statuses mean', a:[
+        '- Pending Collection — booked, the driver hasn’t been yet',
+        '- Collected — the driver has the bags',
+        '- Needs pricing — waiting for the shop to confirm the price',
+        '- In Shop — being worked on',
+        '- Ready — finished and ready to go out',
+        '- Out for delivery — on a driver’s run',
+        '- Delivered — done',
+        '- No answer — the driver couldn’t get an answer; needs rearranging' ]},
+      { q:'Planning the day (Logistics)', a:[
+        'Each driver’s run for the day you have selected, in the order they will drive it.',
+        '- Drag a stop by the dotted handle, or use the arrows, to change the order',
+        '- Drag a stop onto another driver to hand it over, or use the "Move to" dropdown',
+        '- Tap a driver’s name to fold their run away when you are looking at someone else’s',
+        'If a driver has reordered their own run, a note appears saying who changed it and when.' ]},
+      { q:'Setting the packaging while you load the van', a:[
+        'Every delivery on the Logistics list has three buttons: Hang, Hang + box, Box. Tap one to set it.',
+        'This is the same setting as on the order, so the driver sees it change straight away. It is here so you can set it as you load rather than writing it down.' ]},
+      { q:'Suggest best order', a:[
+        'This reorders a driver’s stops to cut the driving.',
+        'It uses real driving distances, so it takes account of the reservoirs, the North Circular and the one-way systems rather than measuring in straight lines.',
+        'If it says "ordered in straight lines", the road data was unavailable at that moment — the suggestion still works, it is just rougher. More than 24 stops on one run also falls back to straight lines.',
+        'It is a suggestion. If you know better, drag the stops where you want them.' ]},
+      { q:'Work that wasn’t completed', a:[
+        'A red banner appears when stops are still outstanding on a day that has passed.',
+        'Tap the day to go to it, then finish each stop, move it to another day, or cancel it. It will not clear itself.' ]},
+      { q:'Customers', a:[
+        'Add, edit and search customers here. The address is checked against the postcode so the map and the route ordering work.',
+        'A standing note is something that is always true for that customer — "ring the bell twice", "leave in the porch". It shows to the driver on every job, every time.' ]},
+      { q:'Pricing', a:[
+        'The weight bands and item prices the whole app uses. Change one here and it applies to everything priced afterwards.',
+        'Also the minimum order and the first-order discount.',
+        'Bags on one collection can each have a different service, and each is priced on its own.' ]},
+      { q:'Staff', a:[
+        'Add and remove people, and set what each can reach: driver, shop, admin — or more than one.',
+        '"Can delete" lets someone cancel jobs and orders. Leave it off for most people.',
+        'The arrows set the order staff appear in. Whoever is at the top is the driver offered first when booking a job.',
+        'You can set someone a new PIN here, but you cannot see their current one. Nobody can.' ]},
+      { q:'Overview and the audit trail', a:[
+        'The Overview is the day at a glance, plus a running list of everything that has happened and who did it.',
+        'If something looks wrong, this is the first place to look — it will tell you who changed what.' ]},
+    ],
+  },
+  everyone: {
+    title: 'Common questions',
+    lead: '',
+    topics: [
+      { q:'Someone changed something and I still can’t see it', a:[
+        'Reload the page. The app doesn’t update itself while you are looking at it yet, so two people on two devices can be a few minutes apart.',
+        'This is worth knowing when the shop and a driver are working on the same order at the same time.' ]},
+      { q:'It signed me out', a:[
+        'Sign-ins last 12 hours, and closing the tab ends it sooner. Just sign in again.',
+        'If drivers are being asked for a PIN part-way through a shift, say so and it can be made longer.' ]},
+      { q:'My PIN won’t work', a:[
+        'Five wrong tries locks the account for five minutes — that is deliberate, to stop anyone guessing their way in.',
+        'If you have genuinely forgotten it, Mark can set you a new one under Staff.' ]},
+      { q:'Did that save?', a:[
+        'If a save fails, a red message appears at the top of the screen. No message means it saved.',
+        'If you do see one, screenshot it and send it on — it says what went wrong.' ]},
+      { q:'Who can see the customer details?', a:[
+        'Only people who have signed in. Without a sign-in the app holds nothing readable, even to somebody who goes looking.',
+        'Treat your PIN like a key to the filing cabinet, because that is what it is.' ]},
+    ],
+  },
+};
+
+function HelpBody({ lines }) {
+  const out=[]; let bullets=[];
+  const flush=()=>{ if(bullets.length){ out.push(
+    <ul key={'u'+out.length} className="list-disc pl-5 space-y-1 text-sm text-slate2 mb-2">
+      {bullets.map((b,i)=><li key={i}>{b}</li>)}</ul>); bullets=[]; } };
+  lines.forEach((l,i)=>{ if(l.indexOf('- ')===0) bullets.push(l.slice(2));
+    else { flush(); out.push(<p key={'p'+i} className="text-sm text-slate2 mb-2 leading-relaxed">{l}</p>); } });
+  flush(); return <>{out}</>;
+}
+
+// role: 'driver' | 'store' | 'admin' — decides which guide is shown.
+function Help({ role }) {
+  const [q,setQ]=useState('');
+  const [open,setOpen]=useState(()=>new Set());
+  const toggle=id=>setOpen(prev=>{ const n=new Set(prev); n.has(id)?n.delete(id):n.add(id); return n; });
+  const groups=[HELP[role], HELP.everyone].filter(Boolean);
+  const term=q.trim().toLowerCase();
+  const matches=t=>!term || (t.q+' '+t.a.join(' ')).toLowerCase().indexOf(term)>=0;
+  const found=groups.map(g=>({...g, topics:g.topics.filter(matches)})).filter(g=>g.topics.length);
+  return (
+    <div>
+      <div className="bg-white card rounded-2xl p-4 mb-3">
+        <h2 className="text-xl font-extrabold text-ink">{(HELP[role]||{}).title||'Guide'}</h2>
+        {(HELP[role]||{}).lead && <p className="text-sm text-slate2 mt-1">{HELP[role].lead}</p>}
+        <div className="relative mt-3">
+          <span className="absolute left-3 top-1/2 -translate-y-1/2 text-slate2"><Ic name="search" size={16}/></span>
+          <input value={q} onChange={e=>setQ(e.target.value)} placeholder="Search the guide — try 'payment' or 'PIN'"
+            className="w-full border border-gray-200 rounded-xl pl-9 pr-3 py-2 text-sm focus:outline-none focus:border-teal"/>
+        </div>
+      </div>
+      {found.length===0 && <p className="text-sm text-slate2 border-2 border-dashed border-gray-200 rounded-xl p-4 text-center">
+        Nothing matches “{q}”. Try a different word — or ask, and it can be added here.</p>}
+      {found.map(g=>(
+        <div key={g.title} className="mb-4">
+          <h3 className="text-sm font-extrabold text-ink uppercase tracking-wide mb-2">{g.title}</h3>
+          <div className="space-y-2">
+            {g.topics.map(t=>{ const id=g.title+'|'+t.q; const isOpen=term?true:open.has(id);
+              return (
+                <div key={id} className="bg-white card rounded-2xl overflow-hidden">
+                  <button onClick={()=>toggle(id)} className="w-full flex items-center justify-between gap-3 px-4 py-3 text-left">
+                    <span className="text-sm font-bold text-ink">{t.q}</span>
+                    <Ic name={isOpen?'up':'down'} size={16} className="text-slate2"/>
+                  </button>
+                  {isOpen && <div className="px-4 pb-3 -mt-1"><HelpBody lines={t.a}/></div>}
+                </div>); })}
+          </div>
+        </div>))}
+    </div>
+  );
+}
+
+// Drivers and shop staff have no tab bar, so the guide opens over the page.
+function HelpOverlay({ role, open, onClose }) {
+  if(!open) return null;
+  return (
+    <div className="fixed inset-0 z-50 overflow-y-auto" style={{background:'#f4f6f8'}}>
+      <div className="sticky top-0 bg-white border-b border-gray-100 px-4 py-3 flex items-center justify-between">
+        <span className="inline-flex items-center gap-2 font-extrabold text-ink"><Ic name="help" size={18}/>How to use this</span>
+        <Btn kind="ghost" icon="close" onClick={onClose} className="!py-1.5 !px-3">Close</Btn>
+      </div>
+      <div className="max-w-2xl mx-auto p-4"><Help role={role}/></div>
+    </div>
+  );
+}
+
 function AdminApp({ go, jobs, setJobs, rates, setRates, audit, drivers, setDrivers, deleteDriver, orders, addJob, updateOrder, addAudit, deleteJob, deleteOrder, dispatchDelivery, customers, addCustomer, updateCustomer, deleteCustomer, user }) {
   const [tab,setTab]=useState('overview');
   const [intake,setIntake]=useState(false);
@@ -1779,7 +2019,7 @@ function AdminApp({ go, jobs, setJobs, rates, setRates, audit, drivers, setDrive
     else if (which==='pricing') { setOrdersFilter('needsPricing'); setTab('orders'); }
   };
   const tabs=[['overview','chart','Overview'],['customers','users','Customers'],['orders','layers','Orders'],
-    ['pricing','tag','Pricing'],['staff','user','Staff'],['logistics','pin','Logistics']];
+    ['pricing','tag','Pricing'],['staff','user','Staff'],['logistics','pin','Logistics'],['help','help','Help']];
   return (
     <div className="min-h-screen">
       <TopBar left={
@@ -1801,6 +2041,7 @@ function AdminApp({ go, jobs, setJobs, rates, setRates, audit, drivers, setDrive
         {tab==='pricing'   && <Pricing rates={rates} setRates={setRates} canDelete={mayDelete(user)}/>}
         {tab==='staff'     && <StaffAdmin drivers={drivers} setDrivers={setDrivers} deleteDriver={deleteDriver} user={user}/>}
         {tab==='logistics' && <Logistics jobs={jobs} setJobs={setJobs} drivers={drivers} onNew={()=>setIntake(true)} deleteJob={deleteJob} customers={customers} user={user} updateOrder={updateOrder}/>}
+        {tab==='help'      && <Help role="admin"/>}
       </div>
       {intake && <IntakeModal drivers={drivers} onClose={()=>setIntake(false)} onCreate={addJob} customers={customers} addCustomer={addCustomer}/>}
     </div>
@@ -1921,16 +2162,19 @@ function Stat({ label, value, onClick }) {
     : <div className="bg-white card rounded-2xl p-4">{inner}</div>;
 }
 function Overview({ jobs, orders, audit, onNew, goStat }) {
-  const done = jobs.filter(j=>j.status==='done');
+  // These say "today", so they must MEAN today. They used to count every stop
+  // ever loaded, which is why the figure ran into the hundreds.
+  const todays = (jobs||[]).filter(j=>(j.runDate||TODAY)===TODAY);
+  const done = todays.filter(j=>j.status==='done');
   const revenue = done.reduce((s,j)=>s+(j.amount||0),0);
-  const cols = jobs.filter(j=>j.type==='collection').length;
+  const cols = todays.filter(j=>j.type==='collection').length;
   const needp = orders.filter(o=>o.needsPricing).length;
   return (
     <div>
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-4">
         <Stat label="Customers" value={CUSTOMERS.length} onClick={()=>goStat('customers')}/>
-        <Stat label="Jobs today" value={jobs.length} onClick={()=>goStat('jobs')}/>
-        <Stat label="Collections / deliveries" value={`${cols} / ${jobs.length-cols}`} onClick={()=>goStat('jobs')}/>
+        <Stat label="Jobs today" value={todays.length} onClick={()=>goStat('jobs')}/>
+        <Stat label="Collections / deliveries" value={`${cols} / ${todays.length-cols}`} onClick={()=>goStat('jobs')}/>
         <Stat label="Awaiting shop pricing" value={needp} onClick={()=>goStat('pricing')}/>
       </div>
       <div className="bg-white card rounded-2xl p-4">
