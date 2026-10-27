@@ -262,6 +262,8 @@ const fullName = c => c ? `${c.title} ${c.first} ${c.last}` : '—';
 const now = () => new Date().toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit'});
 const mapsUrl = addr => `https://www.google.com/maps/dir/?api=1&destination=${encodeURIComponent(addr)}`;
 const sum = a => a.reduce((s,x)=>s+(parseFloat(x)||0),0);
+// for anything typed by staff that ends up inside printed HTML
+const esc = v => String(v==null?'':v).replace(/[&<>"']/g, ch=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
 
 // PURE pricing engine (unit-tested)
 // PURE — price a collection where EACH BAG can be a different service
@@ -377,7 +379,8 @@ function loadingGroups(jobs, driverId, day) {
   mine.forEach(j=>{
     const label=packLabel(j.packaging);
     const g=groups.find(x=>x.packaging===label) || other;
-    g.stops.push({ seq:j.seq, name:fullName(custById(j.customerId)), bags:j.bags||0 });
+    const c=custById(j.customerId);
+    g.stops.push({ seq:j.seq, name:fullName(c), addr:c.addr||'', bags:j.bags||0 });
     g.bags += j.bags||0;
   });
   const all=[...groups, other].filter(g=>g.stops.length);
@@ -547,9 +550,88 @@ const SUPABASE_KEY = 'sb_publishable_zgc-wGOojSP-KGEr6eLs-g_oL2y8Gne';
 // The client is rebuilt after sign-in so that every request carries the staff
 // session token. The database uses that token to decide what it will hand back,
 // which is why the publishable key on its own is not enough to read anything.
+// ---- saves that survive a bad signal ---------------------------------
+// Mark's office is at the back of the shop, where the WiFi drops out. A save
+// sent at that moment used to fail ONCE and be forgotten: on 26 Oct an order's
+// new return date saved, but the driver's stop and the audit entry didn't, and
+// nothing ever tried again — so the driver kept the old date.
+// Every change now retries by itself (about 10 seconds in all). Anything that
+// still can't get through is held, shown in a red banner with "Try again", and
+// re-sent automatically when the connection comes back.
+const FAILED_WRITES = [];            // [{ key, url, init }] — oldest first
+let onFailedWrites = null;           // the App registers this to redraw the banner
+let WRITES_IN_FLIGHT = 0;
+const sleep = ms => new Promise(r=>setTimeout(r,ms));
+const methodOf = init => ((init&&init.method)||'GET').toUpperCase();
+// Sign-in checks (/rpc/) are never retried: re-sending a wrong PIN would count twice towards the lock-out.
+const isRetryableWrite = (url, init) => !['GET','HEAD','OPTIONS'].includes(methodOf(init)) && !String(url).includes('/rpc/');
+// Which record a write is about, so an older failed save can never overwrite a newer one that worked.
+function writeKey(url, init){
+  const u = String(url).split('?'), path = u[0];
+  try { const b = JSON.parse(init.body); const ids = (Array.isArray(b)?b:[b]).map(r=>r&&r.id).filter(Boolean);
+        if (ids.length) return methodOf(init)+' '+path+' '+ids.join(','); } catch(e){}
+  return methodOf(init)+' '+String(url);
+}
+async function sendWithRetry(url, init){
+  const waits = [0, 1000, 3000, 6000];
+  let last;
+  for (let i=0; i<waits.length; i++){
+    if (waits[i]) await sleep(waits[i]);
+    try {
+      const res = await fetch(url, init);
+      // An insert that actually landed before the connection dropped comes back
+      // as "already exists" when it's re-sent. That means it worked.
+      if (i>0 && res.status===409) return new Response(null, { status:201 });
+      if (res.status>=500 || res.status===429){ last = res; continue; }   // server hiccup — try again
+      return res;
+    } catch(e){ last = e; }                                                // no connection — try again
+  }
+  if (last instanceof Response) return last;
+  throw last;
+}
+const notifyFailed = () => { if (onFailedWrites) onFailedWrites(FAILED_WRITES.length); };
+const forgetFailed = key => { const i = FAILED_WRITES.findIndex(w=>w.key===key); if (i>=0){ FAILED_WRITES.splice(i,1); notifyFailed(); } };
+async function resilientFetch(url, init){
+  if (!isRetryableWrite(url, init)) return fetch(url, init);
+  const key = writeKey(url, init);
+  WRITES_IN_FLIGHT++;
+  try {
+    const res = await sendWithRetry(url, init);
+    if (res.ok) forgetFailed(key);                // a newer save of the same record supersedes the failed one
+    return res;
+  } catch(e){
+    forgetFailed(key);
+    FAILED_WRITES.push({ key, url, init, at:Date.now() });
+    notifyFailed();
+    throw e;
+  } finally { WRITES_IN_FLIGHT--; }
+}
+// Re-send everything that's waiting, oldest first. Each save carries the whole
+// record, so a very old one could undo work done since on another phone (say the
+// driver collected it in the meantime). Anything over 30 minutes old is dropped
+// rather than re-sent, and the person is asked to check it instead.
+const STALE_WRITE_MS = 30*60*1000;
+let RETRYING = null;
+function retryFailedWrites(){
+  if (RETRYING) return RETRYING;
+  RETRYING = (async () => {
+    const queue = FAILED_WRITES.splice(0); notifyFailed();
+    let expired = 0, refused = 0;
+    for (const w of queue){
+      if (Date.now()-w.at > STALE_WRITE_MS){ expired++; continue; }
+      let r;
+      try { r = await sendWithRetry(w.url, w.init); }
+      catch(e){ FAILED_WRITES.push(w); continue; }       // still no signal — keep it for next time
+      if (!r.ok) refused++;                              // got through, but the database said no — don't loop on it
+    }
+    notifyFailed();
+    return { stuck:FAILED_WRITES.length, expired, refused };
+  })().finally(()=>{ RETRYING = null; });
+  return RETRYING;
+}
 const makeDb = (token) => (window.supabase && SUPABASE_URL)
   ? window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY,
-      token ? { global: { headers: { 'x-staff-token': token } } } : undefined)
+      { global: { fetch: resilientFetch, ...(token ? { headers: { 'x-staff-token': token } } : {}) } })
   : null;
 let db = makeDb(null);
 const uuid = () => (crypto.randomUUID ? crypto.randomUUID() :
@@ -668,11 +750,22 @@ async function loadAll() {
   DRIVERS   = (drv.data||[]).map(fromDriverRow);
   return { customers: CUSTOMERS, drivers: DRIVERS, rates: ratesFromRows(rateRows.data||[], settings.data),
     orders: (ord.data||[]).map(fromOrderRow), jobs: (jb.data||[]).map(fromJobRow),
-    audit: (aud.data||[]).map(r=>({time:r.at, text:r.text})) };
+    // the stored time is only HH:MM, so the date comes from when the row was written
+    audit: (aud.data||[]).map(r=>({time:r.at, day:r.created_at?isoDate(new Date(r.created_at)):null, text:r.text})) };
 }
 let onSaveError = null; // App registers this to surface DB errors on screen
+// Three kinds of failure, told apart so the message says what to actually DO:
+//  - no signal: already held and re-sent by resilientFetch, so the "not saved yet"
+//    banner covers it — no second, vaguer message on top
+//  - signed out: the 12-hour sign-in ran out; nothing will save until they sign in again
+//  - anything else: the change was refused; say so plainly and offer a reload
+const isNetworkErr = m => /failed to fetch|load failed|networkerror|network request failed|fetch failed|err_internet|offline/i.test(m||'');
+const isAuthErr    = (m,e) => /row-level security|permission denied|jwt|not authori[sz]ed/i.test(m||'') || (e&&(e.code==='42501'||e.code==='PGRST301'));
 const reportErr = (where, error) => { const msg=(error&&(error.message||error.details||error.hint))||'unknown error';
-  console.error('DB '+where, error); if(onSaveError) onSaveError(`Couldn’t save (${where}): ${msg}`); };
+  console.error('DB '+where, error);
+  if(!onSaveError || isNetworkErr(msg)) return;
+  if(isAuthErr(msg,error)) onSaveError({ kind:'auth', text:'Your sign-in has run out, so your last change was NOT saved. Please log out, sign in again and redo it.' });
+  else onSaveError({ kind:'other', text:`Your last change was NOT saved (${where}: ${msg}). Tap Reload to see what is actually stored, then try again.` }); };
 const logErr = (where) => (r) => { if (r && r.error) reportErr(where, r.error); };
 // save jobs one row at a time — resilient (one bad row can't block the others)
 const saveJobs   = arr => { if(!db) return; arr.forEach(j => db.from('jobs').upsert(toJobRow(j)).then(logErr('saveJob'))); };
@@ -1418,13 +1511,22 @@ function OrderModal({ order, rates, onClose, onSave, addAudit, onDelete, onDispa
   const c = custById(order.customerId);
   const driverStaff = (drivers||[]).filter(d=>hasRole(d,'driver'));
   const actor = (user&&user.name) || 'Someone';
-  const assignedJob = (jobs||[]).find(j=>j.orderId===order.id);
+  // the most recent stop for this order (an order can have several: collection, a missed delivery, a retry)
+  const orderJobs = (jobs||[]).filter(j=>j.orderId===order.id).sort((a,b)=>(a.runDate||'').localeCompare(b.runDate||''));
+  const assignedJob = orderJobs.find(j=>j.status==='pending') || orderJobs[orderJobs.length-1];
   const assignedDriver = assignedJob && (drivers||[]).find(d=>d.id===assignedJob.driverId);
+  const missedDelivery = [...orderJobs].reverse().find(j=>j.type==='delivery' && j.status==='no-answer');
   const [pricing,setPricing]=useState(order.needsPricing);
   const [added,setAdded]=useState(order.addedItems||{});
-  const [dispDriver,setDispDriver]=useState((driverStaff[0]&&driverStaff[0].id)||'');
+  // Sending out again after a missed delivery: default to the same driver, and to
+  // the order's deliver-by date rather than today — Mark reschedules by moving
+  // that date, so the send-out should follow it.
+  const dueOrToday = d => (d && d>TODAY) ? d : TODAY;
+  const [dispDriver,setDispDriver]=useState(()=>{ const prev=assignedJob && driverStaff.find(d=>d.id===assignedJob.driverId);
+    return prev ? prev.id : ((driverStaff[0]&&driverStaff[0].id)||''); });
   const [dispWindow,setDispWindow]=useState(EVENING_RUN);
-  const [dispDay,setDispDay]=useState(TODAY);
+  const [dispDay,setDispDay]=useState(dueOrToday(order.dueDate));
+  useEffect(()=>{ setDispDay(dueOrToday(order.dueDate)); },[order.dueDate]);
   const [dispPack,setDispPack]=useState(packLabel(order.packaging)!=='—'?packLabel(order.packaging):PACKAGING[0]);
   const groups = useMemo(()=>{ const g={}; rates.items.forEach(r=>{(g[r.group]=g[r.group]||[]).push(r)}); return g; },[rates]);
   // rebuild what the driver entered per bag, so the shop sees each rate applied
@@ -1450,39 +1552,51 @@ function OrderModal({ order, rates, onClose, onSave, addAudit, onDelete, onDispa
   const [ePay,setEPay]=useState(order.paymentMethod||'—');
   const [eNotes,setENotes]=useState(order.notes||'');
   const [chargeTouched,setChargeTouched]=useState(false);
+  // Only re-work the price when the BAGS are actually changed. It used to
+  // recalculate from the bag weights as soon as the form opened — so on an
+  // order with no weights recorded (a delivery booked through "New job"), just
+  // moving the date wiped the price to £0 and the bags to 0. That's what
+  // happened to Ms Gill's £30 order on 19 Oct.
+  const [bagsTouched,setBagsTouched]=useState(false);
   const ePriced = useMemo(()=>priceBags(rates, eRows), [rates,eRows]);
-  // re-price from the bags whenever they change, unless a figure was typed in by hand
-  useEffect(()=>{ if(!editing||chargeTouched) return;
+  useEffect(()=>{ if(!editing||chargeTouched||!bagsTouched) return;
     setECharge(+ePriced.subtotal.toFixed(2));
-  },[ePriced.subtotal,editing,chargeTouched]);
-  const eAddRow=()=>setERows(r=>[...r,{id:(r[r.length-1]?.id||0)+1,weight:'',
+  },[ePriced.subtotal,editing,chargeTouched,bagsTouched]);
+  const touchBags=f=>{ setBagsTouched(true); setERows(f); };
+  const eAddRow=()=>touchBags(r=>[...r,{id:(r[r.length-1]?.id||0)+1,weight:'',
     serviceKey:(r[r.length-1]||{}).serviceKey||(rates.weight[0]||{}).key}]);
-  const eRmRow=id=>setERows(r=>r.filter(x=>x.id!==id));
-  const eSetW=(id,v)=>setERows(r=>r.map(x=>x.id===id?{...x,weight:v}:x));
-  const eSetSvc=(id,v)=>setERows(r=>r.map(x=>x.id===id?{...x,serviceKey:v}:x));
+  const eRmRow=id=>touchBags(r=>r.filter(x=>x.id!==id));
+  const eSetW=(id,v)=>touchBags(r=>r.map(x=>x.id===id?{...x,weight:v}:x));
+  const eSetSvc=(id,v)=>touchBags(r=>r.map(x=>x.id===id?{...x,serviceKey:v}:x));
   const editCalc = useMemo(()=>orderTotal(rates, parseFloat(eCharge)||0, added, order.firstOrder), [rates,eCharge,added,order.firstOrder]);
   const startEdit=()=>{ setERows(rowsFromOrder());
     setECharge(order.weightCharge||0); setEExtras(order.extras||[]); setEDue(order.dueDate||''); setEPack(order.packaging||PACKAGING[0]);
-    setEPay(order.paymentMethod||'—'); setENotes(order.notes||''); setChargeTouched(false); setPricing(false); setEditing(true); };
+    setEPay(order.paymentMethod||'—'); setENotes(order.notes||''); setChargeTouched(false); setBagsTouched(false); setPricing(false); setEditing(true); };
   const toggleExtra=(x)=>setEExtras(list=>list.includes(x)?list.filter(y=>y!==x):[...list,x]);
   const saveEdit=()=>{
     const wc=parseFloat(eCharge)||0, wt=ePriced.weight, bags=eRows.length;
-    const patch={ services:bagServiceLabels(rates,eRows), bagServices:eRows.map(r=>r.serviceKey),
-      bagWeights:eRows.map(r=>parseFloat(r.weight)||0),
-      weight:wt, bagsCount:bags, weightCharge:wc, extras:eExtras,
+    // Bags and price are only rewritten if someone actually changed them.
+    // Anything else (date, packaging, payment, notes) leaves them exactly as they were.
+    const priceTouched = bagsTouched || chargeTouched;
+    const patch={ extras:eExtras,
       dueDate:eDue||order.dueDate, packaging:ePack, paymentMethod:ePay, notes:eNotes,
-      amount:editCalc.charged, needsPricing: order.needsPricing && eExtras.length>0 };
+      needsPricing: order.needsPricing && eExtras.length>0,
+      ...(bagsTouched ? { services:bagServiceLabels(rates,eRows), bagServices:eRows.map(r=>r.serviceKey),
+                          bagWeights:eRows.map(r=>parseFloat(r.weight)||0), weight:wt, bagsCount:bags } : {}),
+      ...(priceTouched ? { weightCharge:wc, amount:editCalc.charged } : {}) };
     // describe what actually changed, for the audit trail
     const ch=[];
-    if((order.services||[]).join(', ')!==bagServiceLabels(rates,eRows).join(', ')) ch.push(`services → ${bagServiceLabels(rates,eRows).join(' + ')||'none'}`);
-    if((order.weight||0)!==wt) ch.push(`weight → ${wt}kg`);
-    if((order.bagsCount||0)!==bags) ch.push(`bags → ${bags}`);
+    if(bagsTouched){
+      if((order.services||[]).join(', ')!==bagServiceLabels(rates,eRows).join(', ')) ch.push(`services → ${bagServiceLabels(rates,eRows).join(' + ')||'none'}`);
+      if((order.weight||0)!==wt) ch.push(`weight → ${wt}kg`);
+      if((order.bagsCount||0)!==bags) ch.push(`bags → ${bags}`);
+    }
     if((order.extras||[]).join(',')!==eExtras.join(',')) ch.push(`extras → ${eExtras.join(', ')||'none'}`);
     if((order.dueDate||'')!==(eDue||order.dueDate)) ch.push(`deliver by → ${fmtDate(eDue)}`);
     if((order.packaging||'')!==ePack) ch.push(`packaging → ${ePack}`);
     if((order.paymentMethod||'')!==ePay) ch.push(`payment → ${ePay}`);
     if((order.notes||'')!==eNotes) ch.push('notes updated');
-    if(Math.abs((order.amount||0)-editCalc.charged)>0.005) ch.push(`price ${gbp(order.amount)} → ${gbp(editCalc.charged)}`);
+    if(priceTouched && Math.abs((order.amount||0)-editCalc.charged)>0.005) ch.push(`price ${gbp(order.amount)} → ${gbp(editCalc.charged)}`);
     onSave(order.id, patch);
     if(ch.length) addAudit(`${actor} amended ${fullName(c)}'s order: ${ch.join('; ')}`);
     setEditing(false);
@@ -1553,7 +1667,7 @@ function OrderModal({ order, rates, onClose, onSave, addAudit, onDelete, onDispa
               <Field label="Notes"><textarea value={eNotes} onChange={e=>setENotes(e.target.value)} rows={2} className={inputCls+' mt-1'}/></Field>
               <div className="bg-teal-light rounded-xl p-2.5 flex justify-between items-center">
                 <span className="font-semibold text-ink text-sm">New total</span>
-                <span className="text-lg font-extrabold text-teal-dark">{gbp(editCalc.charged)}</span></div>
+                <span className="text-lg font-extrabold text-teal-dark">{gbp((bagsTouched||chargeTouched)?editCalc.charged:order.amount)}</span></div>
               <div className="flex gap-2">
                 <Btn kind="ghost" onClick={()=>setEditing(false)} className="flex-1">Cancel</Btn>
                 <Btn kind="primary" icon="check" onClick={saveEdit} className="flex-1">Save</Btn>
@@ -1587,7 +1701,8 @@ function OrderModal({ order, rates, onClose, onSave, addAudit, onDelete, onDispa
             {NEXT_STATUS[order.status] && !order.needsPricing &&
               <Btn kind="dark" icon="right" className="mt-3 w-full" onClick={advance}>Mark {NEXT_STATUS[order.status]}</Btn>}
             {order.status==='Ready' && onDispatch && <div className="mt-3 bg-violet-50 border border-violet-100 rounded-xl p-3">
-              <div className="text-xs font-semibold text-violet-700 mb-1.5 inline-flex items-center gap-1"><Ic name="truck" size={14}/>Send out for delivery</div>
+              <div className="text-xs font-semibold text-violet-700 mb-1.5 inline-flex items-center gap-1"><Ic name="truck" size={14}/>{missedDelivery?'Send out again':'Send out for delivery'}</div>
+              {missedDelivery && <p className="text-[11px] text-rose-600 mb-1.5 inline-flex items-center gap-1"><Ic name="alert" size={12}/>No answer on {fmtDate(missedDelivery.runDate)} — pick the new day below.</p>}
               <div className="grid grid-cols-2 gap-2">
                 <select value={dispDriver} onChange={e=>setDispDriver(e.target.value)} className={inputCls+' !py-1.5'}>
                   {driverStaff.map(d=><option key={d.id} value={d.id}>{d.name}</option>)}</select>
@@ -2186,7 +2301,8 @@ function Overview({ jobs, orders, audit, onNew, goStat }) {
         {audit.length===0 ? <p className="text-sm text-slate2">No activity yet. Log in as a driver and confirm a job, or price an order as the store team, to see it here.</p>
           : <div className="space-y-2">{audit.map((a,i)=>{ const alert=/^No answer/.test(a.text); return (
               <div key={i} className={`flex gap-3 text-sm border-b border-gray-50 last:border-0 pb-2 ${alert?'bg-rose-50 -mx-2 px-2 rounded-lg':''}`}>
-                <span className={`tabular-nums ${alert?'text-rose-500':'text-slate2'}`}>{a.time}</span>
+                <span className={`tabular-nums shrink-0 w-[5.5rem] leading-tight ${alert?'text-rose-500':'text-slate2'}`}>
+                  <span className="block text-[11px]">{!a.day?'':a.day===TODAY?'Today':a.day===addDays(TODAY,-1)?'Yesterday':fmtDate(a.day)}</span>{a.time}</span>
                 <span className={alert?'text-rose-600 font-semibold inline-flex items-start gap-1':'text-ink'}>{alert&&<Ic name="alert" size={14} className="mt-0.5 shrink-0"/>}{a.text}</span>
               </div>);})}</div>}
       </div>
@@ -2363,6 +2479,22 @@ function Customers({ customers, addCustomer, updateCustomer, deleteCustomer, use
     {editing && <AddCustomerModal customer={editing} onClose={()=>setEditing(null)} onUpdate={updateCustomer} onDelete={mayDelete(user)?deleteCustomer:null} user={user} customers={customers}/>}
   </div>);
 }
+// PURE — how a delivered order was paid. The driver's choice at the door wins;
+// otherwise fall back to "paid before it went out". Colours agreed with Mark:
+// cash = green, online = purple, already paid = teal.
+function deliveredPayment(order, deliveryJob){
+  const m = (deliveryJob && deliveryJob.paymentMethod) || '';
+  if (m==='Paid in advance' || (!m && order && order.paidInAdvance)) return { key:'paid',   label:'Already paid' };
+  if (m==='Cash')   return { key:'cash',   label:'Cash' };
+  if (m==='Online') return { key:'online', label:'Paid online' };
+  if (m && m!=='—') return { key:'other',  label:m };
+  return null;
+}
+const PAY_STYLE = { cash:'bg-emerald-100 text-emerald-800 border-emerald-300', online:'bg-violet-100 text-violet-800 border-violet-300',
+                    paid:'bg-teal-light text-teal-dark border-teal/40', other:'bg-gray-100 text-gray-600 border-gray-200' };
+function PayTag({ pay }){
+  return <span className={`text-[11px] font-bold px-2 py-0.5 rounded-full border ${PAY_STYLE[pay.key]}`}>{pay.label}</span>;
+}
 // how each due-date section looks
 const ORDER_SECTIONS = [
   { key:'overdue',  title:'Overdue',        note:'Past their delivery date — deal with these first.', accent:'border-rose-300',   dot:'bg-rose-500',    pill:'bg-rose-100 text-rose-700' },
@@ -2378,7 +2510,16 @@ function Orders({ orders, rates, updateOrder, addAudit, filter, onClearFilter, d
   const groups = useMemo(()=>groupOrdersByDue(base, TODAY), [base]);
   const total = base.length;
 
-  const card = (o) => { const c=custById(o.customerId); const late=o.dueDate<TODAY && !DONE_STATUSES.includes(o.status); return (
+  // For finished orders: the day it was actually delivered, and how the driver
+  // recorded payment at the door (or that it was paid before it went out).
+  const deliveredBy = useMemo(()=>{ const m={};
+    (jobs||[]).forEach(j=>{ if(j.type!=='delivery'||j.status!=='done'||!j.orderId) return;
+      const p=m[j.orderId]; if(!p || (j.runDate||'')>(p.runDate||'')) m[j.orderId]=j; });
+    return m; },[jobs]);
+  const card = (o) => { const c=custById(o.customerId); const late=o.dueDate<TODAY && !DONE_STATUSES.includes(o.status);
+    const delivered = DONE_STATUSES.includes(o.status), dj = delivered ? deliveredBy[o.id] : null;
+    const pay = delivered ? deliveredPayment(o, dj) : null;
+    return (
     <button key={o.id} onClick={()=>setSel(o)} className="w-full text-left bg-white card rounded-2xl p-3.5 hover:ring-2 hover:ring-teal/40 transition">
       <div className="flex items-center justify-between gap-2">
         <span className="font-semibold text-ink truncate">{fullName(c)}</span>
@@ -2390,8 +2531,11 @@ function Orders({ orders, rates, updateOrder, addAudit, filter, onClearFilter, d
         <span className="text-slate2 shrink-0">{o.bagsCount} · {o.weight}kg</span>
       </div>
       <div className="flex items-center justify-between gap-2 mt-1.5 text-sm">
-        <span className="font-bold text-ink inline-flex items-center gap-2">{gbp(o.amount)}{o.needsPricing&&<span className="text-rose-500 font-normal text-xs">prov.</span>}{o.paidInAdvance&&<Badge tone="green">Paid</Badge>}</span>
-        <span className={`text-xs inline-flex items-center gap-1 ${late?'text-rose-600 font-semibold':'text-slate2'}`}><Ic name="clock" size={13}/>Due {fmtDate(o.dueDate)}</span>
+        <span className="font-bold text-ink inline-flex items-center gap-2">{gbp(o.amount)}{o.needsPricing&&<span className="text-rose-500 font-normal text-xs">prov.</span>}
+          {pay ? <PayTag pay={pay}/> : (o.paidInAdvance&&<Badge tone="green">Paid</Badge>)}</span>
+        {delivered && dj
+          ? <span className="text-xs inline-flex items-center gap-1 text-emerald-700 font-semibold"><Ic name="check" size={13}/>Delivered {fmtDate(dj.runDate)}</span>
+          : <span className={`text-xs inline-flex items-center gap-1 ${late?'text-rose-600 font-semibold':'text-slate2'}`}><Ic name="clock" size={13}/>Due {fmtDate(o.dueDate)}</span>}
       </div>
     </button>);};
 
@@ -2406,7 +2550,10 @@ function Orders({ orders, rates, updateOrder, addAudit, filter, onClearFilter, d
 
     <div className="space-y-5">
       {ORDER_SECTIONS.map(s=>{
-        const list = groups[s.key]; if(!list.length) return null;
+        // delivered: newest delivery first, by the day it actually went out
+        const dayOf = o => (deliveredBy[o.id]&&deliveredBy[o.id].runDate) || o.dueDate || '';
+        const list = s.key==='done' ? [...groups.done].sort((a,b)=>dayOf(b).localeCompare(dayOf(a))) : groups[s.key];
+        if(!list.length) return null;
         // completed work starts folded; everything else starts open
         const open = s.key==='done' ? folded.has('done-open') : !folded.has(s.key);
         return (
@@ -2736,6 +2883,12 @@ function Logistics({ jobs, setJobs, drivers, onNew, deleteJob, customers, user, 
   const move=(driverId,jobId,dir)=>setJobs(prev=>moveJob(prev,driverId,jobId,dir,day));
   const reassign=(jobId,toDriverId)=>setJobs(prev=>moveJobTo(prev,jobId,toDriverId,null,day));
   const [showLoading,setShowLoading]=useState(false);
+  // On a phone the list runs well past the bottom of the screen, and the only way
+  // to shut it was the "Hide" at the very top. Closing now also scrolls back to
+  // where the list starts, so you're not left somewhere in the middle of the page.
+  const loadingRef = useRef(null);
+  const closeLoading = () => { setShowLoading(false);
+    setTimeout(()=>{ const el=loadingRef.current; if(el) el.scrollIntoView({behavior:'smooth', block:'start'}); }, 0); };
   const [foldedDrv,foldDrv]=useCollapsed('logistics-drivers');
   // Mark loads the van from this list, so packaging is set here rather than
   // only at dispatch. Updating the ORDER is what makes it reach the driver.
@@ -2823,13 +2976,13 @@ function Logistics({ jobs, setJobs, drivers, onNew, deleteJob, customers, user, 
       if(!L.total) return '';
       return `<h2>${d.name} — ${L.total} deliver${L.total===1?'y':'ies'} · ${L.bags} bag(s)</h2>` +
         L.groups.map(g=>`<h3>${g.packaging} — ${g.stops.length} stop(s), ${g.bags} bag(s)</h3>
-          <table><tbody>${g.stops.map(st=>`<tr><td class="n">${st.seq}</td><td>${st.name}</td><td class="b">${st.bags} bag(s)</td></tr>`).join('')}</tbody></table>`).join('');
+          <table><tbody>${g.stops.map(st=>`<tr><td class="n">${st.seq}</td><td><b>${esc(st.addr||st.name)}</b><br><span class="nm">${esc(st.name)}</span></td><td class="b">${st.bags} bag(s)</td></tr>`).join('')}</tbody></table>`).join('');
     }).join('');
     const html = `<html><head><title>NELIS — Van loading ${dayLabel(day)}</title>
       <style>body{font-family:Arial;padding:18px;color:#1f2a30}h1{font-size:17px;margin:0 0 2px}
       .sub{color:#777;font-size:12px;margin-bottom:14px}h2{font-size:14px;margin:16px 0 6px;border-bottom:2px solid #3AAFCB;padding-bottom:3px}
       h3{font-size:12px;margin:10px 0 3px;color:#6d28d9}table{width:100%;border-collapse:collapse;font-size:12px}
-      td{border-bottom:1px solid #eee;padding:4px 6px}.n{width:32px;font-weight:bold;color:#3AAFCB}.b{text-align:right;color:#777;width:80px}</style></head>
+      td{border-bottom:1px solid #eee;padding:4px 6px}.n{width:32px;font-weight:bold;color:#3AAFCB}.b{text-align:right;color:#777;width:80px}.nm{color:#888;font-size:11px}</style></head>
       <body><h1>Van loading list</h1><div class="sub">${dayLabel(day)} · ${fmtDate(day)}</div>${blocks||'<p>No deliveries on this day.</p>'}</body></html>`;
     const w=window.open('','_blank'); if(!w){alert('Please allow pop-ups to print.');return;}
     w.document.write(html); w.document.close(); w.focus(); setTimeout(()=>w.print(),300);
@@ -2885,13 +3038,17 @@ function Logistics({ jobs, setJobs, drivers, onNew, deleteJob, customers, user, 
           </div>
         </div>}
       </div>
-      <div className="bg-white card rounded-2xl p-3 mb-4">
+      <div ref={loadingRef} className="bg-white card rounded-2xl p-3 mb-4 scroll-mt-20">
         <div className="flex items-center justify-between gap-2 flex-wrap">
           <button onClick={()=>setShowLoading(v=>!v)} className="font-bold text-ink text-sm inline-flex items-center gap-1.5">
             <Ic name="box" size={16}/>Van loading list
             <span className="text-slate2 font-normal text-xs inline-flex items-center gap-1">{showLoading?'Hide':'Show'}<Ic name={showLoading?'up':'down'} size={13}/></span>
           </button>
-          {showLoading && <Btn kind="ghost" icon="printer" onClick={printLoading} className="!py-1 !px-2.5 text-xs">Print</Btn>}
+          {showLoading && <div className="flex items-center gap-2">
+            <Btn kind="ghost" icon="printer" onClick={printLoading} className="!py-1 !px-2.5 text-xs">Print</Btn>
+            <button onClick={closeLoading} title="Close the van loading list" aria-label="Close"
+              className="w-8 h-8 rounded-full border border-gray-200 bg-white text-slate2 hover:text-ink inline-flex items-center justify-center"><Ic name="close" size={16}/></button>
+          </div>}
         </div>
         {showLoading && <div className="mt-3 grid md:grid-cols-2 gap-4">
           {driverStaff.map(d=>{ const L=loadingGroups(jobs,d.id,day);
@@ -2907,15 +3064,20 @@ function Logistics({ jobs, setJobs, drivers, onNew, deleteJob, customers, user, 
                           {g.packaging} · {g.stops.length} stop{g.stops.length===1?'':'s'}{g.bags?` · ${g.bags} bag${g.bags===1?'':'s'}`:''}</div>
                         <div className="mt-1 space-y-0.5">
                           {g.stops.map(st=>(
-                            <div key={st.seq} className="flex items-center gap-2 text-sm">
+                            <div key={st.seq} className="flex items-center gap-2 text-sm py-0.5">
                               <span className="w-6 h-6 rounded-full bg-teal text-white text-xs font-bold flex items-center justify-center shrink-0">{st.seq}</span>
-                              <span className="text-ink truncate flex-1">{st.name}</span>
+                              <span className="flex-1 min-w-0">
+                                <span className="block text-ink font-medium leading-tight">{st.addr||st.name}</span>
+                                {st.addr && <span className="block text-[11px] text-slate2 truncate">{st.name}</span>}
+                              </span>
                               {st.bags>0 && <span className="text-slate2 text-xs shrink-0">{st.bags} bag{st.bags===1?'':'s'}</span>}
                             </div>))}
                         </div>
                       </div>))}
               </div>); })}
           <p className="text-[11px] text-slate2 md:col-span-2">Numbers are the driving order — load the last stop deepest in the van.</p>
+          <button onClick={closeLoading} className="md:col-span-2 w-full border border-gray-200 rounded-xl py-2 text-sm font-semibold text-ink bg-white hover:bg-gray-50 inline-flex items-center justify-center gap-1.5">
+            <Ic name="close" size={15}/>Close list</button>
         </div>}
       </div>
       <div className="grid md:grid-cols-2 gap-4">
@@ -3036,15 +3198,20 @@ function App() {
   // Pull everything the signed-in person is allowed to see. Runs once on start
   // (when only the staff list is readable) and again after sign-in, once the
   // session token lets the database release the rest.
-  const reloadAll = useCallback(()=>{
+  // quiet = a background refresh: if it fails (no signal) keep what's on screen
+  // rather than replacing the whole app with an error page.
+  const lastLoadRef = useRef(0);
+  const reloadAll = useCallback((opts)=>{
     if(!db) return Promise.resolve();
+    const quiet = !!(opts && opts.quiet);
     return loadAll().then(d=>{
+        lastLoadRef.current = Date.now();
         setCustomersState(d.customers); setDriversState(d.drivers); setJobsState(d.jobs);
         setOrdersState(d.orders); setRatesState(d.rates); setAudit(d.audit); setPhase('ready');
         const missing = d.customers.filter(c=>c.addr && c.lat==null);  // fill in map coordinates for any that lack them
         if(missing.length) backfillCoords(missing, (id,pt)=>{ CUSTOMERS = CUSTOMERS.map(x=>x.id===id?{...x,...pt}:x); setCustomersState(CUSTOMERS);
           if(db) db.from('customers').update({lat:pt.lat,lng:pt.lng}).eq('id',id).then(logErr('backfill coords')); }); })
-      .catch(e=>{ console.error(e); setErr(e.message||String(e)); setPhase('error'); });
+      .catch(e=>{ console.error(e); if(quiet) return; setErr(e.message||String(e)); setPhase('error'); });
   },[]);
   // On start, if this tab still has a token, ask the DATABASE who it belongs to.
   // The identity and permissions come back from the server, so nothing stored in
@@ -3071,6 +3238,55 @@ function App() {
   },[]);
   useEffect(()=>{ onSaveError=(m)=>setSaveError(m); return ()=>{ onSaveError=null; }; },[]);
 
+  // ---- changes that haven't reached the database yet ----
+  const [failedCount,setFailedCount]=useState(0);
+  const [retrying,setRetrying]=useState(false);
+  const [savedNote,setSavedNote]=useState(false);
+  useEffect(()=>{ onFailedWrites=n=>setFailedCount(n); return ()=>{ onFailedWrites=null; }; },[]);
+  const tryAgain = useCallback(async ()=>{
+    if(!FAILED_WRITES.length) return;
+    setRetrying(true);
+    const { stuck, expired, refused } = await retryFailedWrites();
+    setRetrying(false);
+    if(refused) setSaveError({ kind:'auth', text:`${refused} change${refused>1?'s':''} got through but ${refused>1?'were':'was'} refused — usually because the sign-in has run out. Please log out, sign in again and redo ${refused>1?'them':'it'}.` });
+    else if(expired) setSaveError({ kind:'other', text:`${expired} change${expired>1?'s':''} from over 30 minutes ago couldn’t be sent and ${expired>1?'were':'was'} dropped, so ${expired>1?'they':'it'} can’t overwrite anything newer. Please check and redo ${expired>1?'them':'it'}.` });
+    if(!stuck){ reloadAll({quiet:true}); if(!expired && !refused){ setSavedNote(true); setTimeout(()=>setSavedNote(false), 3000); } }
+  },[reloadAll]);
+  // Refresh when the app is brought back to the front, so a phone that's been in a
+  // pocket shows the latest stops instead of what was true when it was last opened.
+  // Skipped while anything is unsaved, so a refresh can't hide a change still waiting to go.
+  const refreshIfStale = useCallback(async ()=>{
+    if(!db || !userRef.current || !SESSION_TOKEN) return;
+    if(FAILED_WRITES.length){ tryAgain(); return; }
+    if(WRITES_IN_FLIGHT || RETRYING) return;
+    if(Date.now()-lastLoadRef.current < 30000) return;
+    // check the sign-in is still valid first — an expired one reads back as an EMPTY database
+    const { data, error } = await db.rpc('staff_from_token',{ p_token:SESSION_TOKEN });
+    if(error) return;                                    // no signal: keep what's on screen
+    const r = Array.isArray(data)?data[0]:data;
+    if(!r || !r.staff_id){
+      setDbToken(null); try{ sessionStorage.removeItem('nelis.view'); }catch(e){}
+      setUser(null); setView('picker');
+      setSaveError({ kind:'auth', text:'Your sign-in ran out, so you’ve been signed out. Please sign in again.' });
+      return;
+    }
+    reloadAll({quiet:true});
+  },[reloadAll,tryAgain]);
+  useEffect(()=>{
+    const onVis = ()=>{ if(document.visibilityState==='visible') refreshIfStale(); };
+    const onOnline = ()=>{ if(FAILED_WRITES.length) tryAgain(); };
+    // keep trying in the background too: moving from shop WiFi to mobile data doesn't always fire "online"
+    const tick = setInterval(()=>{ if(FAILED_WRITES.length && document.visibilityState==='visible') tryAgain(); }, 45000);
+    const onLeave = e=>{ if(FAILED_WRITES.length){ e.preventDefault(); e.returnValue=''; } };
+    document.addEventListener('visibilitychange', onVis);
+    window.addEventListener('focus', onVis);
+    window.addEventListener('online', onOnline);
+    window.addEventListener('beforeunload', onLeave);
+    return ()=>{ clearInterval(tick); document.removeEventListener('visibilitychange', onVis);
+      window.removeEventListener('focus', onVis); window.removeEventListener('online', onOnline);
+      window.removeEventListener('beforeunload', onLeave); };
+  },[refreshIfStale,tryAgain]);
+
   // write-through setters: update the screen AND save to the database
   // Write ONLY the rows that actually changed. This used to save every job on
   // every edit, so a single unsaveable row blocked all other saves.
@@ -3096,7 +3312,7 @@ function App() {
   const deleteDriver=useCallback((id)=>{ setDriversState(prev=>{ const d=prev.find(x=>x.id===id); const next=prev.filter(x=>x.id!==id); DRIVERS=next;
     if(db) db.from('drivers').delete().eq('id',id).then(r=>{ if(r&&r.error) reportErr('delete staff', r.error); });
     if(d) addAudit(`${actor()} removed staff member ${d.name}`); return next; }); },[]);
-  const addAudit=useCallback(text=>{ const e={time:now(),text}; setAudit(prev=>[e,...prev]); insertAudit(e); },[]);
+  const addAudit=useCallback(text=>{ const e={time:now(),day:TODAY,text}; setAudit(prev=>[e,...prev]); insertAudit(e); },[]);
   const addOrder=useCallback(o=>{ ordersRef.current=[o,...ordersRef.current]; setOrdersState(prev=>[o,...prev]); saveOrder(o); },[]);
   const updateOrder=useCallback((id,patch)=>{
     // THE ONE THAT CAUSED ALL THE TROUBLE. This used to work out the updated
@@ -3282,7 +3498,10 @@ function App() {
     addAudit(`${actor()} booked a ${isCol?'collection':'delivery'} for ${fullName(custById(j.customerId))} on ${fmtDate(day)}`);
   },[addAudit]);
   const go=useCallback(v=>{
-    if(v==='logout'){ endStaffSession(); try{ sessionStorage.removeItem('nelis.view'); }catch(e){} setUser(null); setView('picker'); return; }
+    if(v==='logout'){
+      if(FAILED_WRITES.length && !window.confirm(`${FAILED_WRITES.length} change(s) haven’t saved yet because of the signal. If you log out now they will be lost.\n\nLog out anyway?`)) return;
+      FAILED_WRITES.splice(0); notifyFailed();
+      endStaffSession(); try{ sessionStorage.removeItem('nelis.view'); }catch(e){} setUser(null); setView('picker'); return; }
     try{ sessionStorage.setItem('nelis.view', v); }catch(e){}
     setView(v);
   },[]);
@@ -3303,10 +3522,21 @@ function App() {
   else if (view==='admin-app' && hasRole(user,'admin'))   screen=<AdminApp go={go} jobs={jobs} setJobs={setJobs} rates={rates} setRates={setRates} audit={audit} drivers={drivers} setDrivers={setDrivers} deleteDriver={deleteDriver} orders={orders} addJob={addJob} updateOrder={updateOrder} addAudit={addAudit} deleteJob={deleteJob} deleteOrder={deleteOrder} dispatchDelivery={dispatchDelivery} customers={customers} addCustomer={addCustomer} updateCustomer={updateCustomer} deleteCustomer={deleteCustomer} user={user}/>;
   else                            screen=<PortalPicker user={user} onPick={v=>setView(v)} onLogout={()=>go('logout')}/>;
   return <>
-    {saveError && <div className="fixed top-0 inset-x-0 z-[60] bg-rose-600 text-white text-sm px-4 py-2.5 flex items-center justify-between gap-3 shadow-lg">
-      <span className="inline-flex items-start gap-2"><Ic name="alert" size={16} className="mt-0.5 shrink-0"/><span>{saveError}</span></span>
-      <button onClick={()=>setSaveError('')} className="shrink-0 opacity-90 hover:opacity-100"><Ic name="close" size={18}/></button>
+    {(failedCount>0 || saveError) && <div className="fixed top-0 inset-x-0 z-[60] shadow-lg">
+      {failedCount>0 && <div className="bg-rose-600 text-white text-sm px-4 py-2.5 flex items-center justify-between gap-3">
+        <span className="inline-flex items-start gap-2"><Ic name="alert" size={16} className="mt-0.5 shrink-0"/>
+          <span><b>{failedCount} change{failedCount>1?'s':''} not saved yet</b> — probably no signal. {failedCount>1?'They haven’t':'It hasn’t'} reached the database or the drivers. Keep this page open; it will keep trying.</span></span>
+        <button onClick={tryAgain} {...(retrying?{disabled:true}:{})} className="shrink-0 bg-white text-rose-700 font-semibold rounded-lg px-3 py-1 text-xs">{retrying?'Trying…':'Try again'}</button>
+      </div>}
+      {saveError && <div className={`${failedCount>0?'border-t border-white/30 ':''}bg-rose-600 text-white text-sm px-4 py-2.5 flex items-center justify-between gap-3`}>
+        <span className="inline-flex items-start gap-2"><Ic name="alert" size={16} className="mt-0.5 shrink-0"/><span>{typeof saveError==='string'?saveError:saveError.text}</span></span>
+        <span className="shrink-0 inline-flex items-center gap-2">
+          {saveError.kind==='other' && user && <button onClick={()=>{ setSaveError(''); reloadAll({quiet:true}); }} className="bg-white text-rose-700 font-semibold rounded-lg px-3 py-1 text-xs">Reload</button>}
+          <button onClick={()=>setSaveError('')} className="opacity-90 hover:opacity-100" title="Dismiss"><Ic name="close" size={18}/></button>
+        </span>
+      </div>}
     </div>}
+    {savedNote && !failedCount && <div className="fixed top-3 left-1/2 -translate-x-1/2 z-[60] bg-emerald-600 text-white text-sm font-semibold px-4 py-2 rounded-xl shadow-lg inline-flex items-center gap-2"><Ic name="check" size={16}/>All changes saved</div>}
     {screen}
   </>;
 }
