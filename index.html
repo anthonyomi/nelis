@@ -44,6 +44,10 @@
   select, input, textarea, button { font-family:inherit; }
   html { -webkit-text-size-adjust:100%; }
   body { overflow-x:hidden; }
+  /* safety net: nothing inside the app may make the page wider than the phone.
+     (iPhones ignore overflow on <body>, so one wide row let you pinch out and
+     see the whole layout shifted.) "clip" doesn't break the sticky header. */
+  #root { overflow-x:clip; }
   /* iOS zooms in on focus when a control's text is < 16px; force 16px on small screens to prevent it */
   @media (max-width:640px){ input, select, textarea { font-size:16px !important; } }
   /* consistent custom dropdown styling (removes native iOS grey look, adds our own chevron) */
@@ -3007,10 +3011,12 @@ function Logistics({ jobs, setJobs, drivers, onNew, deleteJob, customers, user, 
         <div className="flex items-center justify-between mb-2 flex-wrap gap-2">
           <h4 className="font-bold text-ink text-sm">{dayLabel(day)}’s stops on the map</h4>
           <div className="flex items-center gap-2 flex-wrap">
-            <div className="flex items-center gap-1 bg-gray-50 rounded-xl p-1">
+            {/* wraps onto a second line rather than running off the edge — with six
+                drivers this row was wider than a phone, which widened the whole page */}
+            <div className="flex flex-wrap items-center gap-1 bg-gray-50 rounded-xl p-1 max-w-full">
               {[['all','All drivers'],...driverStaff.map(d=>[d.id,d.name.split(' ')[0]])].map(([k,l])=>(
                 <button key={k} onClick={()=>{setMapDriver(k);setSaving(null);}}
-                  className={`px-2.5 py-1 rounded-lg text-xs font-semibold ${mapDriver===k?'bg-teal text-white':'text-slate2'}`}>{l}</button>))}
+                  className={`px-2.5 py-1 rounded-lg text-xs font-semibold whitespace-nowrap ${mapDriver===k?'bg-teal text-white':'text-slate2'}`}>{l}</button>))}
             </div>
             <Btn kind="primary" icon="pin" onClick={optimise} className="!py-1.5 !px-3 text-xs" {...(optimising?{disabled:true}:{})}>
               {optimising?'Working out the route…':'Suggest best order'}</Btn>
