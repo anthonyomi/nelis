@@ -1511,7 +1511,7 @@ function Timeline({ status }) {
   );
 }
 
-function OrderModal({ order, rates, onClose, onSave, addAudit, onDelete, onDispatch, jobs, drivers, user }) {
+function OrderModal({ order, rates, onClose, onSave, addAudit, onDelete, onDispatch, onRebook, jobs, drivers, user }) {
   const c = custById(order.customerId);
   const driverStaff = (drivers||[]).filter(d=>hasRole(d,'driver'));
   const actor = (user&&user.name) || 'Someone';
@@ -1531,6 +1531,17 @@ function OrderModal({ order, rates, onClose, onSave, addAudit, onDelete, onDispa
   const [dispWindow,setDispWindow]=useState(EVENING_RUN);
   const [dispDay,setDispDay]=useState(dueOrToday(order.dueDate));
   useEffect(()=>{ setDispDay(dueOrToday(order.dueDate)); },[order.dueDate]);
+  // ---- Book again: a collection where nobody was home ----
+  // Puts the SAME order back on a driver's run, instead of booking a New job and
+  // leaving the old "No answer" order behind to delete. Same driver and time
+  // slot as last time by default; tomorrow unless changed.
+  const missedCollection = [...orderJobs].reverse().find(j=>j.type==='collection' && j.status==='no-answer');
+  const [rbDriver,setRbDriver]=useState(()=>{ const prev=missedCollection && driverStaff.find(d=>d.id===missedCollection.driverId);
+    return prev ? prev.id : ((driverStaff[0]&&driverStaff[0].id)||''); });
+  const [rbWindow,setRbWindow]=useState((missedCollection&&missedCollection.window)||EVENING_RUN);
+  const [rbDay,setRbDay]=useState(addDays(TODAY,1));
+  const rbReturn = rebookReturnDate(order.dueDate, rbDay);
+  const rebook = () => { if(!rbDriver||!onRebook) return; onRebook(order, rbDriver, rbWindow, rbDay); onClose(); };
   const [dispPack,setDispPack]=useState(packLabel(order.packaging)!=='—'?packLabel(order.packaging):PACKAGING[0]);
   const groups = useMemo(()=>{ const g={}; rates.items.forEach(r=>{(g[r.group]=g[r.group]||[]).push(r)}); return g; },[rates]);
   // rebuild what the driver entered per bag, so the shop sees each rate applied
@@ -1695,7 +1706,19 @@ function OrderModal({ order, rates, onClose, onSave, addAudit, onDelete, onDispa
             {order.status==='Pending Collection' &&
               <p className="text-xs text-slate2 mt-2 inline-flex items-center gap-1"><Ic name="clock" size={14}/>Awaiting driver collection.</p>}
             {order.status==='No answer' &&
-              <p className="text-xs text-rose-600 mt-2 inline-flex items-center gap-1"><Ic name="alert" size={14}/>No answer at the door — needs rescheduling.</p>}
+              <p className="text-xs text-rose-600 mt-2 inline-flex items-center gap-1"><Ic name="alert" size={14}/>No answer at the door{missedCollection?` on ${fmtDate(missedCollection.runDate)}`:''} — needs rescheduling.</p>}
+            {order.status==='No answer' && onRebook && driverStaff.length>0 && <div className="mt-3 bg-rose-50 border border-rose-100 rounded-xl p-3">
+              <div className="text-xs font-semibold text-rose-700 mb-1.5 inline-flex items-center gap-1"><Ic name="truck" size={14}/>Book collection again</div>
+              <div className="grid grid-cols-2 gap-2">
+                <select value={rbDriver} onChange={e=>setRbDriver(e.target.value)} className={inputCls+' !py-1.5'}>
+                  {driverStaff.map(d=><option key={d.id} value={d.id}>{d.name}</option>)}</select>
+                <select value={rbWindow} onChange={e=>setRbWindow(e.target.value)} className={inputCls+' !py-1.5'}>
+                  <WindowOptions/></select>
+                <div className="col-span-2"><input type="date" value={rbDay} min={TODAY} onChange={e=>setRbDay(e.target.value||addDays(TODAY,1))} className={inputCls+' !py-1.5'}/></div>
+              </div>
+              <p className="text-[11px] text-slate2 mt-1.5">Same order and notes as before — nothing to delete afterwards. Return by {fmtDate(rbReturn)}{rbReturn!==order.dueDate?' (moved on, as the old date is too soon)':''}.</p>
+              <Btn kind="rose" icon="check" className="w-full mt-2" onClick={rebook}>Book for {dayLabel(rbDay).toLowerCase()}’s run</Btn>
+            </div>}
             {order.status==='Out for delivery' &&
               <p className="text-xs text-violet-600 mt-2 inline-flex items-center gap-1"><Ic name="truck" size={14}/>On {assignedDriver?assignedDriver.name+"’s":'a driver’s'} run — delivers when confirmed.</p>}
             {order.status==='Delivered' &&
@@ -1800,7 +1823,7 @@ function StoreLogin({ go, onLogin }) {
     </LoginCard>
   );
 }
-function StoreApp({ go, orders, rates, updateOrder, addAudit, deleteOrder, jobs, drivers, onDispatch, user }) {
+function StoreApp({ go, orders, rates, updateOrder, addAudit, deleteOrder, jobs, drivers, onDispatch, onRebook, user }) {
   const [scope,setScope]=useState(TODAY);
   const [sel,setSel]=useState(null);
   const [showHelp,setShowHelp]=useState(false);
@@ -1885,7 +1908,7 @@ function StoreApp({ go, orders, rates, updateOrder, addAudit, deleteOrder, jobs,
             })}
           </div>}
       </div>
-      {sel && <OrderModal order={orders.find(o=>o.id===sel.id)||sel} rates={rates} onClose={()=>setSel(null)} onSave={updateOrder} addAudit={addAudit} onDelete={deleteOrder} onDispatch={onDispatch} jobs={jobs} drivers={drivers} user={user}/>}
+      {sel && <OrderModal order={orders.find(o=>o.id===sel.id)||sel} rates={rates} onClose={()=>setSel(null)} onSave={updateOrder} addAudit={addAudit} onDelete={deleteOrder} onDispatch={onDispatch} onRebook={onRebook} jobs={jobs} drivers={drivers} user={user}/>}
     </div>
   );
 }
@@ -2127,7 +2150,7 @@ function HelpOverlay({ role, open, onClose }) {
   );
 }
 
-function AdminApp({ go, jobs, setJobs, rates, setRates, audit, drivers, setDrivers, deleteDriver, orders, addJob, updateOrder, addAudit, deleteJob, deleteOrder, dispatchDelivery, customers, addCustomer, updateCustomer, deleteCustomer, user }) {
+function AdminApp({ go, jobs, setJobs, rates, setRates, audit, drivers, setDrivers, deleteDriver, orders, addJob, updateOrder, addAudit, deleteJob, deleteOrder, dispatchDelivery, rebookCollection, customers, addCustomer, updateCustomer, deleteCustomer, user }) {
   const [tab,setTab]=useState('overview');
   const [intake,setIntake]=useState(false);
   const [ordersFilter,setOrdersFilter]=useState('all');
@@ -2156,7 +2179,7 @@ function AdminApp({ go, jobs, setJobs, rates, setRates, audit, drivers, setDrive
         </div>
         {tab==='overview'  && <Overview jobs={jobs} orders={orders} audit={audit} onNew={()=>setIntake(true)} goStat={goStat}/>}
         {tab==='customers' && <Customers customers={customers} addCustomer={addCustomer} updateCustomer={updateCustomer} deleteCustomer={deleteCustomer} user={user}/>}
-        {tab==='orders'    && <Orders orders={orders} rates={rates} updateOrder={updateOrder} addAudit={addAudit} filter={ordersFilter} onClearFilter={()=>setOrdersFilter('all')} deleteOrder={deleteOrder} jobs={jobs} drivers={drivers} onDispatch={dispatchDelivery} user={user}/>}
+        {tab==='orders'    && <Orders orders={orders} rates={rates} updateOrder={updateOrder} addAudit={addAudit} filter={ordersFilter} onClearFilter={()=>setOrdersFilter('all')} deleteOrder={deleteOrder} jobs={jobs} drivers={drivers} onDispatch={dispatchDelivery} onRebook={rebookCollection} user={user}/>}
         {tab==='pricing'   && <Pricing rates={rates} setRates={setRates} canDelete={mayDelete(user)}/>}
         {tab==='staff'     && <StaffAdmin drivers={drivers} setDrivers={setDrivers} deleteDriver={deleteDriver} user={user}/>}
         {tab==='logistics' && <Logistics jobs={jobs} setJobs={setJobs} drivers={drivers} onNew={()=>setIntake(true)} deleteJob={deleteJob} customers={customers} user={user} updateOrder={updateOrder}/>}
@@ -2483,6 +2506,13 @@ function Customers({ customers, addCustomer, updateCustomer, deleteCustomer, use
     {editing && <AddCustomerModal customer={editing} onClose={()=>setEditing(null)} onUpdate={updateCustomer} onDelete={mayDelete(user)?deleteCustomer:null} user={user} customers={customers}/>}
   </div>);
 }
+// PURE — the return-by date when a missed collection is booked again. Keep the
+// customer's original date if there's still time; otherwise two days after the
+// new collection, the same gap the booking form uses.
+function rebookReturnDate(oldDue, newCollectionDay){
+  const min = addDays(newCollectionDay, 2);
+  return (oldDue && oldDue >= min) ? oldDue : min;
+}
 // PURE — how a delivered order was paid. The driver's choice at the door wins;
 // otherwise fall back to "paid before it went out". Colours agreed with Mark:
 // cash = green, online = purple, already paid = teal.
@@ -2507,7 +2537,7 @@ const ORDER_SECTIONS = [
   { key:'upcoming', title:'Upcoming',       note:'Later this week and beyond.',                       accent:'border-gray-200',   dot:'bg-gray-300',    pill:'bg-gray-100 text-gray-600' },
   { key:'done',     title:'Delivered',      note:'Completed — kept for your records.',                accent:'border-gray-200',   dot:'bg-emerald-400', pill:'bg-emerald-50 text-emerald-700' },
 ];
-function Orders({ orders, rates, updateOrder, addAudit, filter, onClearFilter, deleteOrder, jobs, drivers, onDispatch, user }) {
+function Orders({ orders, rates, updateOrder, addAudit, filter, onClearFilter, deleteOrder, jobs, drivers, onDispatch, onRebook, user }) {
   const [sel,setSel]=useState(null);
   const [folded,fold]=useCollapsed('orders');
   const base = filter==='needsPricing' ? orders.filter(o=>o.needsPricing) : orders;
@@ -2577,7 +2607,7 @@ function Orders({ orders, rates, updateOrder, addAudit, filter, onClearFilter, d
       })}
     </div>
     <p className="text-xs text-slate2 mt-4">Tap an order to view details, edit it or amend the price. “prov.” = provisional, extras still to be added at the shop.</p>
-    {sel && <OrderModal order={orders.find(o=>o.id===sel.id)||sel} rates={rates} onClose={()=>setSel(null)} onSave={updateOrder} addAudit={addAudit} onDelete={deleteOrder} onDispatch={onDispatch} jobs={jobs} drivers={drivers} user={user}/>}
+    {sel && <OrderModal order={orders.find(o=>o.id===sel.id)||sel} rates={rates} onClose={()=>setSel(null)} onSave={updateOrder} addAudit={addAudit} onDelete={deleteOrder} onDispatch={onDispatch} onRebook={onRebook} jobs={jobs} drivers={drivers} user={user}/>}
   </div>);
 }
 const slugKey=(s)=>(s||'').toLowerCase().replace(/[^a-z0-9]+/g,'_').replace(/^_+|_+$/g,'').slice(0,32)||'svc';
@@ -3439,6 +3469,24 @@ function App() {
     if(db) db.from('customers').delete().eq('id',id).then(r=>{ if(r&&r.error) reportErr('delete customer', r.error); });
     if(c) addAudit(`${actor()} deleted customer ${fullName(c)}${live||stops?` (had ${live} order(s), ${stops} stop(s))`:''}`);
   },[orders,jobs]);
+  // Book a missed collection again: a new stop on the SAME order (nothing to tidy
+  // up afterwards), carrying over the instructions from the missed visit.
+  const rebookCollection=useCallback((order, driverId, window, day)=>{
+    const runDate = day || addDays(TODAY,1);
+    const missed = jobsRef.current.filter(j=>j.orderId===order.id && j.type==='collection')
+      .sort((a,b)=>(b.runDate||'').localeCompare(a.runDate||''))[0] || {};
+    const returnDate = rebookReturnDate(order.dueDate, runDate);
+    const n = jobsRef.current.filter(x=>x.driverId===driverId && (x.runDate||TODAY)===runDate).length;
+    const job = { id:uuid(), driverId, type:'collection', customerId:order.customerId, orderId:order.id, window, status:'pending',
+      runDate, seq:n+1, returnDate, packaging:missed.packaging||order.packaging, instructions:missed.instructions||null,
+      paidInAdvance:!!order.paidInAdvance };
+    jobsRef.current = [...jobsRef.current, job];
+    setJobsState(prev=>[...prev, job]);
+    if(db) db.from('jobs').insert(toJobRow(job)).then(r=>{ if(r&&r.error) reportErr('book again', r.error); });
+    updateOrder(order.id, { status:'Pending Collection', dueDate:returnDate });
+    const drv = (DRIVERS.find(d=>d.id===driverId)||{}).name || 'a driver';
+    addAudit(`${actor()} booked ${fullName(custById(order.customerId))}'s collection again for ${fmtDate(runDate)} with ${drv}${missed.runDate?` (no answer on ${fmtDate(missed.runDate)})`:''}`);
+  },[updateOrder,addAudit]);
   const dispatchDelivery=useCallback((order, driverId, window, day)=>{
     const runDate = day || TODAY;
     const nj={ id:uuid(), driverId, type:'delivery', customerId:order.customerId, orderId:order.id, window, status:'pending', runDate,
@@ -3524,8 +3572,8 @@ function App() {
   else if (phase==='error') screen=<ErrorScreen msg={err}/>;
   else if (!user)                 screen=<StaffLogin staff={drivers} onLogin={onLogin}/>;
   else if (view==='driver-app' && hasRole(user,'driver')) screen=<DriverApp driver={user} go={go} jobs={jobs} setJobs={setJobs} orders={orders} customers={customers} rates={rates} addAudit={addAudit} addOrder={addOrder} updateOrder={updateOrder}/>;
-  else if (view==='store-app' && hasRole(user,'store'))   screen=<StoreApp go={go} orders={orders} rates={rates} updateOrder={updateOrder} addAudit={addAudit} deleteOrder={deleteOrder} jobs={jobs} drivers={drivers} onDispatch={dispatchDelivery} user={user}/>;
-  else if (view==='admin-app' && hasRole(user,'admin'))   screen=<AdminApp go={go} jobs={jobs} setJobs={setJobs} rates={rates} setRates={setRates} audit={audit} drivers={drivers} setDrivers={setDrivers} deleteDriver={deleteDriver} orders={orders} addJob={addJob} updateOrder={updateOrder} addAudit={addAudit} deleteJob={deleteJob} deleteOrder={deleteOrder} dispatchDelivery={dispatchDelivery} customers={customers} addCustomer={addCustomer} updateCustomer={updateCustomer} deleteCustomer={deleteCustomer} user={user}/>;
+  else if (view==='store-app' && hasRole(user,'store'))   screen=<StoreApp go={go} orders={orders} rates={rates} updateOrder={updateOrder} addAudit={addAudit} deleteOrder={deleteOrder} jobs={jobs} drivers={drivers} onDispatch={dispatchDelivery} onRebook={rebookCollection} user={user}/>;
+  else if (view==='admin-app' && hasRole(user,'admin'))   screen=<AdminApp go={go} jobs={jobs} setJobs={setJobs} rates={rates} setRates={setRates} audit={audit} drivers={drivers} setDrivers={setDrivers} deleteDriver={deleteDriver} orders={orders} addJob={addJob} updateOrder={updateOrder} addAudit={addAudit} deleteJob={deleteJob} deleteOrder={deleteOrder} dispatchDelivery={dispatchDelivery} rebookCollection={rebookCollection} customers={customers} addCustomer={addCustomer} updateCustomer={updateCustomer} deleteCustomer={deleteCustomer} user={user}/>;
   else                            screen=<PortalPicker user={user} onPick={v=>setView(v)} onLogout={()=>go('logout')}/>;
   return <>
     {(failedCount>0 || saveError) && <div className="fixed top-0 inset-x-0 z-[60] shadow-lg">
