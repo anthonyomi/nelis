@@ -2214,10 +2214,14 @@ function AdminApp({ go, jobs, setJobs, rates, setRates, audit, drivers, setDrive
           <Btn kind="rose" icon="plus" onClick={()=>setIntake(true)} className="!py-1.5 !px-3">New job</Btn>
           <Btn kind="ghost" icon="logout" onClick={()=>go('logout')} className="!py-1.5 !px-3">Log out</Btn></div>} />
       <div className="max-w-5xl mx-auto p-4">
-        <div className="flex flex-wrap gap-1 mb-4 bg-white rounded-2xl p-1 card">
+        {/* Phones: an even 4-across grid of equal tiles (icon over label), so the
+            seven tabs line up instead of wrapping into ragged rows.
+            Wider screens: the single row, which fits there. */}
+        <nav className="grid grid-cols-4 gap-1 sm:flex sm:flex-wrap mb-4 bg-white rounded-2xl p-1.5 sm:p-1 card">
           {tabs.map(([k,ic,l])=>(<button key={k} onClick={()=>{ setTab(k); if(k==='orders') setOrdersFilter('all'); }}
-            className={`px-3.5 py-2 rounded-xl text-sm font-semibold whitespace-nowrap inline-flex items-center gap-1.5 ${tab===k?'bg-teal text-white':'text-slate2 hover:bg-gray-50'}`}><Ic name={ic} size={15}/>{l}</button>))}
-        </div>
+            aria-current={tab===k?'page':undefined}
+            className={`flex flex-col items-center justify-center gap-1 py-2.5 px-1 text-[11px] sm:flex-row sm:gap-1.5 sm:px-3.5 sm:py-2 sm:text-sm rounded-xl font-semibold whitespace-nowrap transition ${tab===k?'bg-teal text-white':'text-slate2 hover:bg-gray-50'}`}><Ic name={ic} size={17}/>{l}</button>))}
+        </nav>
         {tab==='overview'  && <Overview jobs={jobs} orders={orders} audit={audit} onNew={()=>setIntake(true)} goStat={goStat}/>}
         {tab==='customers' && <Customers customers={customers} addCustomer={addCustomer} updateCustomer={updateCustomer} deleteCustomer={deleteCustomer} user={user}/>}
         {tab==='orders'    && <Orders orders={orders} rates={rates} updateOrder={updateOrder} addAudit={addAudit} filter={ordersFilter} onClearFilter={()=>setOrdersFilter('all')} deleteOrder={deleteOrder} jobs={jobs} drivers={drivers} onDispatch={dispatchDelivery} onRebook={rebookCollection} user={user}/>}
