@@ -576,11 +576,13 @@ function writeKey(url, init){
         if (ids.length) return methodOf(init)+' '+path+' '+ids.join(','); } catch(e){}
   return methodOf(init)+' '+String(url);
 }
-async function sendWithRetry(url, init){
+// stop(): true once a newer save of the same record has made this one pointless
+async function sendWithRetry(url, init, stop){
   const waits = [0, 1000, 3000, 6000];
   let last;
   for (let i=0; i<waits.length; i++){
     if (waits[i]) await sleep(waits[i]);
+    if (i>0 && stop && stop()) return new Response(null, { status:201 });   // superseded — don't re-send old data
     try {
       const res = await fetch(url, init);
       // An insert that actually landed before the connection dropped comes back
@@ -595,19 +597,48 @@ async function sendWithRetry(url, init){
 }
 const notifyFailed = () => { if (onFailedWrites) onFailedWrites(FAILED_WRITES.length); };
 const forgetFailed = key => { const i = FAILED_WRITES.findIndex(w=>w.key===key); if (i>=0){ FAILED_WRITES.splice(i,1); notifyFailed(); } };
+// ---- one queue per record ---------------------------------------------
+// A save waits for the previous save of the SAME record to finish (retries and
+// all) before it goes, so saves always land in the order they were made.
+// Without this, on 28 Oct sending an order out saved it twice a split second
+// apart (new packaging with status still "Ready", then "Out for delivery"). When
+// a weak signal made the first one retry, it landed LAST and put the order back
+// to "Ready" while its stop was already on the run — so it got sent out again.
+// And because every order/stop save carries the whole record, a newer save makes
+// an older one that hasn't gone yet pointless, so the older one is dropped.
+const RECORD_QUEUE = new Map();          // key -> { tail, latest }
+const isUpsert = init => { try { return /merge-duplicates/i.test(new Headers((init&&init.headers)||{}).get('Prefer')||''); } catch(e){ return false; } };
+function enqueueWrite(key, init, send){
+  const slot = RECORD_QUEUE.get(key) || { tail:Promise.resolve(), latest:null };
+  const entry = { superseded:false };
+  if (slot.latest && isUpsert(init)) slot.latest.superseded = true;
+  slot.latest = entry;
+  const stop = () => entry.superseded;
+  const run = slot.tail.then(() => stop() ? new Response(null, { status:201 }) : send(stop));
+  slot.tail = run.then(()=>{}, ()=>{});
+  RECORD_QUEUE.set(key, slot);
+  run.then(done, done);
+  function done(){ if (RECORD_QUEUE.get(key)===slot && slot.latest===entry) RECORD_QUEUE.delete(key); }
+  return run;
+}
 async function resilientFetch(url, init){
   if (!isRetryableWrite(url, init)) return fetch(url, init);
   const key = writeKey(url, init);
   WRITES_IN_FLIGHT++;
   try {
-    const res = await sendWithRetry(url, init);
-    if (res.ok) forgetFailed(key);                // a newer save of the same record supersedes the failed one
-    return res;
-  } catch(e){
-    forgetFailed(key);
-    FAILED_WRITES.push({ key, url, init, at:Date.now() });
-    notifyFailed();
-    throw e;
+    return await enqueueWrite(key, init, async stop => {
+      try {
+        const res = await sendWithRetry(url, init, stop);
+        if (res.ok) forgetFailed(key);            // a newer save of the same record supersedes the failed one
+        return res;
+      } catch(e){
+        if (stop()) return new Response(null, { status:201 });   // a newer save carries this record anyway
+        forgetFailed(key);
+        FAILED_WRITES.push({ key, url, init, at:Date.now() });
+        notifyFailed();
+        throw e;
+      }
+    });
   } finally { WRITES_IN_FLIGHT--; }
 }
 // Re-send everything that's waiting, oldest first. Each save carries the whole
@@ -624,7 +655,7 @@ function retryFailedWrites(){
     for (const w of queue){
       if (Date.now()-w.at > STALE_WRITE_MS){ expired++; continue; }
       let r;
-      try { r = await sendWithRetry(w.url, w.init); }
+      try { r = await enqueueWrite(w.key, w.init, stop => sendWithRetry(w.url, w.init, stop)); }   // same queue as everything else
       catch(e){ FAILED_WRITES.push(w); continue; }       // still no signal — keep it for next time
       if (!r.ok) refused++;                              // got through, but the database said no — don't loop on it
     }
@@ -1625,9 +1656,14 @@ function OrderModal({ order, rates, onClose, onSave, addAudit, onDelete, onDispa
   };
   const advance = () => { const ns=NEXT_STATUS[order.status]; if(!ns) return;
     onSave(order.id, { status:ns }); addAudit(`${actor} marked ${fullName(c)}'s order ${ns}`); };
+  // packaging travels WITH the send-out, as one save (see dispatchDelivery)
   const dispatch = () => { if(!dispDriver) return;
-    if(dispPack!==order.packaging) onSave(order.id,{ packaging:dispPack });   // remember how it was packed
     onDispatch({...order, packaging:dispPack}, dispDriver, dispWindow, dispDay); onClose(); };
+  // already on a driver's run even though the order doesn't say so (the 28 Oct
+  // problem) — show where, and offer to put the status right, instead of a send button
+  const onRunAlready = pendingStopFor(jobs, order.id, 'delivery');
+  const fixStatus = () => { onSave(order.id, { status:'Out for delivery' });
+    addAudit(`${actor} corrected ${fullName(c)}'s order to Out for delivery (already on ${stopWhere(onRunAlready)})`); };
 
   return (
     <div className="fixed inset-0 bg-black/40 flex items-center justify-center p-4 z-50" onClick={onClose}>
@@ -1727,7 +1763,12 @@ function OrderModal({ order, rates, onClose, onSave, addAudit, onDelete, onDispa
               <p className="text-xs text-rose-600 mt-2 inline-flex items-center gap-1"><Ic name="alert" size={14}/>Price the extras before advancing.</p>}
             {NEXT_STATUS[order.status] && !order.needsPricing &&
               <Btn kind="dark" icon="right" className="mt-3 w-full" onClick={advance}>Mark {NEXT_STATUS[order.status]}</Btn>}
-            {order.status==='Ready' && onDispatch && <div className="mt-3 bg-violet-50 border border-violet-100 rounded-xl p-3">
+            {onRunAlready && !['Out for delivery','Delivered'].includes(order.status) && <div className="mt-3 bg-violet-50 border border-violet-200 rounded-xl p-3">
+              <div className="text-xs font-semibold text-violet-700 inline-flex items-center gap-1"><Ic name="truck" size={14}/>Already on {stopWhere(onRunAlready)}</div>
+              <p className="text-[11px] text-slate2 mt-1">No need to send it out again. It says “{order.status}” because the earlier save didn’t finish properly.</p>
+              <Btn kind="ghost" icon="check" className="w-full mt-2 !py-1.5 text-xs" onClick={fixStatus}>Correct it to “Out for delivery”</Btn>
+            </div>}
+            {order.status==='Ready' && onDispatch && !onRunAlready && <div className="mt-3 bg-violet-50 border border-violet-100 rounded-xl p-3">
               <div className="text-xs font-semibold text-violet-700 mb-1.5 inline-flex items-center gap-1"><Ic name="truck" size={14}/>{missedDelivery?'Send out again':'Send out for delivery'}</div>
               {missedDelivery && <p className="text-[11px] text-rose-600 mb-1.5 inline-flex items-center gap-1"><Ic name="alert" size={12}/>No answer on {fmtDate(missedDelivery.runDate)} — pick the new day below.</p>}
               <div className="grid grid-cols-2 gap-2">
@@ -2505,6 +2546,23 @@ function Customers({ customers, addCustomer, updateCustomer, deleteCustomer, use
     {adding && <AddCustomerModal onClose={()=>setAdding(false)} onCreate={addCustomer} user={user} customers={customers}/>}
     {editing && <AddCustomerModal customer={editing} onClose={()=>setEditing(null)} onUpdate={updateCustomer} onDelete={mayDelete(user)?deleteCustomer:null} user={user} customers={customers}/>}
   </div>);
+}
+// PURE — the stop already waiting for this order, if any (unit-tested).
+// The safety net behind "never put the same order on a run twice".
+const pendingStopFor = (jobs, orderId, type) => (jobs||[]).find(j=>j.orderId===orderId && j.type===type && j.status==='pending') || null;
+const stopWhere = j => `${((DRIVERS||[]).find(d=>d.id===j.driverId)||{}).name||'a driver'}’s run for ${fmtDate(j.runDate||TODAY)}`;
+// Ask the DATABASE too: another phone may have added a stop this screen hasn't
+// seen yet. If the check itself can't get through (no signal), say "unknown" and
+// rely on the on-screen check rather than block the shop.
+async function pendingStopInDb(orderId, type, exceptId){
+  if(!db) return null;
+  try {
+    const { data, error } = await db.from('jobs').select('id,driver_id,run_date')
+      .eq('order_id', orderId).eq('type', type).eq('status','pending');
+    if(error) return null;
+    const hit = (data||[]).find(r=>r.id!==exceptId);
+    return hit ? { id:hit.id, driverId:hit.driver_id, runDate:hit.run_date } : null;
+  } catch(e){ return null; }
 }
 // PURE — the return-by date when a missed collection is booked again. Keep the
 // customer's original date if there's still time; otherwise two days after the
@@ -3471,7 +3529,9 @@ function App() {
   },[orders,jobs]);
   // Book a missed collection again: a new stop on the SAME order (nothing to tidy
   // up afterwards), carrying over the instructions from the missed visit.
-  const rebookCollection=useCallback((order, driverId, window, day)=>{
+  const rebookCollection=useCallback(async (order, driverId, window, day)=>{
+    const already = pendingStopFor(jobsRef.current, order.id, 'collection');
+    if(already){ setSaveError({ kind:'info', text:`${fullName(custById(order.customerId))} is already on ${stopWhere(already)}, so it wasn’t booked again.` }); return; }
     const runDate = day || addDays(TODAY,1);
     const missed = jobsRef.current.filter(j=>j.orderId===order.id && j.type==='collection')
       .sort((a,b)=>(b.runDate||'').localeCompare(a.runDate||''))[0] || {};
@@ -3480,24 +3540,51 @@ function App() {
     const job = { id:uuid(), driverId, type:'collection', customerId:order.customerId, orderId:order.id, window, status:'pending',
       runDate, seq:n+1, returnDate, packaging:missed.packaging||order.packaging, instructions:missed.instructions||null,
       paidInAdvance:!!order.paidInAdvance };
-    jobsRef.current = [...jobsRef.current, job];
+    jobsRef.current = [...jobsRef.current, job];          // on screen straight away, so a second tap is blocked
     setJobsState(prev=>[...prev, job]);
-    if(db) db.from('jobs').insert(toJobRow(job)).then(r=>{ if(r&&r.error) reportErr('book again', r.error); });
+    const inDb = await pendingStopInDb(order.id, 'collection', job.id);
+    if(inDb){ jobsRef.current = jobsRef.current.filter(x=>x.id!==job.id); setJobsState(prev=>prev.filter(x=>x.id!==job.id));
+      setSaveError({ kind:'info', text:`${fullName(custById(order.customerId))} is already on ${stopWhere(inDb)} (added on another phone), so it wasn’t booked again.` });
+      reloadAll({quiet:true}); return; }
+    if(db) db.from('jobs').upsert(toJobRow(job)).then(r=>{ if(r&&r.error) reportErr('book again', r.error); });
     updateOrder(order.id, { status:'Pending Collection', dueDate:returnDate });
     const drv = (DRIVERS.find(d=>d.id===driverId)||{}).name || 'a driver';
     addAudit(`${actor()} booked ${fullName(custById(order.customerId))}'s collection again for ${fmtDate(runDate)} with ${drv}${missed.runDate?` (no answer on ${fmtDate(missed.runDate)})`:''}`);
-  },[updateOrder,addAudit]);
-  const dispatchDelivery=useCallback((order, driverId, window, day)=>{
+  },[updateOrder,addAudit,reloadAll]);
+  // Send an order out: ONE save for the order (status + packaging together) and
+  // one new stop — and never a second stop for an order that's already on a run.
+  // On 28 Oct the order was saved twice here (packaging, then status), the first
+  // save sometimes landed last, put the order back to "Ready", and it was sent
+  // out again: five deliveries ended up on Said's run twice.
+  const dispatchDelivery=useCallback(async (order, driverId, window, day)=>{
+    const who = fullName(custById(order.customerId));
+    const already = pendingStopFor(jobsRef.current, order.id, 'delivery');
+    if(already){
+      setSaveError({ kind:'info', text:`${who} is already on ${stopWhere(already)}, so it wasn’t added again.` });
+      if(order.status!=='Out for delivery') updateOrder(order.id, { status:'Out for delivery' });   // put the status right
+      return;
+    }
     const runDate = day || TODAY;
-    const nj={ id:uuid(), driverId, type:'delivery', customerId:order.customerId, orderId:order.id, window, status:'pending', runDate,
+    const n = jobsRef.current.filter(x=>x.driverId===driverId && (x.runDate||TODAY)===runDate).length;
+    const job = { id:uuid(), driverId, type:'delivery', customerId:order.customerId, orderId:order.id, window, status:'pending', runDate, seq:n+1,
       packaging:order.packaging, bags:order.bagsCount, weight:order.weight, amount:order.amount,
       service:(order.services||[]).join(', ')||'—', paymentMethod:order.paymentMethod, paidInAdvance:order.paidInAdvance };
-    setJobsState(prev=>{ const n=prev.filter(x=>x.driverId===driverId && (x.runDate||TODAY)===runDate).length; const job={...nj,seq:n+1};
-      if(db) db.from('jobs').insert(toJobRow(job)).then(r=>{ if(r&&r.error) reportErr('dispatch job', r.error); });
-      return [...prev, job]; });
-    updateOrder(order.id, { status:'Out for delivery' });
-    addAudit(`${actor()} sent ${fullName(custById(order.customerId))}'s order out for delivery`);
-  },[updateOrder,addAudit]);
+    // the ONE order save — made before the stop is on screen, so it can't also
+    // push the new stop to the database ahead of the check below
+    updateOrder(order.id, { status:'Out for delivery', packaging:order.packaging });
+    jobsRef.current = [...jobsRef.current, job];             // on screen straight away, so a second tap is blocked
+    setJobsState(prev=>[...prev, job]);
+    const inDb = await pendingStopInDb(order.id, 'delivery', job.id);
+    if(inDb){                                                 // another phone already put it on a run
+      jobsRef.current = jobsRef.current.filter(x=>x.id!==job.id);
+      setJobsState(prev=>prev.filter(x=>x.id!==job.id));
+      setSaveError({ kind:'info', text:`${who} is already on ${stopWhere(inDb)} (added on another phone), so it wasn’t added again.` });
+      reloadAll({quiet:true});
+      return;
+    }
+    if(db) db.from('jobs').upsert(toJobRow(job)).then(r=>{ if(r&&r.error) reportErr('dispatch job', r.error); });
+    addAudit(`${actor()} sent ${who}'s order out for delivery`);
+  },[updateOrder,addAudit,reloadAll]);
   const deleteOrder=useCallback(orderId=>{
     setOrdersState(prev=>{ const o=prev.find(x=>x.id===orderId); if(o) addAudit(`${actor()} deleted ${fullName(custById(o.customerId))}'s order`); return prev.filter(x=>x.id!==orderId); });
     if(db) db.from('orders').delete().eq('id',orderId).then(logErr('deleteOrder'));
@@ -3526,29 +3613,32 @@ function App() {
           weightCharge:j.amount||0, amount:j.amount||0, initialAmount:j.amount||0,
           paymentMethod:j.paymentMethod||'Cash', collectedDate:null, collectedAt:null,
           dueDate:day, status:'Out for delivery' };
+    // Worked out up front and saved OUTSIDE the state updaters: React may run an
+    // updater more than once, and a save inside one could then go twice.
+    const n=jobsRef.current.filter(x=>x.driverId===j.driverId && (x.runDate||TODAY)===day).length;
+    const nj={...j, runDate:day, orderId, seq:n+1};
+    ordersRef.current=[order,...ordersRef.current]; jobsRef.current=[...jobsRef.current, nj];
     setOrdersState(prev=>[order,...prev]);
-    setJobsState(prev=>{
-      const n=prev.filter(x=>x.driverId===j.driverId && (x.runDate||TODAY)===day).length;
-      const nj={...j, runDate:day, orderId, seq:n+1};
-      // persist: order first, THEN the job — awaited so the order exists before the job's FK.
-      // If either write fails, take the booking back off the screen: leaving it
-      // there would point at an order the database doesn't have, and every later
-      // save would fail against that dangling link.
-      const undo=(why)=>{
-        setJobsState(p=>p.filter(x=>x.id!==nj.id));
-        setOrdersState(p=>p.filter(x=>x.id!==orderId));
-        if(db) db.from('orders').delete().eq('id',orderId);   // clear a half-written order
-        reportErr(why, { message:'the booking was not saved, so it has been removed from the screen — please add it again' });
-      };
-      (async()=>{
-        if(!db) return;
-        try {
-          const o=await db.from('orders').insert(toOrderRow(order)); if(o.error){ reportErr('save booking', o.error); undo('save booking'); return; }
-          const r=await db.from('jobs').insert(toJobRow(nj));        if(r.error){ reportErr('save job', r.error);     undo('save job'); }
-        } catch(e){ reportErr('save job', e); undo('save job'); }
-      })();
-      return [...prev, nj];
-    });
+    setJobsState(prev=>[...prev, nj]);
+    // persist: order first, THEN the job — awaited so the order exists before the job's FK.
+    // If either write fails, take the booking back off the screen: leaving it
+    // there would point at an order the database doesn't have, and every later
+    // save would fail against that dangling link.
+    const undo=(why)=>{
+      jobsRef.current=jobsRef.current.filter(x=>x.id!==nj.id); ordersRef.current=ordersRef.current.filter(x=>x.id!==orderId);
+      setJobsState(p=>p.filter(x=>x.id!==nj.id));
+      setOrdersState(p=>p.filter(x=>x.id!==orderId));
+      if(db) db.from('orders').delete().eq('id',orderId);   // clear a half-written order
+      reportErr(why, { message:'the booking was not saved, so it has been removed from the screen — please add it again' });
+    };
+    (async()=>{
+      if(!db) return;
+      try {
+        // upserts: re-sending the same booking can never make a second copy
+        const o=await db.from('orders').upsert(toOrderRow(order)); if(o.error){ reportErr('save booking', o.error); undo('save booking'); return; }
+        const r=await db.from('jobs').upsert(toJobRow(nj));        if(r.error){ reportErr('save job', r.error);     undo('save job'); }
+      } catch(e){ reportErr('save job', e); undo('save job'); }
+    })();
     addAudit(`${actor()} booked a ${isCol?'collection':'delivery'} for ${fullName(custById(j.customerId))} on ${fmtDate(day)}`);
   },[addAudit]);
   const go=useCallback(v=>{
@@ -3582,7 +3672,7 @@ function App() {
           <span><b>{failedCount} change{failedCount>1?'s':''} not saved yet</b> — probably no signal. {failedCount>1?'They haven’t':'It hasn’t'} reached the database or the drivers. Keep this page open; it will keep trying.</span></span>
         <button onClick={tryAgain} {...(retrying?{disabled:true}:{})} className="shrink-0 bg-white text-rose-700 font-semibold rounded-lg px-3 py-1 text-xs">{retrying?'Trying…':'Try again'}</button>
       </div>}
-      {saveError && <div className={`${failedCount>0?'border-t border-white/30 ':''}bg-rose-600 text-white text-sm px-4 py-2.5 flex items-center justify-between gap-3`}>
+      {saveError && <div className={`${failedCount>0?'border-t border-white/30 ':''}${saveError.kind==='info'?'bg-amber-500':'bg-rose-600'} text-white text-sm px-4 py-2.5 flex items-center justify-between gap-3`}>
         <span className="inline-flex items-start gap-2"><Ic name="alert" size={16} className="mt-0.5 shrink-0"/><span>{typeof saveError==='string'?saveError:saveError.text}</span></span>
         <span className="shrink-0 inline-flex items-center gap-2">
           {saveError.kind==='other' && user && <button onClick={()=>{ setSaveError(''); reloadAll({quiet:true}); }} className="bg-white text-rose-700 font-semibold rounded-lg px-3 py-1 text-xs">Reload</button>}
